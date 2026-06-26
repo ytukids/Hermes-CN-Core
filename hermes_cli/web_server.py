@@ -2179,6 +2179,21 @@ def _repair_archive_ui(emit=None):
     if not state_db.exists():
         return 0, {"error": "state.db not found"}
 
+    # Fix broken symlinks pointing to non-existent targets
+    for check_link in [ui_db, state_db]:
+        try:
+            if check_link.is_symlink():
+                target = check_link.resolve()
+                if not target.exists():
+                    _e("repair", "archive_ui",
+                       action="Fixing broken symlink: {} -> {}".format(str(check_link)[-40:], str(target)[-40:]),
+                       progress=10)
+                    check_link.unlink()
+                    import shutil
+                    shutil.copy2(str(target.parent / ("real_" + check_link.name)), str(check_link))
+        except Exception:
+            pass
+
     fixed = 0
     details = {}
     import sqlite3
