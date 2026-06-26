@@ -10654,7 +10654,7 @@ async def get_active_profile_endpoint():
         current = profiles_mod.get_active_profile_name() or "default"
     except Exception:
         current = "default"
-    return {"active": active, "current": current}
+    return {"active": active, "current": current, "name": current}
 
 
 @app.post("/api/profiles/active")
