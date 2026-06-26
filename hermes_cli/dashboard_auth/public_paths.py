@@ -60,4 +60,7 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     "/api/cron/fire",
     # Read-only system health self-check (cron liveness, config
     # integrity, disk space). Loopback-only; safe for pre-login SPA.
-    "/api/health",})
+    "/api/health",
+    # Read-only system health auto-repair (SSE stream).
+    # Loopback-only; POST triggers check + repair with progress events.
+    "/api/health/repair",})
