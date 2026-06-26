@@ -166,6 +166,25 @@ async def _lifespan(app: "FastAPI"):
         )
         cron_thread.start()
 
+    # ----- Desktop startup auto health-check + repair -----
+    try:
+        import logging as _logging
+        _startup_log = _logging.getLogger("hermes_cli.web_server.startup")
+        _startup_log.info("Running startup health check + auto-repair...")
+        _result = _run_health_checks(repair=True)
+        if _result.get("fixed"):
+            _startup_log.info("Startup auto-repair fixed: %s", _result["fixed"])
+        if _result.get("repair_errors"):
+            _startup_log.warning("Startup auto-repair errors: %s", _result["repair_errors"])
+        if _result.get("warnings"):
+            _startup_log.warning("Startup health warnings: %s", _result["warnings"])
+        _startup_log.info("Startup health check complete: %s", _result.get("ok", False))
+    except Exception:
+        import logging as _logging
+        _logging.getLogger("hermes_cli.web_server.startup").exception(
+            "Startup health check failed"
+        )
+
     try:
         yield
     finally:
