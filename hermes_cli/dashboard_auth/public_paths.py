@@ -57,4 +57,7 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # handler verifies as the real auth. Must bypass the dashboard auth gate so
     # the NAS relay's bearer-only callback reaches the verifier instead of a
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
-    "/api/cron/fire",})
+    "/api/cron/fire",
+    # Read-only system health self-check (cron liveness, config
+    # integrity, disk space). Loopback-only; safe for pre-login SPA.
+    "/api/health",})

@@ -2016,6 +2016,19 @@ async def get_status(profile: Optional[str] = None):
         # probes (NAS's wildcard-subdomain liveness probe), the SPA's pre-login
         # bootstrap, and anyone who can curl the host — i.e. exactly the audience
         # ``PUBLIC_API_PATHS`` documents this endpoint as serving.
+# ----- Health check summary (lightweight, for SPA status page) -----
+        health_summary = None
+        try:
+            health = _run_health_checks()
+            health_summary = {
+                "cron_ok": health["checks"].get("cron_scheduler", {}).get("ok", False),
+                "jobs_json_ok": health["checks"].get("jobs_json", {}).get("ok", False),
+                "config_ok": health["checks"].get("config_yaml", {}).get("ok", False),
+                "warnings": health.get("warnings", []),
+            }
+        except Exception:
+            pass
+
         status = {
             "version": __version__,
             "release_date": __release_date__,
@@ -2030,6 +2043,7 @@ async def get_status(profile: Optional[str] = None):
             "active_sessions": active_sessions,
             "auth_required": auth_required,
             "auth_providers": auth_providers,
+            "health": health_summary,
         }
 
         # Absolute host paths, the gateway PID, and the internal gateway health
