@@ -2575,7 +2575,7 @@ async def post_health_repair(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
- = 22000
+_WINDOWS_11_MIN_BUILD = 22000
 
 
 def _windows_build_number(version: str, platform_label: str) -> Optional[int]:
