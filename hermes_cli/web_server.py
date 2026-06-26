@@ -2056,6 +2056,196 @@ async def get_status(profile: Optional[str] = None):
         if status_scope is not None:
             status_scope.__exit__(*sys.exc_info())
 
+# ---------------------------------------------------------------------------
+# /api/health -- Desktop startup self-check
+# ---------------------------------------------------------------------------
+
+_HEALTH_CACHE: dict | None = None
+_HEALTH_CACHE_TS: float = 0.0
+_HEALTH_CACHE_TTL: float = 30.0  # seconds
+
+
+def _run_health_checks() -> dict:
+    global _HEALTH_CACHE, _HEALTH_CACHE_TS
+    now = time.time()
+    if _HEALTH_CACHE is not None and (now - _HEALTH_CACHE_TS) < _HEALTH_CACHE_TTL:
+        return _HEALTH_CACHE
+
+    checks: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    hermes_home = get_hermes_home()
+    cron_dir = hermes_home / "cron"
+    jobs_path = cron_dir / "jobs.json"
+    tick_lock_path = cron_dir / ".tick.lock"
+    config_path_ = get_config_path()
+
+    # ----- 1. Cron scheduler liveness -----
+    try:
+        if tick_lock_path.exists():
+            mtime = tick_lock_path.stat().st_mtime
+            age_sec = now - mtime
+            if age_sec < 120:
+                checks["cron_scheduler"] = {
+                    "ok": True,
+                    "detail": f"running (tick.lock updated {age_sec:.0f}s ago)",
+                }
+            else:
+                checks["cron_scheduler"] = {
+                    "ok": False,
+                    "detail": f"stale (tick.lock age: {age_sec:.0f}s)",
+                }
+                warnings.append("Cron scheduler may be dead: tick.lock not updated for >2min")
+        else:
+            checks["cron_scheduler"] = {
+                "ok": False,
+                "detail": "not initialized (no tick.lock)",
+            }
+            if os.getenv("HERMES_DESKTOP") != "1":
+                warnings.append("Cron scheduler tick.lock missing")
+    except Exception as e:
+        checks["cron_scheduler"] = {"ok": False, "detail": f"error: {e}"}
+        warnings.append(f"Cron scheduler check failed: {e}")
+
+    # ----- 2. jobs.json health (BOM detection, syntax) -----
+    try:
+        if jobs_path.exists():
+            with open(jobs_path, "rb") as f:
+                header = f.read(4)
+            has_bom = header[:3] == b"\xef\xbb\xbf"
+            if has_bom:
+                checks["jobs_json"] = {
+                    "ok": False,
+                    "detail": "UTF-8 BOM detected -- cron parser rejects this!",
+                }
+                warnings.append("jobs.json has UTF-8 BOM -- cron scheduler may be disabled")
+            else:
+                try:
+                    with open(jobs_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    job_count = len(data.get("jobs", []))
+                    enabled = sum(1 for j in data.get("jobs", []) if j.get("state") != "paused")
+                    checks["jobs_json"] = {
+                        "ok": True,
+                        "detail": f"valid JSON, {job_count} jobs ({enabled} enabled)",
+                    }
+                except json.JSONDecodeError as je:
+                    checks["jobs_json"] = {
+                        "ok": False,
+                        "detail": f"invalid JSON: {je}",
+                    }
+                    warnings.append("jobs.json is corrupted (invalid JSON)")
+        else:
+            checks["jobs_json"] = {"ok": True, "detail": "no jobs.json yet (fresh install)"}
+    except Exception as e:
+        checks["jobs_json"] = {"ok": False, "detail": f"error: {e}"}
+
+    # ----- 3. config.yaml health -----
+    try:
+        if config_path_.exists():
+            with open(config_path_, "rb") as f:
+                header = f.read(4)
+            has_bom = header[:3] == b"\xef\xbb\xbf"
+            try:
+                with open(config_path_, "r", encoding="utf-8-sig" if has_bom else "utf-8") as f:
+                    yaml.safe_load(f)
+                checks["config_yaml"] = {
+                    "ok": True,
+                    "detail": "valid YAML" + (" (UTF-8 BOM)" if has_bom else ""),
+                }
+            except yaml.YAMLError as ye:
+                checks["config_yaml"] = {
+                    "ok": False,
+                    "detail": f"invalid YAML: {ye}",
+                }
+                warnings.append("config.yaml is corrupted (invalid YAML)")
+        else:
+            checks["config_yaml"] = {"ok": True, "detail": "no config.yaml yet"}
+    except Exception as e:
+        checks["config_yaml"] = {"ok": False, "detail": f"error: {e}"}
+
+    # ----- 4. Gateway process status -----
+    try:
+        gateway_pid = get_running_pid()
+        gateway_running = gateway_pid is not None
+        if gateway_running:
+            checks["gateway"] = {
+                "ok": True,
+                "detail": f"running (pid={gateway_pid})",
+            }
+        else:
+            is_desktop = os.getenv("HERMES_DESKTOP") == "1"
+            checks["gateway"] = {
+                "ok": True,
+                "detail": "not running" + (" (dashboard mode -- cron runs in-process)" if is_desktop else ""),
+            }
+    except Exception as e:
+        checks["gateway"] = {"ok": False, "detail": f"error: {e}"}
+
+    # ----- 5. Disk space -----
+    try:
+        import shutil
+        usage = shutil.disk_usage(str(hermes_home))
+        free_gb = usage.free / (1024 ** 3)
+        if free_gb < 1.0:
+            checks["disk_space"] = {
+                "ok": False,
+                "detail": f"{free_gb:.1f} GB free -- critically low!",
+            }
+            warnings.append(f"Disk space critically low: {free_gb:.1f} GB free")
+        else:
+            checks["disk_space"] = {
+                "ok": True,
+                "detail": f"{free_gb:.1f} GB free",
+            }
+    except Exception as e:
+        checks["disk_space"] = {"ok": True, "detail": f"unable to check ({e})"}
+
+    # ----- 6. code_execution mode -----
+    try:
+        config = yaml.safe_load(config_path_.read_text(encoding="utf-8"))
+        mode = config.get("code_execution", {}).get("mode", "project")
+        if mode == "host":
+            checks["code_execution"] = {"ok": True, "detail": "mode=host (full filesystem access)"}
+        elif mode == "project":
+            checks["code_execution"] = {
+                "ok": True,
+                "detail": "mode=project (workspace-scoped)",
+            }
+        else:
+            checks["code_execution"] = {"ok": True, "detail": f"mode={mode}"}
+    except Exception as e:
+        checks["code_execution"] = {"ok": True, "detail": f"unknown ({e})"}
+
+    all_ok = all(c.get("ok", False) for c in checks.values())
+
+    result = {
+        "ok": all_ok,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
+        "warnings": warnings,
+    }
+
+    _HEALTH_CACHE = result
+    _HEALTH_CACHE_TS = now
+    return result
+
+
+@app.get("/api/health")
+async def get_health(profile: Optional[str] = None):
+    health_scope = None
+    requested_profile = (profile or "").strip()
+    if requested_profile and requested_profile.lower() != "current":
+        health_scope = _config_profile_scope(requested_profile)
+        health_scope.__enter__()
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _run_health_checks)
+    finally:
+        if health_scope is not None:
+            health_scope.__exit__(*sys.exc_info())
+
+
 
 _WINDOWS_11_MIN_BUILD = 22000
 

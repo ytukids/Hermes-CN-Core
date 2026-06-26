@@ -5060,6 +5060,36 @@ async function startHermes() {
       childAlive: () => hermesProcess !== null && hermesProcess.exitCode === null && !hermesProcess.killed,
       rememberLog
     })
+
+    // ----- Desktop startup health self-check -----
+    await advanceBootProgress('backend.health', 'Running system health check', 92)
+    let bootHealth = null
+    try {
+      const healthUrl = baseUrl + '/api/health'
+      const controller = new AbortController()
+      const healthTimeout = setTimeout(() => controller.abort(), 8000)
+      const healthResp = await fetch(healthUrl, {
+        headers: { 'Authorization': 'Bearer ' + token },
+        signal: controller.signal
+      })
+      clearTimeout(healthTimeout)
+      if (healthResp.ok) {
+        bootHealth = await healthResp.json()
+        if (bootHealth && bootHealth.warnings && bootHealth.warnings.length > 0) {
+          rememberLog('[health] warnings: ' + JSON.stringify(bootHealth.warnings))
+        }
+        if (bootHealth && !bootHealth.ok) {
+          rememberLog('[health] system health check FAILED: ' + JSON.stringify(bootHealth.checks))
+        } else {
+          rememberLog('[health] system health check passed')
+        }
+      } else {
+        rememberLog('[health] health endpoint returned ' + healthResp.status)
+      }
+    } catch (err) {
+      rememberLog('[health] health check failed: ' + (err && err.message ? err.message : String(err)))
+    }
+
     updateBootProgress({
       phase: 'backend.ready',
       message: 'Hermes backend is ready. Finalizing desktop startup',
@@ -5076,6 +5106,7 @@ async function startHermes() {
       token: authToken,
       wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
       logs: hermesLog.slice(-80),
+      health: bootHealth,
       ...getWindowState()
     }
   })().catch(error => {
