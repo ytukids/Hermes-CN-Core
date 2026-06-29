@@ -169,6 +169,22 @@ class InProcessCronScheduler(CronScheduler):
     for the next allowed tick.
     """
 
+    def __init__(self):
+        self._completion_callbacks: list = []
+
+    def add_completion_callback(self, cb):
+        """Register a callback invoked after every cron job completes.
+
+        ``cb(job_id, job_name, success, delivery_error)`` is called
+        synchronously in the worker thread that ran the job. Keep
+        callbacks fast — use ``call_soon_threadsafe`` / queue to bridge
+        into the event loop if you need async work (e.g. WebSocket push).
+
+        Callbacks are best-effort: exceptions are caught and logged so a
+        broken listener never blocks the scheduler.
+        """
+        self._completion_callbacks.append(cb)
+
     @property
     def name(self) -> str:
         return "builtin"

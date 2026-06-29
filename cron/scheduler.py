@@ -3824,6 +3824,25 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _notify_completion_callbacks(job: dict, success: bool, delivery_error: str | None) -> None:
+    """Best-effort: call registered completion callbacks after a job finishes.
+
+    Catches all exceptions so a broken listener never blocks the scheduler or
+    prevents ``mark_job_run`` from completing. Must be fast (no I/O) — callers
+    that need async work should bridge via ``call_soon_threadsafe``.
+    """
+    try:
+        from cron.scheduler_provider import resolve_cron_scheduler
+        provider = resolve_cron_scheduler()
+        for cb in getattr(provider, '_completion_callbacks', ()):
+            try:
+                cb(job["id"], job.get("name", ""), success, delivery_error)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
