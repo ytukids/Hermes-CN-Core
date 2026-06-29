@@ -120,6 +120,26 @@ _log = logging.getLogger(__name__)
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+async def _broadcast_cron_error(app: "FastAPI", job_id: str, job_name: str, delivery_error: str) -> None:
+    """Push a cron delivery error to all subscribed desktop clients via WebSocket.
+
+    Called from a worker thread via ``call_soon_threadsafe``, so this function
+    itself runs on the event-loop thread where async WebSocket sends are safe.
+    Best-effort: failures are logged but never raised.
+    """
+    try:
+        payload = json.dumps({
+            "type": "cron_delivery_error",
+            "job_id": job_id,
+            "job_name": job_name,
+            "error": (delivery_error or "")[:250],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        await _broadcast_event(app, "cron", payload)
+    except Exception:
+        _log.exception("Failed to broadcast cron delivery error for job %s", job_id)
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -137,6 +157,27 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     from cron.scheduler_provider import resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
+
+    # Register a completion callback so the dashboard can push delivery errors
+    # to connected desktop clients in real time — no polling needed.
+    _loop_ref = getattr(provider, "_event_loop", None)
+    _app_ref = getattr(provider, "_fastapi_app", None)
+    if _loop_ref is not None and _app_ref is not None and hasattr(provider, "add_completion_callback"):
+        def _on_cron_complete(job_id, job_name, success, delivery_error):
+            if not delivery_error:
+                return
+            try:
+                _loop_ref.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        _broadcast_cron_error(_app_ref, job_id, job_name, delivery_error)
+                    )
+                )
+            except Exception:
+                pass
+
+        provider.add_completion_callback(_on_cron_complete)
+        _log.info("Desktop cron error broadcast enabled (channel=cron)")
+
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
     provider.start(stop_event, interval=interval)
 
@@ -158,6 +199,16 @@ async def _lifespan(app: "FastAPI"):
     cron_thread: "threading.Thread | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":
         cron_stop = threading.Event()
+        # Stash the event loop + FastAPI app refs on the scheduler provider so
+        # completion callbacks can bridge from the worker thread back to the
+        # event loop for async WebSocket broadcasts.
+        try:
+            from cron.scheduler_provider import resolve_cron_scheduler
+            provider = resolve_cron_scheduler()
+            provider._event_loop = asyncio.get_running_loop()
+            provider._fastapi_app = app
+        except Exception:
+            pass
         cron_thread = threading.Thread(
             target=_start_desktop_cron_ticker,
             args=(cron_stop,),
