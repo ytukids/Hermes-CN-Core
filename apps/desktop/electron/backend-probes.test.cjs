@@ -11,7 +11,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
+const { canImportHermesCli, hermesRuntimeImportProbe, verifyHermesCli } = require('./backend-probes.cjs')
 
 // Resolve the host's own Node binary -- guaranteed to be on disk and
 // runnable. We use it as both a stand-in for "a python that doesn't
@@ -40,10 +40,16 @@ test('canImportHermesCli returns false when binary does not exist', async () => 
   assert.equal(await canImportHermesCli(ghost), false)
 })
 
-test('verifyHermesCli returns false when command is falsy', async () => {
-  assert.equal(await verifyHermesCli(''), false)
-  assert.equal(await verifyHermesCli(null), false)
-  assert.equal(await verifyHermesCli(undefined), false)
+test('hermes runtime import probe checks config dependencies', () => {
+  const probe = hermesRuntimeImportProbe()
+  assert.match(probe, /\bimport yaml\b/)
+  assert.match(probe, /\bimport hermes_cli\.config\b/)
+})
+
+test('verifyHermesCli returns false when command is falsy', () => {
+  assert.equal(verifyHermesCli(''), false)
+  assert.equal(verifyHermesCli(null), false)
+  assert.equal(verifyHermesCli(undefined), false)
 })
 
 test('verifyHermesCli returns false when binary does not exist', async () => {
