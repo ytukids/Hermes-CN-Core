@@ -8,6 +8,7 @@
 
 | ID | 目标文件 | 做了什么 | 为什么需要 | 上游状态 |
 |---|---|---|---|---|
+| **P-025** | `hermes_cli/web_server.py` | `/api/providers/oauth` 现在：(1) 命中 20s 的按 profile 进程内 TTL 缓存；(2) 用 `asyncio.to_thread` 并发跑各 provider 的状态检查（移出 FastAPI 事件循环），不再串行内联；(3) 在每次连接/断开时失效缓存（断开的两条清理路径、PKCE submit、设备码/loopback 轮询到 `approved`）。另加 `refresh=true` 逃生阀。 | 桌面端模型页每次打开、以及每次窗口重新聚焦都会串行枚举所有 OAuth provider 的状态；部分检查会联网/起子进程，而该 handler 是 `async`，于是阻塞了同时服务聊天网关 WebSocket 的事件循环——模型页要等好几秒，还会拖累实时会话。 | 建议上游（通用响应性修复） |
 | **P-001** | `tui_gateway/server.py` | provider 配置 dict/list 不一致修复 | 早期 fork 需要兼容用户配置形态 | 已由上游修复，本 fork 不再携带 |
 | **P-002** | `hermes_cli/web_server.py` | 增加 `POST /api/upload` 附件上传接口 | desktop / web composer 拖拽上传依赖它 | 未进入上游 |
 | **P-003** | `hermes_cli/web_server.py` | 去掉 `/api/ws` 的 `_DASHBOARD_EMBEDDED_CHAT_ENABLED` 门禁 | desktop 以 headless dashboard 方式运行，不带 `--tui` 时仍需要 gateway WS | **基本被上游解决** —— v0.16.0(#38591)默认把该标志设为 `True` 并移除了 `--tui`；fork 仍保留 `/api/ws` 上的显式去门禁作为纵深防御 |
@@ -29,8 +30,13 @@
 | **P-018** | `agent/agent_init.py`, `tests/run_agent/test_init_fallback_on_exhausted_pool.py` | 增加 `_api_key_required` 辅助函数，并在 OpenAI / Anthropic SDK 客户端构造前加入空 key 保护；当 api_key 为空且 provider 需要密钥时，抛出 `RuntimeError: no API key (param empty, env vars unset)` | 此前空 key（参数为空且环境变量未设置）会触发底层 SDK 认证异常，在 TUI/gateway 后台线程中表现为 panic 且无堆栈信息 | 建议上游 |
 | **P-020** | `tools/environments/windows_env.py`（新建）, `tools/environments/local.py`, `hermes_cli/claw.py`, `hermes_cli/managed_uv.py`, `hermes_cli/gateway.py`, `hermes_cli/dep_ensure.py`, `hermes_cli/clipboard.py`, `skills/creative/comfyui/scripts/hardware_check.py` | 新增 `refresh_env_from_registry()` 函数，从 Windows 注册表（HKLM + HKCU）刷新 `os.environ["PATH"]` 和 `os.environ["PATHEXT"]`，在每次 PowerShell 子进程调用前执行，使进程启动后安装的工具（如 WinGet、MSI）可被发现。参考 `kimi-cli/src/kimi_cli/utils/environment.py` 的实现。非 Windows 平台无操作。 | 如果不刷新，agent 无法发现进程启动后安装的二进制文件（例如通过 WinGet 安装的工具）— `shutil.which` 和 `subprocess.Popen` 只能看到进程创建时捕获的 PATH。当 agent 在会话中安装自己的依赖（node、uv 等）时尤其痛苦。 | 建议上游 |
 | **P-021** | `gateway/run.py`、`cron/scheduler.py`、`cron/jobs.py`、`hermes_time.py` | 四项 cron "静默停摆" 根因修复：(1) `_start_cron_ticker` 初始化包在 try/except 中，防止 daemon 线程静默死亡；(2) 僵尸 `.tick.lock` 自动清理——锁文件 mtime 超过 `lock_stale_seconds`（默认 120s）则删除；(3) `_validate_cron_startup()` 启动前校验 `jobs.json` 可解析性；(4) `_ensure_aware` 按配置时区解释无时区时间戳；修复 `hermes_time.py` 缺失的 `def now()`；每次 tick 调用 `reset_cache()` 使时区配置热生效。 | `jobs.json` 损坏 → ticker 线程崩溃 → daemon 静默死亡。僵尸 `.tick.lock` → 所有后续 tick 永久阻塞。ticker 初始化 `ImportError` → 线程零日志死亡。服务器时区 ≠ 配置时区 → 调度时间静默偏移。 | 建议上游 |
-| **P-022** | `agent/agent_runtime_helpers.py`、`tests/run_agent/test_agent_guardrails.py`、`tests/run_agent/test_session_meta_filtering.py` | 在 `sanitize_api_messages` 中增加空内容过滤：丢弃 `content` 为 `""` 且无有效载荷的 `assistant`/`user`/`function` 消息；保留仍携带 `tool_calls`、`codex_reasoning_items`、`codex_message_items` 或 `reasoning_content` 的 `assistant` 消息。 | MiMo v2.5 及严格的 OpenAI 兼容网关会拒收空 `content` 消息（HTTP 400 / "text is not set"）。长会话（如飞书 3-13h）在上下文压缩/截断后可能留下这类消息。 | 建议上游 |
+| **P-024** | `agent/agent_runtime_helpers.py`、`tests/run_agent/test_agent_guardrails.py`、`tests/run_agent/test_session_meta_filtering.py` | 在 `sanitize_api_messages` 中增加空内容过滤：丢弃 `content` 为 `""` 且无有效载荷的 `assistant`/`user`/`function` 消息；保留仍携带 `tool_calls`、`codex_reasoning_items`、`codex_message_items` 或 `reasoning_content` 的 `assistant` 消息。 | MiMo v2.5 及严格的 OpenAI 兼容网关会拒收空 `content` 消息（HTTP 400 / "text is not set"）。长会话（如飞书 3-13h）在上下文压缩/截断后可能留下这类消息。 | 建议上游 |
 | **P-023** | `tui_gateway/server.py` | 网关回合执行器现在会把"漏接"的 `/steer` 作为下一轮用户输入投递。`run_conversation()` 只能把 steer 注入到*后续*的工具结果里；落在最后一个工具批次之后（或纯文本回合）的 steer 会以 `result["pending_steer"]` 返回。`cli.py` 会重新投递它，但网关此前直接丢弃——导致桌面端（运行时输入行为默认 "引导/steer"）发出的 steer 静默丢失。仿照已有的 `goal_followup` 链路：在 `finally` 释放 `session["running"]` 后，用 steer 文本发起一次嵌套 `_run_prompt_submit`（受 `running` 保护，真实用户输入优先；优先级高于 goal 续跑）。 | 桌面端反馈（#193）："引导功能不好用……等到任务执行完，我引导的东西也没插入进去"——晚到的 steer 被 `agent.steer()` 接受却从未生效，因为网关忽略了 `pending_steer`。 | 建议上游（通用可靠性修复） |
+| **P-026** | `hermes_constants.py`、`hermes_bootstrap.py`、`tests/test_managed_runtime_caches.py` | 桌面以托管运行时方式启动时（`HERMES_DESKTOP_MANAGED=1`），`configure_managed_runtime_caches()` 用 `setdefault` 把第三方缓存/临时目录环境变量指向 `<HERMES_HOME>/cache` 的子目录：`HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TORCH_HOME`、`TIKTOKEN_CACHE_DIR`、`MPLCONFIGDIR`、`NLTK_DATA`、`PLAYWRIGHT_BROWSERS_PATH`，以及（仅当三者都未设置时）`TMPDIR/TEMP/TMP`。从 `hermes_bootstrap`（每个入口的第一个 import）调用，确保早于 transformers/tiktoken/playwright 加载。 | Windows 桌面占盘：即使桌面端已把自身运行时树锚定到所选安装盘，这些库仍默认把缓存写进 `~/.cache`（C 盘），导致用户选了 D 盘安装、C 盘照样被撑满。`setdefault` + `HERMES_DESKTOP_MANAGED` 门控让独立 CLI 安装与用户显式覆盖不受影响。 | CN 桌面收敛；环境变量钩子通用，可考虑上游 |
+| **P-028** | `agent/models_dev.py`、`agent/models_dev_snapshot.json`（新增）、`agent/model_metadata.py`、`hermes_cli/model_cost_guard.py`、`hermes_cli/web_server.py`、`tui_gateway/server.py`、`gateway/slash_commands.py`、`cli.py`、`hermes_cli/auth.py`、`scripts/refresh_models_dev_snapshot.py`（新增）、`pyproject.toml`、`MANIFEST.in`、`.github/workflows/release-runtime.yml` | 让 models.dev 元数据离线优先，使模型保存/切换不再阻塞在网络上。(1) 随包预置 `models_dev_snapshot.json`，并在 `fetch_models_dev` 补上真正的 Stage 0/4 兜底，缓存永不为空。(2) 新增 `allow_network=False` 非阻塞读模式，贯穿 `get_model_capabilities`/`get_model_info`/`lookup_models_dev_context`/`get_model_context_length`/`expensive_model_warning`；所有模型保存/切换热路径（网关 `config.set`、REST `/api/model/set`、`/api/model/info`、`/model` 斜杠命令、CLI 切换、模型保存告警）都走该模式——只读缓存/快照、fail-open。(3) `MODELS_DEV_URL` 与超时可用环境变量覆盖（`HERMES_MODELS_DEV_URL` 国内镜像、`HERMES_MODELS_DEV_TIMEOUT`，默认 15s→3s）；`prewarm_models_dev_async` 在 web 启动时后台预热缓存（`HERMES_DISABLE_MODELS_DEV_PREWARM` 可关）。 | 国内访问 `https://models.dev/api.json` 慢/被墙；同步的 15s 超时拉取就卡在 `/models` 页"设为当前模型"/"保存"的关键路径上，而缓存只有请求成功才会写入——于是每次操作都重吃满 15s（桌面端反馈：模型操作要"十几秒"）。 | 离线优先快照 + 非阻塞读模式建议上游；国内镜像开关与打包属 CN 专有 |
+| **P-029** | `hermes_cli/main.py`、`cron/jobs.py`、`.github/workflows/release-runtime.yml` | 在 `cmd_dashboard()`（同步主流程）里、`start_server()` 之前**额外**启动一遍 desktop cron tick 线程——不再只依赖 FastAPI lifespan handler，于是 lifespan 静默失败也不会让 cron 死掉；新路径失败时用 `logger.exception()` 显式记录。lifespan 里的原 ticker 保留作双保险；`cron/.tick.lock` 的 flock 让两者互斥（同一进程内、不同 fd 也会拒绝第二把锁），任务不会重复触发。另把 `cron/jobs.json` 的读取改为 `utf-8-sig`（容忍 BOM）。并修复发布工作流的 `Sign manifest` 门控：把 `RUNTIME_SIGN_PRIVATE_KEY_PEM` 提到 **job 级** `env:`，用 `if: env.RUNTIME_SIGN_PRIVATE_KEY_PEM != ''` 门控——step 级 env 变量对该 step 自己的 `if:` 不可见,这样真实发布会签名、无 secret 的运行会干净跳过。 | CN Desktop 跑的是 `hermes dashboard` 后端(没有 gateway),只能自己跑 cron。v0.17.0-cn.1:微信 iLink 断网导致 gateway 崩溃 + 桌面重启后,dashboard 恢复了,但 lifespan 没走到 cron 启动代码——scheduler 未初始化、`.tick.lock` 不存在、两个 cron 任务停摆约 14 小时且**毫无错误日志**。移植自 #46(@ytukids),并重做其 workflow 改动:原改动把 step 级 env 变量用在该 step 自己的 `if:` 里,会**静默关掉每次运行时构建的发布签名**。 | `cmd_dashboard` 启动 cron + `utf-8-sig` 读取属通用可靠性(可上游);workflow 签名门控属 CN 专有(仅 fork 发布运行时)。相关:P-021(cron 静默失效系列)、P-028。 |
+| **P-030** | `tools/file_operations.py`、`tests/tools/test_search_python_fallback.py` | `search_files` 在**本地后端**且无 ripgrep 时改为进程内纯 Python 搜索（文件名用 os.walk + fnmatch，内容用逐行 regex），不再直接报错。本地后端不再 shell 出 POSIX `command -v` 探测与 `find`/`grep` 管线（它们在 Windows PowerShell 下根本跑不了），`test -e` 路径存在性检查改走本地 Python，并给 ripgrepy 的 subprocess 调用钉上 `encoding="utf-8"`（修 cp936 乱码）。回退会剪掉 vendored/缓存与隐藏目录并限制扫描文件数；对含 `\n` 的正则沿用 rg/grep 的逐行语义。远程后端 shell 路径保持不变。 | GitHub #334：Windows 上 `_has_command` 的 `command -v rg` 探测在 PowerShell 下无法执行，于是 rg/grep/find 即便装了也被判为缺失；都没装时搜索直接返回"requires ripgrep"——而 terminal 工具又禁止模型直接用 grep/rg/find，等于没有可用搜索。 | 建议上游（通用可移植性修复；P-019 把 PowerShell 设为 Windows 唯一 shell 后更必要） |
+| **P-031** | `agent/agent_init.py`、`tests/agent/test_model_extra_body.py`、`website/docs/user-guide/configuring-models.md`（含 zh-Hans） | `init_agent` 通过新增的 `_merge_model_extra_body`（仿 `_merge_custom_provider_extra_body`）把主 `model.extra_body` 配置块并入 `request_overrides['extra_body']`，于是内建 provider（DeepSeek 等）也会应用用户设置的 OpenAI 兼容采样参数（`frequency_penalty`/`presence_penalty`/`top_p`）。优先级 `caller > custom_providers > model.extra_body`；走 transport 既有的 `request_overrides` 最后合并，因此也会盖过 provider profile 自带的同名键（如 DeepSeek 的 `thinking`）。 | GitHub #336：顶层 `model.extra_body` 对所有一等 provider 被静默丢弃——只有 `custom_providers` 能携带 `extra_body`，用户只能改 provider 源码（升级即丢）。 | 建议上游（通用配置缺口） |
 
 ## 发布和维护支撑
 
@@ -42,6 +48,16 @@
 | managed runtime | `.github/workflows/release-runtime.yml`, `scripts/sign_runtime_manifest.py`, `docs/RUNTIME_RELEASES.md` | 构建 PyInstaller runtime，签名 manifest，并发布给 desktop 下载 |
 
 ## 补丁详情
+
+### P-026：桌面托管运行时收敛第三方缓存到 HERMES_HOME
+
+**现象**（Windows 桌面）：用户把 CN 桌面装到 D 盘以躲开快满的 C 盘，但 C 盘仍持续增长。桌面端自身的运行时树已经收敛，但内核引入的 Python 库仍把缓存散落在 C 盘的用户主目录里。
+
+**根因**：huggingface/transformers、torch、tiktoken、matplotlib、nltk、playwright 在未设置各自环境变量时，默认把缓存写到用户主目录（`~/.cache/...`、`%USERPROFILE%\...`），而托管运行时从未设置它们——于是无论装到哪个盘，这些缓存都逃逸出收敛根。当前运行时里真实可达的命中是 tiktoken（`hermes_cli/tools_config.py`）和 transformers tokenizer（`trajectory_compressor.py`）；playwright 已在 `browser_tool.py` 里自收敛，但只作用于其子进程环境，并非进程级。
+
+**修复**：`hermes_constants.configure_managed_runtime_caches()` 用 `setdefault` 把 `HF_HOME`、`HUGGINGFACE_HUB_CACHE`、`TORCH_HOME`、`TIKTOKEN_CACHE_DIR`、`MPLCONFIGDIR`、`NLTK_DATA`、`PLAYWRIGHT_BROWSERS_PATH` 指向 `<HERMES_HOME>/cache/<tool>`；仅当 `TMPDIR/TEMP/TMP` 都未设置时，再把它们指向 `<HERMES_HOME>/cache/tmp`。由于桌面端把 `HERMES_HOME` 设在其收敛的 `runtime_root()` 下（全新 Windows 安装时锚定到安装目录——见 Hermes-CN-Desktop），这些缓存随之落到所选盘。函数以 `HERMES_DESKTOP_MANAGED=1` 门控并使用 `setdefault`，因此独立 CLI 安装保留其共享 `~/.cache`（不触发重新下载），用户显式设置的值始终优先。挂在 `hermes_bootstrap`（每个入口最先 import）里，确保早于 transformers/tiktoken/playwright 加载。
+
+**测试**：`tests/test_managed_runtime_caches.py`——未设 `HERMES_DESKTOP_MANAGED` 时无操作；托管时把缓存变量设到 HERMES_HOME 下；`setdefault` 不覆盖已有值；已配置临时目录时不动它。
 
 ### P-001：provider dict/list 不一致修复
 
@@ -441,7 +457,9 @@
 
 ---
 
-### P-022：`sanitize_api_messages` 空内容消息过滤
+### P-024：`sanitize_api_messages` 空内容消息过滤
+
+> 原先误编号为 **P-022**，与上面的"流式 stale 检测"补丁撞号（后者有 `cn/P-022-provider-stream-hang` 分支与 `[CN-fork] P-022` 提交坐实 P-022；本空内容过滤补丁没有自己的 P-022 提交，故移到下一个空号）。
 
 **现象**：长会话（如飞书 3-13h）在调用模型 API 时偶发 HTTP 400，错误信息如 MiMo 的 `"text is not set"` 或某些严格 OpenAI 兼容网关的空内容拒绝。出错的请求里包含 `content` 被压缩/截断为空字符串的 `assistant` 或 `user` 消息。
 

@@ -510,8 +510,7 @@ def load_cli_config() -> Dict[str, Any]:
             with open(config_path, "r", encoding="utf-8") as f:
                 from hermes_cli.config import _normalize_root_model_keys
 
-                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
-            
+                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})            
             _file_has_terminal_config = "terminal" in file_config
 
             # Handle model config - can be string (new format) or dict (old format)
@@ -3394,11 +3393,22 @@ def save_config_value(key_path: str, value: any) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    # Use the same precedence as load_cli_config: user config first, then project config
+    # Use the same precedence as load_cli_config: user config first, then project config.
+    # [CN-fork] P-027: only WRITE to the project-level cli-config.yaml when it
+    # ALREADY exists — never CREATE it. It lives in the installed package / source
+    # tree, which must not be written on first use; the user config is the correct
+    # write target (its parent dir is created below). The old "else project" branch
+    # created <repo>/cli-config.yaml whenever the (e.g. test-hermetic) HERMES_HOME
+    # had no config.yaml, which under parallel test runs leaked that file across
+    # workers and polluted project-config reads (load_cli_config under
+    # HERMES_IGNORE_USER_CONFIG). See FORK_NOTES.md P-027.
     user_config_path = _hermes_home / 'config.yaml'
     project_config_path = Path(__file__).parent / 'cli-config.yaml'
-    config_path = user_config_path if user_config_path.exists() else project_config_path
-    
+    config_path = (
+        project_config_path
+        if project_config_path.exists() and not user_config_path.exists()
+        else user_config_path
+    )    
     try:
         # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7418,11 +7428,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             from hermes_cli.model_cost_guard import expensive_model_warning
 
             warning = expensive_model_warning(
-                result.new_model,
-                provider=result.target_provider,
-                base_url=result.base_url or self.base_url or "",
-                api_key=result.api_key or self.api_key or "",
-                model_info=result.model_info,
+                result,
+                allow_network=False,
             )
         except Exception:
             warning = None

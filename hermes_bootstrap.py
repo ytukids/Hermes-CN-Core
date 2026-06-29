@@ -220,3 +220,24 @@ apply_windows_utf8_bootstrap()
 # packages installed into the data volume on a previous run are importable
 # this run, before any backend module imports its SDK. No-op when unset.
 activate_durable_lazy_target()
+
+
+def _configure_managed_runtime_caches() -> None:
+    """Converge third-party framework/tool caches under the desktop-managed
+    runtime's HERMES_HOME so they don't bloat C: on Windows.
+
+    No-op unless ``HERMES_DESKTOP_MANAGED=1``.  Done here, at the first import of
+    every entry point, so it runs before anything imports transformers / tiktoken
+    / playwright.  The import is lazy and the whole thing is guarded so this
+    module stays minimal and dependency-free for the UTF-8 fast path, and a
+    failure here can never block startup.
+    """
+    try:
+        from hermes_constants import configure_managed_runtime_caches
+
+        configure_managed_runtime_caches()
+    except Exception:
+        pass
+
+
+_configure_managed_runtime_caches()

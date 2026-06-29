@@ -62,10 +62,8 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 
 
 
-# =============================================================================
-# Custom Singularity Environment with more space
-# =============================================================================
-
+# # Custom Singularity Environment with more space
+# 
 # Singularity helpers (scratch dir, SIF cache) now live in tools/environments/singularity.py
 from tools.environments.singularity import _get_scratch_dir
 from tools.tool_backend_helpers import (
@@ -248,10 +246,8 @@ def _reset_cached_sudo_passwords() -> None:
     with _sudo_password_cache_lock:
         _sudo_password_cache.clear()
 
-# =============================================================================
-# Dangerous Command Approval System
-# =============================================================================
-
+# # Dangerous Command Approval System
+# 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
@@ -1844,10 +1840,8 @@ def _atexit_cleanup():
 atexit.register(_atexit_cleanup)
 
 
-# =============================================================================
-# Exit Code Context for Common CLI Tools
-# =============================================================================
-# Many Unix commands use non-zero exit codes for informational purposes, not
+# # Exit Code Context for Common CLI Tools
+# # Many Unix commands use non-zero exit codes for informational purposes, not
 # to indicate failure.  The model sees a raw exit_code=1 from `grep` and
 # wastes a turn investigating something that just means "no matches".
 # This lookup adds a human-readable note so the agent can move on.
@@ -2803,6 +2797,8 @@ def terminal_tool(
                 result_dict["approval"] = approval_note
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
+            if result.get("pwsh_warnings"):
+                result_dict["pwsh_warnings"] = result["pwsh_warnings"]
             if sudo_auth_failed:
                 result_dict["sudo_auth_failed"] = True
             if sudo_cache_cleared:

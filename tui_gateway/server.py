@@ -139,6 +139,13 @@ _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
+# Last config-health warning string already emitted to the log. _probe_config_health
+# runs on every session create, but the warning is process-global (about config.yaml,
+# not the session), so we only log each distinct warning once — re-logging it per
+# session floods the dashboard log. Reset whenever the warning content changes so a
+# newly-introduced config issue still surfaces. The per-session UI surfacing via
+# info["config_warning"] is unaffected.
+_last_logged_config_warning: str | None = None
 _session_resume_lock = threading.Lock()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
@@ -1284,8 +1291,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
             if cfg_warn:
-                info["config_warning"] = cfg_warn
-                logger.warning(cfg_warn)
+                info["config_warning"] = cfg_warn  # per-session UI surfacing (always)
+                # Log only when the warning text changes, so an unchanged
+                # config issue isn't re-logged on every session create.
+                if _should_log_config_warning(cfg_warn):
+                    logger.warning(cfg_warn)
             _emit("session.info", sid, info)
             # If MCP discovery is still in flight (a server slower than the
             # bounded wait_for_mcp_discovery join in _make_agent), the agent
@@ -2683,12 +2693,16 @@ def _apply_model_switch(
         try:
             from hermes_cli.model_cost_guard import expensive_model_warning
 
+            # Non-blocking: the cost guard reads result.model_info + the
+            # models.dev cache/bundled snapshot only, never the network, so a
+            # /model switch never stalls on the models.dev round-trip (P-028).
             warning = expensive_model_warning(
                 result.new_model,
                 provider=result.target_provider,
                 base_url=result.base_url or current_base_url,
                 api_key=result.api_key or current_api_key,
                 model_info=result.model_info,
+                allow_network=False,
             )
         except Exception:
             warning = None
@@ -3053,6 +3067,24 @@ def _probe_config_health(cfg: dict) -> str:
                 "personality overlay will be skipped."
             )
     return " ".join(warnings).strip()
+
+
+def _should_log_config_warning(cfg_warn: str) -> bool:
+    """Return True iff ``cfg_warn`` hasn't been logged yet, recording it as the
+    last-logged warning.
+
+    ``_probe_config_health`` runs on every session create, but its warning is
+    about process-global config.yaml state, not the session — re-logging it each
+    time floods the dashboard log (the symptom this dedup fixes). We log each
+    distinct warning string once; a different warning (a newly-introduced config
+    issue) still surfaces because the comparison is by content. Per-session UI
+    surfacing via ``info["config_warning"]`` is independent and unaffected.
+    """
+    global _last_logged_config_warning
+    if cfg_warn and cfg_warn != _last_logged_config_warning:
+        _last_logged_config_warning = cfg_warn
+        return True
+    return False
 
 
 def _current_profile_name() -> str:
@@ -7201,9 +7233,9 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"logged_in": False, "balance_lines": [], "identity_line": None, "topup_url": None, "depleted": False})
 
 
-# ===========================================================================
+# =====
 # Phase 2b terminal billing RPC methods
-# ===========================================================================
+# =====
 #
 # These return STRUCTURED success envelopes (result.ok / result.error) rather
 # than JSON-RPC-level errors, so the TUI's rpc() promise always resolves and the
@@ -8775,6 +8807,36 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
 
+        # P-023: deliver a late /steer as the next user turn. run_conversation
+        # only injects steer into a following tool result; one that lands after
+        # the last tool batch (or in a text-only turn) comes back as
+        # result["pending_steer"]. cli.py re-delivers it; the gateway used to
+        # drop it, so desktop steers silently vanished. Done AFTER the finally
+        # releases session["running"] (same rationale as the goal hook below);
+        # a racing real prompt wins via the running guard. Takes priority over
+        # goal continuation since it's explicit user input — its own turn
+        # completion will re-run the goal judge anyway. Run BEFORE draining a
+        # queued prompt: the queued prompt is persistent (survives in the queue
+        # for the next turn-end) while this steer is a one-shot local, so steer
+        # first never loses the queued prompt.
+        if steer_followup:
+            with session["history_lock"]:
+                if session.get("running"):
+                    return
+                session["running"] = True
+            try:
+                # _run_prompt_submit emits message.start itself, so don't
+                # pre-emit here (that would double-fire it).
+                _run_prompt_submit(rid, sid, session, steer_followup)
+                return
+            except Exception as _steer_exc:
+                print(
+                    f"[tui_gateway] steer continuation dispatch failed: "
+                    f"{type(_steer_exc).__name__}: {_steer_exc}",
+                    file=sys.stderr,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
@@ -12242,6 +12304,92 @@ def _build_probe_url_candidates(base_url: str) -> list[str]:
     return candidates
 
 
+def _fetch_provider_model_ids(
+    base_url: str, api_key: str, timeout_s: float
+) -> dict:
+    """GET the first responding /models candidate and parse its model ids.
+
+    Shared by ``provider.probe`` (connectivity test, samples 5) and
+    ``provider.models`` (refresh picker, full list). Returns a normalized dict::
+
+        {ok, model_ids, status_code, latency_ms, error, error_kind}
+
+    ``api_key`` may be empty — local servers (Ollama, LM Studio) need none, so
+    the Authorization header is only attached when a key is present. Failures
+    are returned as data (never raised) so callers wrap them in an ``_ok``
+    envelope and the UI can branch on ``error_kind``.
+    """
+    import time
+    import httpx
+
+    candidates = _build_probe_url_candidates(base_url)
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    timeout_ms = int(timeout_s * 1000)
+    last_status: int | None = None
+    last_error: str | None = None
+
+    for url in candidates:
+        try:
+            start = time.monotonic()
+            resp = httpx.get(url, headers=headers, timeout=timeout_s)
+            latency_ms = int((time.monotonic() - start) * 1000)
+
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                raw_models = data.get("data", []) if isinstance(data, dict) else []
+                model_ids = [
+                    str(m.get("id", "")).strip()
+                    for m in raw_models
+                    if isinstance(m, dict) and m.get("id")
+                ]
+                return {
+                    "ok": True,
+                    "model_ids": model_ids,
+                    "status_code": 200,
+                    "latency_ms": latency_ms,
+                    "error": None,
+                    "error_kind": None,
+                }
+
+            last_status = resp.status_code
+            # Auth failures are terminal — no point trying other URL patterns
+            # since they'd return the same 401/403.
+            if resp.status_code in (401, 403):
+                return {
+                    "ok": False,
+                    "model_ids": [],
+                    "status_code": resp.status_code,
+                    "latency_ms": latency_ms,
+                    "error": f"API key rejected (HTTP {resp.status_code})",
+                    "error_kind": "auth",
+                }
+            # 404 / 405 → try next candidate URL
+            last_error = f"HTTP {resp.status_code}"
+        except httpx.TimeoutException:
+            return {
+                "ok": False,
+                "model_ids": [],
+                "status_code": None,
+                "latency_ms": timeout_ms,
+                "error": f"timed out after {timeout_ms}ms",
+                "error_kind": "timeout",
+            }
+        except httpx.HTTPError as e:
+            last_error = str(e) or "network error"
+
+    return {
+        "ok": False,
+        "model_ids": [],
+        "status_code": last_status,
+        "latency_ms": 0,
+        "error": last_error or "no /models endpoint responded",
+        "error_kind": "http" if last_status else "network",
+    }
+
+
 @method("provider.probe")
 def _(rid, params: dict) -> dict:
     """Lightweight connectivity check against a provider's /models endpoint.
@@ -12260,9 +12408,6 @@ def _(rid, params: dict) -> dict:
     are *data*, not RPC errors, so the UI can branch on error_kind without
     JSON-RPC plumbing).
     """
-    import time
-    import httpx
-
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
 
@@ -12304,82 +12449,83 @@ def _(rid, params: dict) -> dict:
         except (TypeError, ValueError):
             timeout_ms = 5000
         timeout_ms = max(1000, min(timeout_ms, 30000))
-        timeout_s = timeout_ms / 1000.0
 
-        candidates = _build_probe_url_candidates(base_url)
-        last_status: int | None = None
-        last_error: str | None = None
-
-        for url in candidates:
-            try:
-                start = time.monotonic()
-                resp = httpx.get(
-                    url,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=timeout_s,
-                )
-                latency_ms = int((time.monotonic() - start) * 1000)
-
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = {}
-                    raw_models = data.get("data", []) if isinstance(data, dict) else []
-                    model_ids = [
-                        str(m.get("id", "")).strip()
-                        for m in raw_models
-                        if isinstance(m, dict) and m.get("id")
-                    ]
-                    return _ok(rid, {
-                        "ok": True,
-                        "latency_ms": latency_ms,
-                        "model_count": len(model_ids),
-                        "sample_models": model_ids[:5],
-                        "status_code": 200,
-                        "error": None,
-                        "error_kind": None,
-                    })
-
-                last_status = resp.status_code
-                # Auth failures are terminal — no point trying other URL
-                # patterns since they'd return the same 401/403.
-                if resp.status_code in (401, 403):
-                    return _ok(rid, {
-                        "ok": False,
-                        "latency_ms": latency_ms,
-                        "model_count": 0,
-                        "sample_models": [],
-                        "status_code": resp.status_code,
-                        "error": f"API key rejected (HTTP {resp.status_code})",
-                        "error_kind": "auth",
-                    })
-                # 404 / 405 → try next candidate URL
-                last_error = f"HTTP {resp.status_code}"
-            except httpx.TimeoutException:
-                return _ok(rid, {
-                    "ok": False,
-                    "latency_ms": timeout_ms,
-                    "model_count": 0,
-                    "sample_models": [],
-                    "status_code": None,
-                    "error": f"timed out after {timeout_ms}ms",
-                    "error_kind": "timeout",
-                })
-            except httpx.HTTPError as e:
-                last_error = str(e) or "network error"
-
+        result = _fetch_provider_model_ids(base_url, api_key, timeout_ms / 1000.0)
+        model_ids = result["model_ids"]
         return _ok(rid, {
-            "ok": False,
-            "latency_ms": 0,
-            "model_count": 0,
-            "sample_models": [],
-            "status_code": last_status,
-            "error": last_error or "no /models endpoint responded",
-            "error_kind": "http" if last_status else "network",
+            "ok": result["ok"],
+            "latency_ms": result["latency_ms"],
+            "model_count": len(model_ids),
+            "sample_models": model_ids[:5],
+            "status_code": result["status_code"],
+            "error": result["error"],
+            "error_kind": result["error_kind"],
         })
     except Exception as e:
         return _err(rid, 5042, str(e))
+
+
+@method("provider.models")
+def _(rid, params: dict) -> dict:
+    """Full model-id list for a provider's /models endpoint (refresh picker).
+
+    Like ``provider.probe`` but returns the *complete* list (probe only samples
+    5) and tolerates an empty api_key — local servers (Ollama, LM Studio,
+    vLLM) need none. The desktop's model picker calls this through the gateway
+    instead of fetching the LAN endpoint directly, so a self-hosted provider on
+    a private IP (e.g. http://192.168.x.x:11434/v1) is reachable from the
+    backend rather than being blocked by the desktop's external-request SSRF
+    guard.
+
+    Params:
+        provider: provider slug (e.g. "deepseek"); only used for env-var/base
+            fallback, so custom providers may pass any non-empty placeholder.
+        api_key: optional override; falls back to PROVIDER_REGISTRY env var.
+        base_url: optional override; falls back to PROVIDER_REGISTRY default.
+        timeout_ms: optional, default 8000, clamped 1000-30000.
+
+    Returns (always _ok envelope; failures are data, not RPC errors)::
+
+        {ok, models, model_count, status_code, error, error_kind}
+    """
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        provider = str(params.get("provider", "")).strip()
+        if not provider:
+            return _err(rid, 5043, "provider parameter is required")
+
+        api_key = str(params.get("api_key", "")).strip()
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        if not api_key and pconfig and pconfig.api_key_env_vars:
+            for env_var in pconfig.api_key_env_vars:
+                api_key = os.getenv(env_var, "").strip()
+                if api_key:
+                    break
+
+        base_url = str(params.get("base_url", "")).strip().rstrip("/")
+        if not base_url and pconfig:
+            base_url = (pconfig.inference_base_url or "").rstrip("/")
+        if not base_url:
+            return _err(rid, 5044, f"unknown provider: {provider}")
+
+        try:
+            timeout_ms = int(params.get("timeout_ms", 8000))
+        except (TypeError, ValueError):
+            timeout_ms = 8000
+        timeout_ms = max(1000, min(timeout_ms, 30000))
+
+        result = _fetch_provider_model_ids(base_url, api_key, timeout_ms / 1000.0)
+        return _ok(rid, {
+            "ok": result["ok"],
+            "models": result["model_ids"],
+            "model_count": len(result["model_ids"]),
+            "status_code": result["status_code"],
+            "error": result["error"],
+            "error_kind": result["error_kind"],
+        })
+    except Exception as e:
+        return _err(rid, 5045, str(e))
 
 
 @method("model.save_key")

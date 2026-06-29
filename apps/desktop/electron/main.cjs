@@ -7158,6 +7158,7 @@ ipcMain.handle('hermes:git:scanRepos', async (_event, roots, options) => {
     return []
   }
 })
+
 ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   if (!nodePty) {
     throw new Error('PTY support is unavailable. Reinstall desktop dependencies and restart Hermes.')

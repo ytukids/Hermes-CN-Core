@@ -1,4 +1,5 @@
 import { useStore } from '@nanostores/react'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import { type MouseEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
@@ -6,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { SearchField } from '@/components/ui/search-field'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { getActionStatus, getLogs, getStatus, getUsageAnalytics, restartGateway, updateHermes } from '@/hermes'
-import type { ActionStatusResponse, AnalyticsResponse, StatusResponse } from '@/hermes'
+import type { ActionStatusResponse, AnalyticsResponse, SessionInfo, StatusResponse } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { Activity, AlertCircle, BarChart3, Bookmark, BookmarkFilled, Download, Pin, Trash2 } from '@/lib/icons'
@@ -20,6 +21,8 @@ import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { OverlayMain, OverlayNavItem, OverlaySidebar, OverlaySplitLayout } from '../overlays/overlay-split-layout'
 import { OverlayView } from '../overlays/overlay-view'
+
+import { filterCommandCenterSessions } from './sessions'
 
 export type CommandCenterSection = 'sessions' | 'system' | 'usage'
 
@@ -127,26 +130,10 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
 
   const debouncedQuery = useDebouncedValue(query.trim(), 180)
 
-  const filteredSessions = useMemo(() => {
-    const sorted = [...sessions].sort((a, b) => {
-      const left = a.last_active || a.started_at || 0
-      const right = b.last_active || b.started_at || 0
-
-      return right - left
-    })
-
-    const needle = debouncedQuery.toLowerCase()
-
-    if (!needle) {
-      return sorted
-    }
-
-    return sorted.filter(session => {
-      const haystack = `${sessionTitle(session)} ${session.id}`.toLowerCase()
-
-      return haystack.includes(needle)
-    })
-  }, [debouncedQuery, sessions])
+  const filteredSessions = useMemo(
+    () => filterCommandCenterSessions(sessions, debouncedQuery),
+    [debouncedQuery, sessions]
+  )
 
   const refreshSystem = useCallback(async () => {
     setSystemLoading(true)
@@ -212,8 +199,6 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
       void refreshUsage(usagePeriod)
     }
   })
-
-  const sessionListHasResults = filteredSessions.length > 0
 
   const runSystemAction = useCallback(
     async (kind: 'restart' | 'update') => {
@@ -301,56 +286,13 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
           </header>
 
           {section === 'sessions' ? (
-            <div className="min-h-0 flex-1 overflow-y-auto">
-              {!sessionListHasResults ? (
-                <EmptyPanel description={debouncedQuery ? cc.noResults : cc.noSessions} />
-              ) : (
-                <ul>
-                  {filteredSessions.map(session => {
-                    const pinId = sessionPinId(session)
-                    const pinned = pinnedSessionIds.includes(pinId)
-
-                    return (
-                      <li className="group flex items-center gap-2 py-2" key={session.id}>
-                        <button
-                          className="min-w-0 flex-1 text-left"
-                          onClick={() => onOpenSession(session.id)}
-                          type="button"
-                        >
-                          <div className="truncate text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
-                            {sessionTitle(session)}
-                          </div>
-                          <div className="truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-                            {formatTimestamp(session.last_active || session.started_at)}
-                          </div>
-                        </button>
-                        <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                          <RowIconButton
-                            onClick={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
-                            title={pinned ? cc.unpinSession : cc.pinSession}
-                          >
-                            {pinned ? <BookmarkFilled className="size-3.5" /> : <Bookmark className="size-3.5" />}
-                          </RowIconButton>
-                          <RowIconButton
-                            onClick={() => void exportSession(session.id, { session, title: sessionTitle(session) })}
-                            title={cc.exportSession}
-                          >
-                            <Download className="size-3.5" />
-                          </RowIconButton>
-                          <RowIconButton
-                            className="hover:text-destructive"
-                            onClick={() => void onDeleteSession(session.id)}
-                            title={cc.deleteSession}
-                          >
-                            <Trash2 className="size-3.5" />
-                          </RowIconButton>
-                        </div>
-                      </li>
-                    )
-                  })}
-                </ul>
-              )}
-            </div>
+            <SessionsPanel
+              debouncedQuery={debouncedQuery}
+              filteredSessions={filteredSessions}
+              onDeleteSession={onDeleteSession}
+              onOpenSession={onOpenSession}
+              pinnedSessionIds={pinnedSessionIds}
+            />
           ) : section === 'usage' ? (
             <UsagePanel
               error={usageError}
@@ -449,6 +391,114 @@ function formatTokens(value: null | number | undefined): string {
 
 function formatInteger(value: null | number | undefined): string {
   return Number(value ?? 0).toLocaleString()
+}
+
+const SESSION_ROW_ESTIMATE_PX = 52
+const SESSION_OVERSCAN_ROWS = 8
+
+interface SessionsPanelProps {
+  debouncedQuery: string
+  filteredSessions: SessionInfo[]
+  onDeleteSession: (sessionId: string) => Promise<void>
+  onOpenSession: (sessionId: string) => void
+  pinnedSessionIds: string[]
+}
+
+/**
+ * Virtualized session list (issue #19). Mirrors the sidebar's VirtualSessionList
+ * pattern (padding-spacer layout + measureElement + data-index) so only the
+ * visible window of rows mounts, instead of one DOM row per session. Kept as a
+ * sibling component so the useVirtualizer hook only mounts while the sessions
+ * section is shown and the diff stays local to this list.
+ */
+function SessionsPanel({
+  debouncedQuery,
+  filteredSessions,
+  onDeleteSession,
+  onOpenSession,
+  pinnedSessionIds
+}: SessionsPanelProps) {
+  const { t } = useI18n()
+  const cc = t.commandCenter
+  const scrollerRef = useRef<HTMLDivElement | null>(null)
+
+  const virtualizer = useVirtualizer({
+    count: filteredSessions.length,
+    estimateSize: () => SESSION_ROW_ESTIMATE_PX,
+    getItemKey: index => filteredSessions[index]?.id ?? index,
+    getScrollElement: () => scrollerRef.current,
+    initialRect: { height: 600, width: 480 },
+    overscan: SESSION_OVERSCAN_ROWS
+  })
+
+  const virtualItems = virtualizer.getVirtualItems()
+  const totalSize = virtualizer.getTotalSize()
+  const paddingTop = virtualItems[0]?.start ?? 0
+  const paddingBottom = Math.max(0, totalSize - (virtualItems[virtualItems.length - 1]?.end ?? 0))
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto" ref={scrollerRef}>
+      {filteredSessions.length === 0 ? (
+        <EmptyPanel description={debouncedQuery ? cc.noResults : cc.noSessions} />
+      ) : (
+        <ul style={{ paddingBottom: `${paddingBottom}px`, paddingTop: `${paddingTop}px` }}>
+          {virtualItems.map(virtualItem => {
+            const session = filteredSessions[virtualItem.index]
+
+            if (!session) {
+              return null
+            }
+
+            const pinId = sessionPinId(session)
+            const pinned = pinnedSessionIds.includes(pinId)
+
+            return (
+              <li
+                className="group flex items-center gap-2 py-2"
+                data-index={virtualItem.index}
+                key={session.id}
+                ref={virtualizer.measureElement}
+              >
+                <button
+                  className="min-w-0 flex-1 text-left"
+                  onClick={() => onOpenSession(session.id)}
+                  type="button"
+                >
+                  <div className="truncate text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
+                    {sessionTitle(session)}
+                  </div>
+                  <div className="truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+                    {formatTimestamp(session.last_active || session.started_at)}
+                  </div>
+                </button>
+                <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                  <RowIconButton
+                    onClick={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
+                    title={pinned ? cc.unpinSession : cc.pinSession}
+                  >
+                    {pinned ? <BookmarkFilled className="size-3.5" /> : <Bookmark className="size-3.5" />}
+                  </RowIconButton>
+                  <RowIconButton
+                    onClick={() => void exportSession(session.id, { session, title: sessionTitle(session) })}
+                    title={cc.exportSession}
+                  >
+                    <Download className="size-3.5" />
+                  </RowIconButton>
+                  <RowIconButton
+                    className="hover:text-destructive"
+                    onClick={() => void onDeleteSession(session.id)}
+                    title={cc.deleteSession}
+                  >
+                    <Trash2 className="size-3.5" />
+                  </RowIconButton>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </div>
+  )
 }
 
 interface UsagePanelProps {

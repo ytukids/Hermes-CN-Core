@@ -377,7 +377,9 @@ _SPAWN_COMPATIBLE_SHELLS = frozenset({"bash", "zsh", "sh", "dash", "ksh", "mksh"
 def _find_shell() -> str:
     """Find the user's login shell for background process spawning.
 
-    Unlike ``_find_bash`` (which always returns a bash binary for callers
+    (process_registry.py imports this name.)
+
+    Unlike ``_find_bash_posix`` (which always returns a bash binary for callers
     that explicitly need bash), this function prefers the user's configured
     ``$SHELL`` on POSIX so that ``spawn_local`` uses the shell the user
     actually logs in with.
@@ -399,10 +401,11 @@ def _find_shell() -> str:
     ``set +m`` job-control syntax is NOT understood by fish, csh/tcsh,
     nushell, elvish, xonsh, etc.  Returning such a ``$SHELL`` would trade the
     bash-3.2 swallow for a parse error on every background command, so for any
-    non-allowlisted shell we fall back to ``_find_bash`` (the prior behaviour).
+    non-allowlisted shell we fall back to ``_find_bash_posix`` (the prior
+    behaviour).
 
-    On Windows, ``$SHELL`` is typically bash (Git Bash), so behaviour is
-    unchanged — we fall through to ``_find_bash``.
+    On Windows (PowerShell-only in this fork, per P-019) this falls through to
+    ``_find_bash_posix``; background spawning on Windows does not use ``$SHELL``.
     """
     if not _IS_WINDOWS:
         user_shell = os.environ.get("SHELL")
@@ -413,7 +416,7 @@ def _find_shell() -> str:
             and Path(user_shell).name in _SPAWN_COMPATIBLE_SHELLS
         ):
             return user_shell
-    return _find_bash()
+    return _find_bash_posix()
 
 
 # Standard PATH entries for environments with minimal PATH.

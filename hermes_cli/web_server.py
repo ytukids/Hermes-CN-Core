@@ -225,6 +225,17 @@ async def _lifespan(app: "FastAPI"):
     # the server socket is already open and accepting probes.
     asyncio.get_event_loop().run_in_executor(None, _warm_gateway_module)
 
+    # Warm the models.dev registry off-thread (P-028). Hot paths read it
+    # non-blocking (cache/bundled snapshot), so this only refreshes the shared
+    # disk cache for freshness — fire-and-forget, exception-isolated, runs at
+    # most once, and honours HERMES_DISABLE_MODELS_DEV_PREWARM (tests).
+    try:
+        from agent.models_dev import prewarm_models_dev_async
+
+        prewarm_models_dev_async()
+    except Exception:
+        pass
+
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
     # dashboard` is unaffected — it relies on its own gateway.
@@ -521,67 +532,6 @@ def _unique_upload_path(directory: Path, filename: str) -> Path:
         if not next_candidate.exists():
             return next_candidate
     raise ValueError("too many files with the same name")
-
-
-_FS_LIST_MAX_ENTRIES = 5000  # safety cap; /tmp or huge dirs would otherwise return tens of thousands of entries
-
-
-def _resolve_fs_path(raw: str) -> Path:
-    """Resolve a user-supplied path for /api/fs/list (P-004).
-
-    P-004 helper: empty / missing → home; ~ expansion; .. folded via .resolve().
-    Restricted to the user home subtree — anything outside raises 400 so the
-    web picker cannot wander into /Library, /private, /System etc. (most of
-    which are TCC-blocked anyway and would 403 the whole listing).
-    """
-    home = Path.home().resolve(strict=False)
-    candidate = (raw or "").strip()
-    if not candidate:
-        return home
-    if candidate.startswith("~"):
-        path = Path(candidate).expanduser().resolve(strict=False)
-    else:
-        path = Path(candidate).resolve(strict=False)
-    try:
-        path.relative_to(home)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Path must be inside your home directory ({home})",
-        )
-    return path
-
-
-def _list_directory_entries(directory: Path, include_hidden: bool) -> List[Dict[str, Any]]:
-    """List immediate children of a directory for /api/fs/list (P-004).
-
-    Returns dicts with name/path/is_dir.  Skips entries whose stat fails (broken
-    symlinks, permission errors).  Sorted: directories first, then case-insensitive name.
-    Capped at _FS_LIST_MAX_ENTRIES to keep responses bounded.
-    """
-    entries: List[Dict[str, Any]] = []
-    try:
-        with os.scandir(directory) as scanner:
-            for entry in scanner:
-                if not include_hidden and entry.name.startswith("."):
-                    continue
-                try:
-                    is_dir = entry.is_dir(follow_symlinks=False)
-                except OSError:
-                    continue
-                entries.append({
-                    "name": entry.name,
-                    "path": str(directory / entry.name),
-                    "is_dir": is_dir,
-                })
-                if len(entries) >= _FS_LIST_MAX_ENTRIES:
-                    break
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Permission denied")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read directory: {exc}")
-    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
-    return entries
 
 
 # Accepted Host header values for loopback binds. DNS rebinding attacks
@@ -1752,6 +1702,71 @@ def _decode_data_url(data_url: str) -> tuple[bytes, str]:
     return data, mime_type
 
 
+@app.post("/api/upload")
+async def upload_attachment(request: Request):
+    """Store a browser-selected attachment for the local dashboard UI.
+
+    Files are written under ``~/.hermes/uploads/<session_id>/`` and the
+    absolute path is returned so the TUI gateway can attach images or reference
+    files in a follow-up prompt.
+
+    [CN-fork] P-002 — downstream-only; upstream added it once (``e7c3cd772``)
+    then reverted. The desktop composer's paste/drop image flow depends on this
+    route (Desktop ``web/src/lib/transport.ts`` POSTs multipart here, and
+    ``src/commands/api_proxy.rs``'s ``upload_file`` proxies to it). Without it
+    the SPA catch-all answers the path on GET only, so the POST returns HTTP 405
+    and pasting an image fails. Keep this handler beside its helpers and the
+    regression test in ``tests/hermes_cli/test_web_server_upload.py`` so an
+    upstream sync can't silently drop it again. See FORK_NOTES.md P-002.
+    """
+    length_raw = request.headers.get("content-length")
+    try:
+        if length_raw and int(length_raw) > _UPLOAD_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="File too large")
+    except ValueError:
+        pass
+
+    body = await request.body()
+    if len(body) > _UPLOAD_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="File too large")
+
+    try:
+        fields, files = _parse_multipart_form(request.headers.get("content-type", ""), body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    session_id = (fields.get("session_id") or "default").strip()
+    if not _UPLOAD_SESSION_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session id")
+
+    upload = files.get("file")
+    if not upload:
+        raise HTTPException(status_code=400, detail="Missing file")
+
+    content = upload["content"]
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    upload_dir = get_hermes_home() / "uploads" / session_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = _safe_upload_filename(str(upload.get("filename") or "attachment"))
+    target = _unique_upload_path(upload_dir, filename)
+    target.write_bytes(content)
+
+    content_type = str(upload.get("content_type") or "")
+    if not content_type or content_type == "application/octet-stream":
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+
+    return {
+        "ok": True,
+        "filename": target.name,
+        "path": str(target),
+        "size": len(content),
+        "mime_type": content_type,
+    }
+
+
 @app.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
     policy, target, display_path = _resolve_managed_path(path, request)
@@ -2891,12 +2906,29 @@ def _spawn_hermes_action(
 
     cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
 
+    # A detached ``hermes <subcommand>`` child is a fresh, external CLI
+    # invocation — never the running gateway itself. ``gateway/run.py`` sets
+    # ``_HERMES_GATEWAY=1`` as a *module-level* import side effect, so a process
+    # that has imported it leaks the marker into this child's environment. On the
+    # desktop's managed runtime the dashboard is served from inside the gateway
+    # process, so ``hermes gateway restart`` spawned here would inherit the marker
+    # and the restart guard would misfire — "Refusing to restart the gateway from
+    # inside the gateway process" — making the desktop's restart button a no-op
+    # (issue Eynzof/Hermes-CN-Desktop#224). Strip the marker so this child is the
+    # "external shell" the guard expects. The agent-tool-call restart path runs
+    # ``hermes gateway restart`` directly (not via this helper), so its loop
+    # protection is unaffected.
+    child_env = {k: v for k, v in os.environ.items() if k != "_HERMES_GATEWAY"}
+    child_env["HERMES_NONINTERACTIVE"] = "1"
+    if extra_env:
+        child_env.update(extra_env)
+
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
         "stdin": subprocess.DEVNULL,
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
-        "env": {**os.environ, "HERMES_NONINTERACTIVE": "1", **(extra_env or {})},
+        "env": child_env,
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = windows_detach_flags()
@@ -4187,6 +4219,7 @@ def get_model_info(profile: Optional[str] = None):
                 base_url=base_url,
                 provider=provider,
                 config_context_length=None,  # ignore override — we want auto value
+                allow_network=False,  # P-028: never block this endpoint on models.dev/OpenRouter
             )
         except Exception:
             auto_ctx = 0
@@ -4202,7 +4235,11 @@ def get_model_info(profile: Optional[str] = None):
         caps = {}
         try:
             from agent.models_dev import get_model_capabilities
-            mc = get_model_capabilities(provider=provider, model=model_name)
+            # P-028: read cache/bundled snapshot only — this endpoint is hit on
+            # every model save and must never stall on the models.dev round-trip.
+            mc = get_model_capabilities(
+                provider=provider, model=model_name, allow_network=False
+            )
             if mc is not None:
                 caps = {
                     "supports_tools": mc.supports_tools,
@@ -4510,13 +4547,15 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
             try:
                 from hermes_cli.model_cost_guard import expensive_model_warning
 
-                # Pricing lookup can hit models.dev / a /models endpoint on a
-                # cache miss — keep it off the event loop.
+                # P-028: read the models.dev cache/bundled snapshot only — never
+                # block a model-set on the network round-trip. Still off the
+                # event loop for the cheap cache read.
                 warning = await asyncio.to_thread(
                     expensive_model_warning,
                     model,
                     provider=provider,
                     base_url=base_url,
+                    allow_network=False,
                 )
             except Exception:
                 warning = None
@@ -6769,8 +6808,47 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# OAuth status cache (P-025) — keep the Models page (and the chat WebSocket)
+# responsive. Assembling the Accounts-tab list calls each provider's auth-status
+# helper serially, and a few touch the network/subprocess. The desktop Models
+# page fetched this on every open AND on every window refocus; because the
+# handler is ``async`` those blocking calls ran on the FastAPI event loop,
+# stalling the gateway WebSocket that streams chat. Cache the assembled payload
+# briefly per profile (the GET handler also runs the per-provider checks
+# concurrently, off the loop). Busted on any connect/disconnect.
+# ---------------------------------------------------------------------------
+_OAUTH_STATUS_TTL_SECONDS = 20.0
+_OAUTH_STATUS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_OAUTH_STATUS_CACHE_LOCK = threading.Lock()
+
+
+def _oauth_cache_key(profile: Optional[str]) -> str:
+    requested = (profile or "").strip().lower()
+    return requested or "current"
+
+
+def _oauth_status_cache_get(key: str) -> Optional[List[Dict[str, Any]]]:
+    with _OAUTH_STATUS_CACHE_LOCK:
+        hit = _OAUTH_STATUS_CACHE.get(key)
+        if hit is not None and (time.monotonic() - hit[0]) < _OAUTH_STATUS_TTL_SECONDS:
+            return hit[1]
+    return None
+
+
+def _oauth_status_cache_put(key: str, providers: List[Dict[str, Any]]) -> None:
+    with _OAUTH_STATUS_CACHE_LOCK:
+        _OAUTH_STATUS_CACHE[key] = (time.monotonic(), providers)
+
+
+def _invalidate_oauth_status_cache() -> None:
+    """Drop cached OAuth status so the next GET reflects a connect/disconnect."""
+    with _OAUTH_STATUS_CACHE_LOCK:
+        _OAUTH_STATUS_CACHE.clear()
+
+
 @app.get("/api/providers/oauth")
-async def list_oauth_providers(profile: Optional[str] = None):
+async def list_oauth_providers(profile: Optional[str] = None, refresh: bool = False):
     """Enumerate every OAuth-capable LLM provider with current status.
 
     Response shape (per provider):
@@ -6793,23 +6871,62 @@ async def list_oauth_providers(profile: Optional[str] = None):
     sync with the `hermes model` picker; _OAUTH_OVERRIDES supplies per-provider
     flow/status/cli metadata.
     """
-    with _profile_scope(profile):
-        providers = []
-        for p in _build_oauth_catalog():
-            status = _resolve_provider_status(p["id"], p.get("status_fn"))
-            disconnect_hint = _oauth_provider_disconnect_hint(p, status)
-            providers.append({
-                "id": p["id"],
-                "name": p["name"],
-                "flow": p["flow"],
-                "cli_command": p["cli_command"],
-                "docs_url": p["docs_url"],
-                "disconnect_hint": disconnect_hint,
-                "disconnect_command": _oauth_provider_disconnect_command(p),
-                "disconnectable": disconnect_hint is None,
-                "status": status,
-            })
-        return {"providers": providers}
+    # The module-level TestClient app is shared across tests in a file, and each
+    # test gets its own HERMES_HOME tmpdir under the same "current" cache key — a
+    # persistent cache would leak one test's provider status into the next. Skip
+    # the cache under pytest; the cache helpers are unit-tested directly.
+    cache_enabled = not os.environ.get("PYTEST_CURRENT_TEST")
+    cache_key = _oauth_cache_key(profile)
+    if cache_enabled and not refresh:
+        cached = _oauth_status_cache_get(cache_key)
+        if cached is not None:
+            return {"providers": cached}
+
+    # Resolve the profile's home as a context-local override for this request.
+    # Deliberately NOT _profile_scope: its lock-protected skills-globals swap is
+    # unneeded for auth-status reads and unsafe to hold while we fan the
+    # per-provider checks out across threads. asyncio.to_thread copies this
+    # contextvar into each worker, so every provider resolves its auth store
+    # against the right profile while running OFF the event loop (these calls
+    # block on file/network/subprocess I/O — inline they stalled the chat WS).
+    requested = (profile or "").strip()
+    token = None
+    if requested and requested.lower() != "current":
+        from hermes_constants import set_hermes_home_override
+        token = set_hermes_home_override(str(_resolve_profile_dir(requested)))
+    try:
+        catalog = _build_oauth_catalog()
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(_resolve_provider_status, p["id"], p.get("status_fn"))
+                for p in catalog
+            ),
+            return_exceptions=True,
+        )
+    finally:
+        if token is not None:
+            from hermes_constants import reset_hermes_home_override
+            reset_hermes_home_override(token)
+
+    providers = []
+    for p, status in zip(catalog, results):
+        if isinstance(status, BaseException):
+            status = {"logged_in": False, "error": str(status)}
+        disconnect_hint = _oauth_provider_disconnect_hint(p, status)
+        providers.append({
+            "id": p["id"],
+            "name": p["name"],
+            "flow": p["flow"],
+            "cli_command": p["cli_command"],
+            "docs_url": p["docs_url"],
+            "disconnect_hint": disconnect_hint,
+            "disconnect_command": _oauth_provider_disconnect_command(p),
+            "disconnectable": disconnect_hint is None,
+            "status": status,
+        })
+    if cache_enabled:
+        _oauth_status_cache_put(cache_key, providers)
+    return {"providers": providers}
 
 
 @app.delete("/api/providers/oauth/{provider_id}")
@@ -6865,6 +6982,7 @@ async def disconnect_oauth_provider(
             except Exception:
                 pass
             _log.info("oauth/disconnect: %s", provider_id)
+            _invalidate_oauth_status_cache()
             return {"ok": bool(cleared), "provider": provider_id}
 
         try:
@@ -6873,6 +6991,7 @@ async def disconnect_oauth_provider(
             if provider_id == "nous":
                 invalidate_nous_auth_status_cache()
             _log.info("oauth/disconnect: %s (cleared=%s)", provider_id, cleared)
+            _invalidate_oauth_status_cache()
             return {"ok": bool(cleared), "provider": provider_id}
         except Exception as e:
             _log.exception("disconnect %s failed", provider_id)
@@ -7894,9 +8013,11 @@ async def submit_oauth_code(
     """Submit the auth code for PKCE flows. Token-protected."""
     _require_token(request)
     if provider_id == "anthropic":
-        return await asyncio.get_running_loop().run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None, _submit_anthropic_pkce, body.session_id, body.code, profile,
         )
+        _invalidate_oauth_status_cache()
+        return result
     raise HTTPException(status_code=400, detail=f"submit not supported for {provider_id}")
 
 
@@ -7919,6 +8040,10 @@ async def poll_oauth_session(
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
+    if sess.get("status") == "approved":
+        # A device-code / loopback sign-in just completed in the background; drop
+        # the cached status so the UI's follow-up refetch shows it as connected.
+        _invalidate_oauth_status_cache()
     return {
         "session_id": session_id,
         "status": sess["status"],
@@ -10960,9 +11085,20 @@ async def get_active_profile_endpoint():
         current = profiles_mod.get_active_profile_name() or "default"
     except Exception:
         current = "default"
-    return {"active": active, "current": current}
+    # [CN-fork] P-008 compat: the hermes-agent-cn desktop reads `.name` from this
+    # response (its ActiveProfileResponse schema requires `name: string`). Upstream
+    # ships only `{active, current}`; keep `name` mirroring the sticky `active` so
+    # existing desktop shells don't fail to load the profile list. Dropping this
+    # field is the regression behind Eynzof/Hermes-CN-Desktop#301. See FORK_NOTES
+    # P-008 and tests/hermes_cli/test_web_server_profile_active_compat.py.
+    return {"name": active, "active": active, "current": current}
 
 
+# [CN-fork] P-008 compat: PUT alias. The desktop switches profiles via
+# `putJSON("/api/profiles/active", {name})`; upstream only exposes POST, so
+# without this alias profile switching 405s. Stacked on the POST handler so both
+# verbs share one implementation.
+@app.put("/api/profiles/active")
 @app.post("/api/profiles/active")
 async def set_active_profile_endpoint(body: ProfileActiveUpdate):
     """Set the sticky active profile (mirrors ``hermes profile use``).
@@ -12053,7 +12189,11 @@ async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
             caps = {}
             try:
                 from agent.models_dev import get_model_capabilities
-                mc = get_model_capabilities(provider=provider, model=model_name)
+                # P-028: snapshot/cache only — capability flags don't need to be
+                # live-fresh and this must not stall on models.dev.
+                mc = get_model_capabilities(
+                    provider=provider, model=model_name, allow_network=False
+                )
                 if mc is not None:
                     caps = {
                         "supports_tools": mc.supports_tools,

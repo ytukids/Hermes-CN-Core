@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.environments.local import _find_bash, _find_shell
+from tools.environments.local import _find_bash_posix, _find_shell
 
 
 class TestFindShellPrefersUserShell:
@@ -28,13 +28,13 @@ class TestFindShellPrefersUserShell:
             assert _find_shell() == str(fake_zsh)
 
     def test_falls_back_when_shell_not_executable(self, tmp_path):
-        """$SHELL exists but lacks the execute bit -> fall back to _find_bash
+        """$SHELL exists but lacks the execute bit -> fall back to _find_bash_posix
         (returning it would fail at spawn time)."""
         fake = tmp_path / "zsh"
         fake.touch()
         fake.chmod(0o644)  # not executable
         with patch.dict(os.environ, {"SHELL": str(fake)}):
-            assert _find_shell() == _find_bash()
+            assert _find_shell() == _find_bash_posix()
 
     def test_falls_back_for_incompatible_shell_fish(self, tmp_path):
         """#42203 regression: $SHELL=fish must NOT be returned — spawn_local's
@@ -44,7 +44,7 @@ class TestFindShellPrefersUserShell:
         fake_fish.touch()
         fake_fish.chmod(0o755)
         with patch.dict(os.environ, {"SHELL": str(fake_fish)}):
-            assert _find_shell() == _find_bash()
+            assert _find_shell() == _find_bash_posix()
 
     def test_falls_back_for_incompatible_shell_csh(self, tmp_path):
         """$SHELL=tcsh/csh is also not -lic/set+m compatible -> fall back."""
@@ -52,7 +52,7 @@ class TestFindShellPrefersUserShell:
         fake.touch()
         fake.chmod(0o755)
         with patch.dict(os.environ, {"SHELL": str(fake)}):
-            assert _find_shell() == _find_bash()
+            assert _find_shell() == _find_bash_posix()
 
     def test_honours_allowlisted_bash_and_dash(self, tmp_path):
         """Every allowlisted POSIX-sh-family shell is honoured."""
@@ -63,34 +63,34 @@ class TestFindShellPrefersUserShell:
             with patch.dict(os.environ, {"SHELL": str(fake)}):
                 assert _find_shell() == str(fake), name
 
-    def test_falls_back_to_find_bash_when_shell_unset(self):
-        """When $SHELL is unset, _find_shell delegates to _find_bash."""
+    def test_falls_back_to_find_bash_posix_when_shell_unset(self):
+        """When $SHELL is unset, _find_shell delegates to _find_bash_posix."""
         env = {k: v for k, v in os.environ.items() if k != "SHELL"}
         with patch.dict(os.environ, env, clear=True):
-            assert _find_shell() == _find_bash()
+            assert _find_shell() == _find_bash_posix()
 
-    def test_falls_back_to_find_bash_when_shell_not_a_file(self, tmp_path):
+    def test_falls_back_to_find_bash_posix_when_shell_not_a_file(self, tmp_path):
         """When $SHELL points to a non-existent path, _find_shell delegates."""
         fake_path = str(tmp_path / "nonexistent_shell")
         with patch.dict(os.environ, {"SHELL": fake_path}):
-            assert _find_shell() == _find_bash()
+            assert _find_shell() == _find_bash_posix()
 
-    def test_falls_back_to_find_bash_when_shell_empty(self):
+    def test_falls_back_to_find_bash_posix_when_shell_empty(self):
         """When $SHELL is empty string, _find_shell delegates."""
         with patch.dict(os.environ, {"SHELL": ""}):
-            assert _find_shell() == _find_bash()
+            assert _find_shell() == _find_bash_posix()
 
 
 class TestFindShellWindowsBehavior:
-    """On Windows, _find_shell always delegates to _find_bash."""
+    """On Windows, _find_shell always delegates to _find_bash_posix."""
 
     def test_windows_ignores_shell_env(self):
-        """On Windows, $SHELL is ignored — _find_shell delegates to _find_bash."""
+        """On Windows, $SHELL is ignored — _find_shell delegates to _find_bash_posix."""
         with patch("tools.environments.local._IS_WINDOWS", True):
             # Even if SHELL is set, it should be ignored on Windows
             with patch.dict(os.environ, {"SHELL": "/usr/bin/zsh"}):
                 result = _find_shell()
-                assert result == _find_bash()
+                assert result == _find_bash_posix()
 
 
 class TestFindShellReturnsString:
@@ -104,12 +104,12 @@ class TestFindShellReturnsString:
 
 
 class TestFindBashUnchanged:
-    """_find_bash should be unaffected by the _find_shell change."""
+    """_find_bash_posix should be unaffected by the _find_shell change."""
 
-    def test_find_bash_still_prefers_bash(self):
-        """_find_bash still returns bash (not $SHELL) on POSIX."""
-        result = _find_bash()
-        # On any system, _find_bash should return something containing "bash"
+    def test_find_bash_posix_still_prefers_bash(self):
+        """_find_bash_posix still returns bash (not $SHELL) on POSIX."""
+        result = _find_bash_posix()
+        # On any system, _find_bash_posix should return something containing "bash"
         # or fall back to $SHELL or /bin/sh — but it should NOT prefer $SHELL
         # over bash the way _find_shell does.
         assert isinstance(result, str)

@@ -81,6 +81,7 @@ export type {
   MessagingConflictDetail,
   MemoryProviderConfig,
   MemoryProviderOAuthStatus,
+  MessagingConflictDetail,
   MessagingEnvVarInfo,
   MessagingHomeChannel,
   MessagingPlatformInfo,

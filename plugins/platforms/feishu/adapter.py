@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import errno
 import concurrent.futures
 import hashlib
 import hmac
@@ -1446,9 +1447,9 @@ class FeishuAdapter(BasePlatformAdapter):
     # is almost certain.
     _SPLIT_THRESHOLD = 4000
 
-    # =========================================================================
+    # ===
     # Lifecycle — init / settings / connect / disconnect
-    # =========================================================================
+    # ===
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.FEISHU)
@@ -1884,9 +1885,9 @@ class FeishuAdapter(BasePlatformAdapter):
             self._webhook_runner = None
             self._webhook_site = None
 
-    # =========================================================================
+    # ===
     # Outbound — send / edit / send_image / send_voice / …
-    # =========================================================================
+    # ===
 
     async def send(
         self,
@@ -2385,9 +2386,9 @@ class FeishuAdapter(BasePlatformAdapter):
         """Feishu text messages are plain text by default."""
         return content.strip()
 
-    # =========================================================================
+    # ===
     # Inbound event handlers
-    # =========================================================================
+    # ===
 
     def _on_message_event(self, data: Any) -> None:
         """Normalize Feishu inbound events into MessageEvent.
@@ -3015,9 +3016,9 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
         await self._handle_message_with_guards(synthetic_event)
 
-    # =========================================================================
+    # ===
     # Per-chat serialization and typing indicator
-    # =========================================================================
+    # ===
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         """Return (creating if needed) the per-chat asyncio.Lock for serial message processing.
@@ -3056,9 +3057,9 @@ class FeishuAdapter(BasePlatformAdapter):
         async with chat_lock:
             await self.handle_message(event)
 
-    # =========================================================================
+    # ===
     # Processing status reactions
-    # =========================================================================
+    # ===
 
     def _reactions_enabled(self) -> bool:
         return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in {"false", "0", "no"}
@@ -3174,9 +3175,9 @@ class FeishuAdapter(BasePlatformAdapter):
         if outcome is ProcessingOutcome.FAILURE:
             await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
 
-    # =========================================================================
+    # ===
     # Webhook server and security
-    # =========================================================================
+    # ===
 
     def _record_webhook_anomaly(self, remote_ip: str, status: str) -> None:
         """Increment the anomaly counter for remote_ip and emit a WARNING every threshold hits.
@@ -3208,9 +3209,9 @@ class FeishuAdapter(BasePlatformAdapter):
         """Reset the anomaly counter for remote_ip after a successful request."""
         self._webhook_anomaly_counts.pop(remote_ip, None)
 
-    # =========================================================================
+    # ===
     # Inbound processing pipeline
-    # =========================================================================
+    # ===
 
     async def _process_inbound_message(
         self,
@@ -3303,9 +3304,9 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         await self._handle_message_with_guards(event)
 
-    # =========================================================================
+    # ===
     # Media batching
-    # =========================================================================
+    # ===
 
     def _should_batch_media_event(self, event: MessageEvent) -> bool:
         return bool(
@@ -3597,9 +3598,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_rate_counts[rate_key] = (1, now)
         return True
 
-    # =========================================================================
+    # ===
     # Text batching
-    # =========================================================================
+    # ===
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Return the session-scoped key used for Feishu text aggregation."""
@@ -3712,9 +3713,9 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         await self._handle_message_with_guards(event)
 
-    # =========================================================================
+    # ===
     # Message content extraction and resource download
-    # =========================================================================
+    # ===
 
     async def _extract_message_content(
         self, message: Any
@@ -3929,9 +3930,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
         return "", ""
 
-    # =========================================================================
+    # ===
     # Static helpers — extension / media-type guessing
-    # =========================================================================
+    # ===
 
     @staticmethod
     def _read_binary_response(response: Any) -> bytes:
@@ -4204,9 +4205,9 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("[Feishu] Background inbound processing failed")
 
-    # =========================================================================
+    # ===
     # Inbound admission
-    # =========================================================================
+    # ===
 
     def _admit(self, sender: Any, message: Any) -> Optional[RejectReason]:
         sender_ids = _sender_identity(sender)
@@ -4420,9 +4421,9 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[Feishu] Failed to hydrate bot name from application info", exc_info=True)
 
-    # =========================================================================
+    # ===
     # Deduplication — seen message ID cache (persistent)
-    # =========================================================================
+    # ===
 
     def _load_seen_message_ids(self) -> None:
         try:
@@ -4486,9 +4487,9 @@ class FeishuAdapter(BasePlatformAdapter):
             self._persist_seen_message_ids()
             return False
 
-    # =========================================================================
+    # ===
     # Outbound payload construction and send pipeline
-    # =========================================================================
+    # ===
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
@@ -4652,9 +4653,9 @@ class FeishuAdapter(BasePlatformAdapter):
             raw_response=response,
         )
 
-    # =========================================================================
+    # ===
     # Connection internals — websocket / webhook setup
-    # =========================================================================
+    # ===
 
     async def _connect_with_retry(self) -> None:
         for attempt in range(_FEISHU_CONNECT_ATTEMPTS):
@@ -4811,9 +4812,9 @@ class FeishuAdapter(BasePlatformAdapter):
         finally:
             self._app_lock_identity = None
 
-    # =========================================================================
+    # ===
     # Lark API request builders
-    # =========================================================================
+    # ===
 
     @staticmethod
     def _build_get_chat_request(chat_id: str) -> Any:
@@ -4997,14 +4998,12 @@ class FeishuAdapter(BasePlatformAdapter):
         return _FEISHU_FILE_UPLOAD_TYPE, "file"
 
 
-# =============================================================================
-# QR scan-to-create onboarding
+# # QR scan-to-create onboarding
 #
 # Device-code flow: user scans a QR code with Feishu/Lark mobile app and the
 # platform creates a fully configured bot application automatically.
 # Called by `hermes gateway setup` via _setup_feishu() in hermes_cli/gateway.py.
-# =============================================================================
-
+# 
 
 def _accounts_base_url(domain: str) -> str:
     return _ONBOARD_ACCOUNTS_URLS.get(domain, _ONBOARD_ACCOUNTS_URLS["feishu"])

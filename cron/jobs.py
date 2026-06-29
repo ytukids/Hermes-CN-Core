@@ -45,10 +45,8 @@ try:
 except ImportError:
     HAS_CRONITER = False
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
+# # Configuration
+# 
 # Cron is per-profile by design (issue #4707). Each profile owns its own cron
 # store under its own HERMES_HOME, and a profile-scoped gateway runs that
 # profile's jobs under that same HERMES_HOME — so a job authored in profile
@@ -288,10 +286,8 @@ def ensure_dirs():
     _secure_dir(OUTPUT_DIR)
 
 
-# =============================================================================
-# Schedule Parsing
-# =============================================================================
-
+# # Schedule Parsing
+# 
 def parse_duration(s: str) -> int:
     """
     Parse duration string into minutes.
@@ -380,7 +376,8 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             # off from the user's wall-clock intent — far enough that one-shots
             # never become due and recurring jobs fire at the wrong time. Using
             # the configured zone makes "20:07" mean 20:07 on the same clock the
-            # scheduler checks against (#51021).
+            # scheduler checks against (#51021). Legacy *stored* naive timestamps
+            # are still read as system-local wall time by _ensure_aware (#806).
             if dt.tzinfo is None:
                 hermes_tz = _hermes_now().tzinfo
                 dt = dt.replace(tzinfo=hermes_tz)
@@ -388,7 +385,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             return {
                 "kind": "once",
                 "run_at": dt.isoformat(),
-                "display": f"once at {dt.strftime('%Y-%m-%d %H:%M')} {tz_display}"
+                "display": f"once at {dt.strftime('%Y-%m-%d %H:%M')}"
             }
         except ValueError as e:
             raise ValueError(f"Invalid timestamp '{schedule}': {e}")
@@ -565,10 +562,8 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     return None
 
 
-# =============================================================================
-# Ticker heartbeat (liveness signal for `hermes cron status`)
-# =============================================================================
-
+# # Ticker heartbeat (liveness signal for `hermes cron status`)
+# 
 def _atomic_write_epoch(path: Path) -> None:
     """Atomically write the current epoch time to ``path``.
 
@@ -637,10 +632,8 @@ def get_ticker_success_age() -> Optional[float]:
     return _epoch_file_age(TICKER_SUCCESS_FILE)
 
 
-# =============================================================================
-# Job CRUD Operations
-# =============================================================================
-
+# # Job CRUD Operations
+# 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     ensure_dirs()
@@ -650,13 +643,15 @@ def load_jobs() -> List[Dict[str, Any]]:
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+        # utf-8-sig transparently strips a UTF-8 BOM if present (some editors
+        # on Windows add one), and is identical to utf-8 when there is none.
+        with open(JOBS_FILE, 'r', encoding='utf-8-sig') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            with open(JOBS_FILE, 'r', encoding='utf-8-sig') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -1633,10 +1628,8 @@ def save_job_output(job_id: str, output: str):
     return output_file
 
 
-# =============================================================================
-# Skill reference rewriting (curator integration)
-# =============================================================================
-
+# # Skill reference rewriting (curator integration)
+# 
 def referenced_skill_names() -> Set[str]:
     """Return the set of skill names referenced by ANY cron job.
 

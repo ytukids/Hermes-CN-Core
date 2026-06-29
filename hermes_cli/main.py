@@ -1731,8 +1731,11 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             except Exception:
                 pass
         if not path:
-            print(f"{bin} not found — install Node.js to use the TUI.")
-            sys.exit(1)
+            # sys.exit(str) exits non-zero AND carries the reason as the
+            # exception message, so the dashboard PTY handler surfaces it to
+            # the browser (web_server pty_ws: "Chat unavailable: <reason>")
+            # instead of a bare exit code. See FORK_NOTES P-032.
+            sys.exit(f"{bin} not found — install Node.js to use the TUI.")
         return path
 
     # Footgun: --dev against a prebuilt bundle that has no source/node_modules.
@@ -1746,10 +1749,11 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         )
         sys.exit(1)
 
-    if not ext_dir:
-        _ensure_tui_workspace(tui_dir)
-
-    # 1. Prebuilt bundle (nix / packaged release): just run it.
+    # 1. Prebuilt bundle (nix / packaged release): just run it. Checked BEFORE
+    #    _ensure_tui_workspace so a packaged runtime that ships a prebuilt
+    #    bundle (HERMES_TUI_DIR, or a wheel-bundled tui_dist) never aborts on a
+    #    missing ui-tui/ source tree it does not need — the desktop frozen
+    #    runtime has no ui-tui/ source. See FORK_NOTES P-032.
     if not tui_dev:
         if ext_dir:
             p = Path(ext_dir)
@@ -1762,6 +1766,12 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         if bundled is not None:
             node = _node_bin("node")
             return [node, "--expose-gc", str(bundled)], bundled.parent
+
+    # The source flow below (npm install + esbuild, or --dev tsx) needs the
+    # ui-tui/ workspace. Ensure it exists before any npm/node subprocess uses
+    # it as cwd; only reached when no prebuilt bundle was found above.
+    if not ext_dir:
+        _ensure_tui_workspace(tui_dir)
 
     # 2. Normal flow: npm install if needed, always esbuild, then node dist/entry.js.
     #    --dev flow: npm install if needed, then tsx src/entry.tsx.
@@ -1821,7 +1831,9 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             print("npm install failed.")
             if preview:
                 print(preview)
-            sys.exit(1)
+            # Carry a concise reason so the dashboard PTY shows it instead of a
+            # bare exit code; the full preview above goes to the runtime log.
+            sys.exit("npm install failed (see runtime log for details).")
         did_install = True
 
     if tui_dev:
@@ -11826,6 +11838,34 @@ def cmd_dashboard(args):
             "Background MCP tool discovery failed at dashboard startup",
             exc_info=True,
         )
+
+    # Desktop-spawned backends (HERMES_DESKTOP=1) must run the cron scheduler
+    # tick loop in-process because there is no separate gateway process.
+    # Starting it HERE (cmd_dashboard, the synchronous main flow) — rather than
+    # relying solely on the FastAPI lifespan handler in web_server.py — ensures
+    # the scheduler still starts even if the lifespan ever fails silently
+    # (observed downstream: a crashed lifespan left cron dead for 14h with no
+    # log). The lifespan handler still starts its own ticker as a
+    # belt-and-suspenders fallback; the cron `.tick.lock` flock makes the two
+    # mutually exclusive, so a job is never double-fired.
+    if os.getenv("HERMES_DESKTOP") == "1":
+        try:
+            from hermes_cli.web_server import _start_desktop_cron_ticker
+
+            _cron_stop = threading.Event()
+            threading.Thread(
+                target=_start_desktop_cron_ticker,
+                args=(_cron_stop,),
+                daemon=True,
+                name="desktop-cron-ticker-main",
+            ).start()
+            logger.info(
+                "Desktop cron scheduler started in cmd_dashboard (HERMES_DESKTOP=1)"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to start desktop cron scheduler in cmd_dashboard"
+            )
 
     from hermes_cli.web_server import start_server
 
