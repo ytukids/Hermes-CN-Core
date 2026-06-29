@@ -1618,8 +1618,14 @@ def get_model_context_length(
     config_context_length: int | None = None,
     provider: str = "",
     custom_providers: list | None = None,
+    allow_network: bool = True,
 ) -> int:
     """Get the context length for a model.
+
+    ``allow_network=False`` skips the foreign metadata services (models.dev and
+    the OpenRouter live API) so display/hot paths like ``/api/model/info`` never
+    block on them; resolution falls through to cache + hardcoded defaults. The
+    local/own-provider endpoint probes are unaffected. See P-028.
 
     Resolution order:
     0. Explicit config override (model.context_length or custom_providers per-model)
@@ -1646,6 +1652,34 @@ def get_model_context_length(
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
+
+    # 0a. MoA virtual provider — ``model`` is a preset name, not a real model,
+    # and ``base_url`` is the local virtual endpoint, so every probe below would
+    # miss and fall through to the 256K default. The aggregator is the acting
+    # model, so resolve the context window from the aggregator slot's real
+    # provider+model instead. References are advisory-only and never bound the
+    # acting context, so they're ignored here.
+    if (provider or "").strip().lower() == "moa":
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.moa_config import resolve_moa_preset
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            preset = resolve_moa_preset(load_config().get("moa") or {}, model)
+            agg = preset.get("aggregator") or {}
+            agg_provider = str(agg.get("provider") or "").strip()
+            agg_model = str(agg.get("model") or "").strip()
+            if agg_model and agg_provider and agg_provider.lower() != "moa":
+                rt = resolve_runtime_provider(requested=agg_provider, target_model=agg_model)
+                return get_model_context_length(
+                    agg_model,
+                    base_url=rt.get("base_url", "") or "",
+                    api_key=rt.get("api_key", "") or "",
+                    provider=agg_provider,
+                )
+        except Exception:
+            logger.debug("MoA aggregator context-length resolution failed", exc_info=True)
+        # Fall through to the generic default if aggregator resolution failed.
 
     # 0b. custom_providers per-model override — check before any probe.
     # This closes the gap where /model switch and display paths used to fall
@@ -1914,7 +1948,7 @@ def get_model_context_length(
     # effective_provider`), so a fresh slug like claude-fable-5 fell through to
     # the generic "claude": 200K entry and under-reported a 1M window. Mirrors
     # the dedicated Nous/Copilot/GMI branches above.
-    if effective_provider == "openrouter":
+    if allow_network and effective_provider == "openrouter":
         metadata = fetch_model_metadata()
         entry = metadata.get(model)
         if entry:
@@ -1928,7 +1962,9 @@ def get_model_context_length(
 
     if effective_provider:
         from agent.models_dev import lookup_models_dev_context
-        ctx = lookup_models_dev_context(effective_provider, model)
+        ctx = lookup_models_dev_context(
+            effective_provider, model, allow_network=allow_network
+        )
         if ctx:
             # MiniMax M3: models.dev reports 512K but actual context is 1M.
             # Prefer hardcoded catalog over stale probe value.
@@ -1947,7 +1983,7 @@ def get_model_context_length(
     # Only consulted when the provider is unknown (no effective_provider),
     # because OpenRouter data is community-maintained and can be incorrect
     # for models that belong to known providers with curated defaults.
-    if not effective_provider:
+    if allow_network and not effective_provider:
         metadata = fetch_model_metadata()
         if model in metadata:
             or_ctx = metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)

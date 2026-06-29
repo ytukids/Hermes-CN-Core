@@ -489,14 +489,13 @@ def test_accounts_offers_every_oauth_provider_from_catalog():
             )
 
 
-def test_gemini_cli_and_copilot_acp_now_in_accounts():
-    """Regression: google-gemini-cli and copilot-acp were canonical providers the
-    CLI could configure, but had no Accounts card (the reported GUI/CLI drift).
+def test_copilot_acp_now_in_accounts():
+    """Regression: copilot-acp was a canonical provider the CLI could configure,
+    but had no Accounts card (the reported GUI/CLI drift).
     """
     resp = client.get("/api/providers/oauth", headers=HEADERS)
     assert resp.status_code == 200, resp.text
     providers = {p["id"]: p for p in resp.json()["providers"]}
-    assert "google-gemini-cli" in providers
     assert "copilot-acp" in providers
     # copilot-acp is managed by an external CLI: read-only card, not auto-removable.
     assert providers["copilot-acp"]["flow"] == "external"
@@ -890,3 +889,38 @@ def test_status_unknown_provider_degrades_to_logged_out():
     with patch("hermes_cli.auth.get_auth_status", return_value={"logged_in": False}):
         out = ws._resolve_provider_status("totally-unknown", None)
     assert out["logged_in"] is False
+
+
+# --- P-025: OAuth provider-status cache helpers -----------------------------
+
+def test_oauth_status_cache_key_normalizes_profile():
+    """None / "" / whitespace / "current" all collapse to the launch profile key."""
+    import hermes_cli.web_server as ws
+
+    assert ws._oauth_cache_key(None) == "current"
+    assert ws._oauth_cache_key("") == "current"
+    assert ws._oauth_cache_key("   ") == "current"
+    assert ws._oauth_cache_key("current") == "current"
+    assert ws._oauth_cache_key("Coder") == "coder"
+
+
+def test_oauth_status_cache_get_put_ttl_and_invalidate(monkeypatch):
+    """Put is readable within the TTL; expiry and explicit invalidation miss."""
+    import hermes_cli.web_server as ws
+
+    ws._invalidate_oauth_status_cache()
+    payload = [{"id": "fake", "status": {"logged_in": True}}]
+    ws._oauth_status_cache_put("current", payload)
+    assert ws._oauth_status_cache_get("current") == payload
+
+    # Past the TTL the entry is treated as a miss (not returned).
+    monkeypatch.setattr(ws, "_OAUTH_STATUS_TTL_SECONDS", 0.0)
+    assert ws._oauth_status_cache_get("current") is None
+
+    # A healthy TTL serves the entry again; explicit invalidation then drops it
+    # (this is what the connect/disconnect endpoints call).
+    monkeypatch.setattr(ws, "_OAUTH_STATUS_TTL_SECONDS", 20.0)
+    ws._oauth_status_cache_put("current", payload)
+    assert ws._oauth_status_cache_get("current") == payload
+    ws._invalidate_oauth_status_cache()
+    assert ws._oauth_status_cache_get("current") is None

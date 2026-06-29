@@ -9,6 +9,7 @@ import { Switch } from '@/components/ui/switch'
 import { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 import { getSkills, getToolsets, toggleSkill, toggleToolset } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
@@ -17,9 +18,12 @@ import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { PAGE_INSET_X } from '../layout-constants'
 import { PageSearchShell } from '../page-search-shell'
+import { ComputerUsePanel } from '../settings/computer-use-panel'
 import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
 import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
+
+import { VirtualSkillsList } from './virtual-skills-list'
 
 const SKILLS_MODES = ['skills', 'toolsets'] as const
 type SkillsMode = (typeof SKILLS_MODES)[number]
@@ -29,11 +33,11 @@ type SkillsMode = (typeof SKILLS_MODES)[number]
 // on the toolsets tab. Show the first N and summarize the rest.
 const MAX_VISIBLE_TOOL_CHIPS = 24
 
-function categoryFor(skill: SkillInfo): string {
+export function categoryFor(skill: SkillInfo): string {
   return asText(skill.category) || 'general'
 }
 
-function filteredSkills(skills: SkillInfo[], query: string, category: string | null): SkillInfo[] {
+export function filteredSkills(skills: SkillInfo[], query: string, category: string | null): SkillInfo[] {
   const q = query.trim().toLowerCase()
 
   return skills
@@ -56,6 +60,10 @@ function filteredToolsets(toolsets: ToolsetInfo[], query: string): ToolsetInfo[]
 
   return toolsets
     .filter(toolset => {
+      if (!isDesktopToolsetVisible(toolset.name)) {
+        return false
+      }
+
       if (!q) {
         return true
       }
@@ -264,43 +272,13 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
       {!skills || !toolsets ? (
         <PageLoader label={t.skills.loading} />
       ) : mode === 'skills' ? (
-        <div className={cn('h-full overflow-y-auto py-3', PAGE_INSET_X)}>
-          {visibleSkills.length === 0 ? (
-            <EmptyState description={t.skills.noSkillsDesc} title={t.skills.noSkillsTitle} />
-          ) : (
-            <div className="space-y-4">
-              {skillGroups.map(([category, list]) => (
-                <div className="space-y-1.5" key={category}>
-                  {activeCategory === null && (
-                    <div className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                      {prettyName(category)}
-                    </div>
-                  )}
-                  <div>
-                    {list.map(skill => (
-                      <div
-                        className="grid gap-3 px-0 py-2.5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
-                        key={skill.name}
-                      >
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium">{skill.name}</div>
-                          <p className="mt-0.5 text-xs text-muted-foreground">
-                            {asText(skill.description) || t.skills.noDescription}
-                          </p>
-                        </div>
-                        <Switch
-                          checked={skill.enabled}
-                          disabled={savingSkill === skill.name}
-                          onCheckedChange={checked => void handleToggleSkill(skill, checked)}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        <VirtualSkillsList
+          empty={<EmptyState description={t.skills.noSkillsDesc} title={t.skills.noSkillsTitle} />}
+          groups={skillGroups}
+          onToggle={handleToggleSkill}
+          savingSkill={savingSkill}
+          showHeaders={activeCategory === null}
+        />
       ) : (
         <div className={cn('h-full overflow-y-auto py-3', PAGE_INSET_X)}>
           {visibleToolsets.length === 0 ? (
@@ -364,6 +342,9 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                             </span>
                           )}
                         </div>
+                      )}
+                      {expanded && toolset.name === 'computer_use' && (
+                        <ComputerUsePanel onConfiguredChange={refreshToolsets} />
                       )}
                       {expanded && <ToolsetConfigPanel onConfiguredChange={refreshToolsets} toolset={toolset.name} />}
                     </div>

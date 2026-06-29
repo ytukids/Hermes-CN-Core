@@ -123,6 +123,17 @@ conservative at the waist.
   without E2E proof, and plugins that touch core files.** Plugins live in their
   own directory and work within the ABCs/hooks we provide; if a plugin needs
   more, widen the generic plugin surface, don't special-case it in core.
+- **Third-party products / other people's projects integrated into the core
+  tree.** Observability backends, vendor SaaS integrations, analytics dashboards,
+  and similar "someone else's product" plugins do NOT land under `plugins/` in
+  this repo. They place an ongoing maintenance burden on us to keep them working
+  against a fast-moving core, for a backend we don't own. Ship them as a
+  **standalone plugin repo** users install into `~/.hermes/plugins/` (or via a
+  pip entry point), and promote them in the Nous Research Discord
+  (`#plugins-skills-and-skins`). This is a coupling-and-maintenance decision, not
+  a quality bar — the plugin can be excellent and still be a close. PRs that add
+  such a directory to the tree are closed with a pointer to publish it as its own
+  repo.
 
 ### Before you call it a bug — verify the premise (and when NOT to close)
 
@@ -210,6 +221,21 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+### 开发前预检（双仓同步 + Worktree 隔离）
+
+Hermes CN 的需求与 bug 修复通常**同时横跨 Core 与 [Desktop](https://github.com/Eynzof/Hermes-CN-Desktop) 两个仓库**。正式动手写代码前，两个仓库都必须先过这道预检，**不要直接在 `main` 上改**：
+
+1. **确认主分支已与远端同步**。对 Core 与 Desktop 分别 `git fetch origin`，确认本地 `main` 与 `origin/main` 一致（`git rev-list --left-right --count main...origin/main` 应为 `0  0`）；落后就先快进，工作区脏就先收拾干净。Core 是 fork——**永远不要把 `upstream/main` 直接并进 `main`**，上游同步走 `./scripts/sync-upstream.sh`。
+2. **为每个仓库开独立的功能分支 + git worktree**，让 Core 与 Desktop 的改动互不干扰、可并行：
+   ```bash
+   git -C <repo> fetch origin
+   git -C <repo> worktree add ../wt/<repo>-<topic> -b <branch> origin/main
+   ```
+   分支命名沿用各仓库既有约定：Core 的 fork 行为补丁用 `cn/P-xxx-*`（并登记进 `FORK_NOTES.md`），干净上游 PR 用 `upstream-pr/*`，文档/杂项用 `docs/` `chore/`；Desktop 沿用 Conventional 风格。注意 worktree 默认共享主 checkout 的 venv（见上一段的 venv 探测顺序），不必每个 worktree 重装依赖。
+3. 不要在同一个工作目录里来回 `git checkout` 切分支——双仓并行时极易串味；每条线一个 worktree。
+
+**收尾流程（每个仓库都要走完，缺一不可）**：改完 → 跑各自校验（Core：`scripts/run_tests.sh` 全套 + `ruff check .`；Desktop：`pnpm typecheck && pnpm test:unit && cargo check`）→ commit → push → 开 PR → **盯 PR 上 GitHub Actions 全绿**（Core：`lint.yml` + 测试切片），没过就回去修，别把任务当完成。
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
@@ -218,10 +244,10 @@ entry points you'll actually edit.
 
 ```
 hermes-agent/
-├── run_agent.py          # AIAgent class — core conversation loop (~12k LOC)
+├── run_agent.py          # AIAgent class — core conversation loop (~5.5k LOC)
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
-├── cli.py                # HermesCLI class — interactive CLI orchestrator (~11k LOC)
+├── cli.py                # HermesCLI class — interactive CLI orchestrator (~15k LOC)
 ├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
 ├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
@@ -255,7 +281,7 @@ hermes-agent/
 ├── cron/                 # Scheduler — jobs.py, scheduler.py
 ├── scripts/              # run_tests.sh, release.py, auxiliary scripts
 ├── website/              # Docusaurus docs site
-└── tests/                # Pytest suite (~17k tests across ~900 files as of May 2026)
+└── tests/                # Pytest suite (~31k tests across ~1,600 files as of June 2026)
 ```
 
 **User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys only).
@@ -302,7 +328,7 @@ run_agent.py, cli.py, batch_runner.py, environments/
 
 ## AIAgent Class (run_agent.py)
 
-The real `AIAgent.__init__` takes ~60 parameters (credentials, routing, callbacks,
+The real `AIAgent.__init__` takes ~70 parameters (credentials, routing, callbacks,
 session context, budget, credential pool, etc.). The signature below is the
 minimum subset you'll usually touch — read `run_agent.py` for the full list.
 
@@ -783,6 +809,24 @@ landing in this tree. PRs that add a new directory under
 provider as its own repo. Existing in-tree providers stay; bug fixes
 to them are welcome.
 
+**No new third-party-product plugins in-tree (policy, June 2026):** the
+same rule applies beyond memory providers. Plugins that integrate
+someone else's product or project — observability/metrics backends,
+vendor SaaS connectors, analytics dashboards, paid-service tie-ins —
+must ship as **standalone plugin repos** that users install into
+`~/.hermes/plugins/` (or via pip entry points). They register through
+the existing plugin discovery path and use the ABCs/hooks/ctx surface
+we expose; nothing special is needed in core. The reason is
+maintenance load: every product we absorb into the tree becomes our
+burden to keep working against a fast-moving core, for a backend we
+don't own. Promote standalone plugins in the Nous Research Discord
+(`#plugins-skills-and-skins`). PRs that add such a directory under
+`plugins/` are closed with a pointer to publish it as its own repo —
+this is a coupling decision, not a quality judgment. (The
+`observability/`, `kanban/`, `disk-cleanup/`, etc. directories already
+in the tree are existing precedent, not an invitation to add more
+third-party-product plugins alongside them.)
+
 ### Model-provider plugins (`plugins/model-providers/<name>/`)
 
 Every inference backend (openrouter, anthropic, gmi, deepseek, nvidia, …)
@@ -935,15 +979,16 @@ contributor skill PRs.
 ## Toolsets
 
 All toolsets are defined in `toolsets.py` as a single `TOOLSETS` dict.
-Each platform's adapter picks a base toolset (e.g. Telegram uses
-`"messaging"`); `_HERMES_CORE_TOOLS` is the default bundle most
-platforms inherit from.
+Each platform's adapter picks a base toolset; `_HERMES_CORE_TOOLS` is the
+default bundle most platforms inherit from.
 
-Current toolset keys: `browser`, `clarify`, `code_execution`, `cronjob`,
-`debugging`, `delegation`, `discord`, `discord_admin`, `feishu_doc`,
-`feishu_drive`, `file`, `homeassistant`, `image_gen`, `kanban`, `memory`,
-`messaging`, `moa`, `rl`, `safe`, `search`, `session_search`, `skills`,
-`spotify`, `terminal`, `todo`, `tts`, `video`, `vision`, `web`, `yuanbao`.
+Toolset keys include (canonical list lives in `toolsets.py`): `browser`,
+`clarify`, `code_execution`, `coding`, `computer_use`, `context_engine`,
+`cronjob`, `debugging`, `delegation`, `discord`, `discord_admin`,
+`feishu_doc`, `feishu_drive`, `file`, `homeassistant`, `image_gen`,
+`kanban`, `memory`, `moa`, `safe`, `search`, `session_search`, `skills`,
+`spotify`, `terminal`, `todo`, `tts`, `video`, `video_gen`, `vision`,
+`web`, `x_search`, `yuanbao`.
 
 Enable/disable per platform via `hermes tools` (the curses UI) or the
 `tools.<platform>.enabled` / `tools.<platform>.disabled` lists in
@@ -954,9 +999,10 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 ## Delegation (`delegate_task`)
 
 `tools/delegate_tool.py` spawns a subagent with an isolated
-context + terminal session. Synchronous: the parent waits for the
-child's summary before continuing its own loop — if the parent is
-interrupted, the child is cancelled.
+context + terminal session. By default the parent waits for the
+child's summary before continuing its own loop. With `background=true`,
+Hermes returns a delegation id immediately and the result re-enters the
+conversation later through the async-delegation completion queue.
 
 Two shapes:
 
@@ -978,9 +1024,9 @@ Key config knobs (under `delegation:` in `config.yaml`):
 `orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
 `max_iterations`.
 
-Synchronicity rule: delegate_task is **not** durable. For long-running
-work that must outlive the current turn, use `cronjob` or
-`terminal(background=True, notify_on_complete=True)` instead.
+Durability rule: background `delegate_task` is detached from the current
+turn but still process-local. For work that must survive process restart, use
+`cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
 
 ---
 
@@ -1174,7 +1220,7 @@ automatically scope to the active profile.
    a unique credential (bot token, API key), call `acquire_scoped_lock()` from
    `gateway.status` in the `connect()`/`start()` method and `release_scoped_lock()` in
    `disconnect()`/`stop()`. This prevents two profiles from using the same credential.
-   See `gateway/platforms/telegram.py` for the canonical pattern.
+   See `plugins/platforms/irc/adapter.py` for the canonical pattern.
 
 6. **Profile operations are HOME-anchored, not HERMES_HOME-anchored** — `_get_profiles_root()`
    returns `Path.home() / ".hermes" / "profiles"`, NOT `get_hermes_home() / "profiles"`.
@@ -1229,7 +1275,7 @@ unused module into a live code path, E2E test the real resolution chain
 with actual imports (not mocks) against a temp `HERMES_HOME`.
 
 ### Tests must not write to `~/.hermes/`
-The `_isolate_hermes_home` autouse fixture in `tests/conftest.py` redirects `HERMES_HOME` to a temp dir. Never hardcode `~/.hermes/` paths in tests.
+The `_hermetic_environment` autouse fixture in `tests/conftest.py` redirects `HERMES_HOME` to a per-test temp dir. Never hardcode `~/.hermes/` paths in tests.
 
 **Profile tests**: When testing profile features, also mock `Path.home()` so that
 `_get_profiles_root()` and `_get_default_hermes_home()` resolve within the temp dir.
@@ -1249,39 +1295,36 @@ def profile_env(tmp_path, monkeypatch):
 ## Testing
 
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces
-hermetic environment parity with CI (unset credential vars, TZ=UTC, LANG=C.UTF-8,
-`-n auto` xdist workers, in-tree subprocess-isolation plugin). Direct `pytest`
-on a 16+ core developer machine with API keys set diverges from CI in ways
-that have caused multiple "works locally, fails in CI" incidents (and the reverse).
+hermetic environment parity with CI (clean env via `env -i`, credential vars unset, TZ=UTC,
+LANG/LC_ALL=C.UTF-8, PYTHONHASHSEED=0) and runs each test file in its own
+`python -m pytest <file>` subprocess via `scripts/run_tests_parallel.py` (no xdist, no shared
+workers). Direct `pytest` on a 16+ core developer machine with API keys set diverges from CI
+in ways that have caused multiple "works locally, fails in CI" incidents (and the reverse).
 
 ```bash
 scripts/run_tests.sh                                  # full suite, CI-parity
 scripts/run_tests.sh tests/gateway/                   # one directory
 scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
-scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
-scripts/run_tests.sh --no-isolate tests/foo/          # disable subprocess isolation (faster, for debugging)
+scripts/run_tests.sh tests/foo.py -- --tb=long        # path + pass-through pytest flags (after `--`)
 ```
 
-### Subprocess-per-test isolation
+### Subprocess-per-file isolation
 
-Every test runs in a freshly-spawned Python subprocess via the in-tree plugin
-at `tests/_isolate_plugin.py`. This means module-level dicts/sets and
-ContextVars from one test cannot leak into the next — the historic
-`_reset_module_state` autouse fixture is gone.
+Every test **file** runs in a freshly-spawned `python -m pytest <file>`
+subprocess, orchestrated by `scripts/run_tests_parallel.py`. This means
+module-level dicts/sets and ContextVars from one file cannot leak into the
+next — the historic `_reset_module_state` autouse fixture is gone.
 
 Implementation notes:
 
-- The plugin uses `multiprocessing.get_context("spawn")`, which works on
-  Linux, macOS, and Windows alike (POSIX `fork` is not used).
-- Per-test overhead is ~0.5–1.0s (Python startup + pytest collection). xdist
-  parallelism amortizes this across cores; on a 20-core box the full suite
-  finishes in roughly the same wall time as before, but flake-free.
-- `isolate_timeout` (configured in `pyproject.toml`) caps each test at 30s.
-  Hangs are killed and surfaced as a failure report.
-- Pass `--no-isolate` to disable isolation — useful when debugging a single
-  test interactively, or when you specifically want to verify state leakage.
-- The plugin disables itself in child processes (sentinel envvar
-  `HERMES_ISOLATE_CHILD=1`), so there's no fork-bomb risk.
+- Each file is a separate `python -m pytest <file>` process — there is no
+  xdist and no in-tree pytest plugin. Parallelism is `--jobs` (default
+  `cpu_count * 2`) concurrent file-subprocesses.
+- Per-file overhead is Python startup + pytest collection; the per-file
+  fan-out amortizes it across cores while staying flake-free.
+- `--file-timeout` (default 140s per file, env `HERMES_TEST_FILE_TIMEOUT`)
+  SIGKILLs an overrunning file and surfaces it as a failure report.
+- CI shards the suite with `--slice N/6`.
 
 ### Why the wrapper (and why the old "just call pytest" doesn't work)
 
@@ -1293,7 +1336,7 @@ Five real sources of local-vs-CI drift the script closes:
 | HOME / `~/.hermes/` | Your real config+auth.json | Temp dir per test |
 | Timezone | Local TZ (PDT etc.) | UTC |
 | Locale | Whatever is set | C.UTF-8 |
-| xdist workers | `-n auto` = all cores | `-n auto` (safe — subprocess isolation prevents cross-worker flakes) |
+| Parallelism | raw `pytest` in one process | per-file `--jobs` subprocesses (no xdist) |
 
 `tests/conftest.py` also enforces points 1-4 as an autouse fixture so ANY pytest
 invocation (including IDE integrations) gets hermetic behavior — but the wrapper
@@ -1302,19 +1345,21 @@ is belt-and-suspenders.
 ### Running without the wrapper (only if you must)
 
 If you can't use the wrapper (e.g. inside an IDE that shells pytest directly),
-at minimum activate the venv. The isolation plugin loads automatically from
-`addopts` in `pyproject.toml`, so you get the same per-test process isolation
-either way.
+at minimum activate the venv. Note that raw `pytest` does **not** get per-file
+subprocess isolation — that comes only from `scripts/run_tests_parallel.py`
+(the wrapper). The autouse `_hermetic_environment` fixture in `tests/conftest.py`
+still gives you the clean env / temp `HERMES_HOME` / UTC / C.UTF-8, but
+module-state leakage between files is on you.
 
 ```bash
 source .venv/bin/activate   # or: source venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-If you need to bypass isolation for fast feedback while debugging:
+For an isolated single-file run that matches CI behavior, use the wrapper:
 
 ```bash
-python -m pytest tests/agent/test_foo.py -q --no-isolate
+scripts/run_tests.sh tests/agent/test_foo.py
 ```
 
 Always run the full suite before pushing changes.
