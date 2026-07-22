@@ -51,16 +51,17 @@ Activation (config ``agent.coding_context``):
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli._subprocess_compat import bounded_git_probe
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 logger = logging.getLogger("hermes.coding_context")
 
@@ -688,14 +689,18 @@ def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
 
 
 def _git(cwd: Path, *args: str) -> str:
-    """``git -C <cwd> <args>`` → stripped stdout, or ``""`` on any failure.
-
-    Uses the shared :func:`bounded_git_probe` so the post-kill cleanup is bounded
-    on Windows — a plain ``subprocess.run(timeout=...)`` here deadlocked the agent
-    turn inside ``build_coding_workspace_block`` when a killed git left a suspended
-    descendant holding the pipe handles (issue #66037).
-    """
-    return bounded_git_probe(["git", "-C", str(cwd), *args], timeout=_GIT_TIMEOUT)
+    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            **_popen_kwargs,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
 
 
 def _parse_status(porcelain: str) -> tuple[dict[str, str], dict[str, int]]:
@@ -765,8 +770,8 @@ def detect_project_facts(root: Path) -> ProjectFacts:
         verify.append("scripts/run_tests.sh")
     if (root / "package.json").is_file():
         try:
-            scripts = json.loads(_read_small(root / "package.json") or "{}").get("scripts") or {}
-        except (json.JSONDecodeError, AttributeError):
+            scripts = orjson.loads(_read_small(root / "package.json") or "{}").get("scripts") or {}
+        except (orjson.JSONDecodeError, AttributeError):
             scripts = {}
         js_pm = next((pm for lock, pm in _JS_LOCKFILES if (root / lock).is_file()), "npm")
         verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)

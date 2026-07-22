@@ -9,13 +9,13 @@ downloading from PR #4588 (YuhangLin).
 """
 
 import asyncio
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import uuid
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -176,7 +176,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         elif isinstance(raw, str):
             text = raw.strip()
             try:
-                loaded = json.loads(text) if text else []
+                loaded = orjson.loads(text) if text else []
             except Exception:
                 loaded = None
             patterns = loaded if isinstance(loaded, list) else [
@@ -485,7 +485,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         payload = {
             "addresses": [address],
             "message": message,
-            "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+            "tempGuid": f"temp-{datetime.now(tz=timezone.utc).timestamp()}",
         }
         try:
             res = await self._api_post("/api/v1/chat/new", payload)
@@ -541,7 +541,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
             payload: Dict[str, Any] = {
                 "chatGuid": guid,
-                "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+                "tempGuid": f"temp-{datetime.now(tz=timezone.utc).timestamp()}",
                 "message": chunk,
             }
             if reply_to and self._private_api_enabled and self._helper_connected:
@@ -886,7 +886,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             raw = await request.read()
             body = raw.decode("utf-8", errors="replace")
             try:
-                payload = json.loads(body)
+                payload = orjson.loads(body)
             except Exception:
                 from urllib.parse import parse_qs
 
@@ -897,7 +897,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                     or form.get("message")
                     or [""]
                 )[0]
-                payload = json.loads(payload_str) if payload_str else {}
+                payload = orjson.loads(payload_str) if payload_str else {}
         except Exception as exc:
             logger.error("[bluebubbles] webhook parse error: %s", exc)
             return web.json_response({"error": "invalid payload"}, status=400)

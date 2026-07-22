@@ -62,7 +62,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation
-    "execute_code", "delegate_task",
+    "execute_code", "delegate_task", "agent_swarm",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -214,8 +214,12 @@ TOOLSETS = {
     },
 
     "context_engine": {
-        "description": "Runtime tools exposed by the active context engine",
-        "tools": [],
+        "description": (
+            "Runtime tools exposed by the active context engine — "
+            "context_usage (report context usage) and compact (proactive "
+            "context compaction with optional instruction and mode)."
+        ),
+        "tools": ["context_usage", "compact"],
         "includes": []
     },
     
@@ -246,6 +250,12 @@ TOOLSETS = {
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
+        "includes": []
+    },
+
+    "swarm": {
+        "description": "Parallel subagent execution with template-based spawning",
+        "tools": ["agent_swarm"],
         "includes": []
     },
 
@@ -359,7 +369,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search", "clarify",
-            "execute_code", "delegate_task",
+            "execute_code", "delegate_task", "agent_swarm",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,
@@ -391,7 +401,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search",
-            "execute_code", "delegate_task",
+            "execute_code", "delegate_task", "agent_swarm",
         ],
         "includes": []
     },
@@ -419,7 +429,7 @@ TOOLSETS = {
             # Session history search
             "session_search",
             # Code execution + delegation
-            "execute_code", "delegate_task",
+            "execute_code", "delegate_task", "agent_swarm",
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)

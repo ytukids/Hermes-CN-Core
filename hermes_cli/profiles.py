@@ -19,9 +19,9 @@ Usage::
     hermes profile delete coder          # remove profile + alias + service
 """
 
-import json
+import orjson
 import os
-import re
+from agent.re_compat import re
 import shlex
 import shutil
 import stat
@@ -1203,13 +1203,13 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
         result = subprocess.run(
             [sys.executable, "-c",
              "import json; from tools.skills_sync import sync_skills; "
-             "r = sync_skills(quiet=True); print(json.dumps(r))"],
+             "r = sync_skills(quiet=True); print(orjson.dumps(r).decode('utf-8'))"],
             env={**os.environ, "HERMES_HOME": str(profile_dir)},
             cwd=str(project_root),
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
+            return orjson.loads(result.stdout.strip())
         if not quiet:
             print(f"⚠ Skill seeding returned exit code {result.returncode}")
             if result.stderr.strip():
@@ -1444,7 +1444,7 @@ def _rmtree_with_retry(profile_dir: Path, onexc_handler) -> None:
     last_exc: OSError | None = None
     for attempt in range(attempts):
         try:
-            # ``onexc`` was added in 3.12; fall back to ``onerror`` on 3.11.
+            # ``onexc`` was added in 3.12; both APIs work on 3.14.
             try:
                 shutil.rmtree(profile_dir, onexc=onexc_handler)
             except TypeError:
@@ -1568,7 +1568,7 @@ def delete_profile(name: str, yes: bool = False) -> Path:
 
             # Normalise the two callback signatures:
             #   onexc(func, path, exc_instance)   — 3.12+
-            #   onerror(func, path, exc_info_tuple) — 3.11
+            #   onerror(func, path, exc_info_tuple) — 3.11 (our minimum is 3.14, onexc always works)
             if isinstance(exc, tuple):
                 exc = exc[1]  # exc_info → actual exception object
 
@@ -1756,7 +1756,7 @@ def _stop_gateway_process(profile_dir: Path) -> None:
 
     try:
         raw = pid_file.read_text().strip()
-        data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
+        data = orjson.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
         pid = int(data["pid"])
         # Route through terminate_pid so Windows uses the appropriate
         # primitive (taskkill / TerminateProcess) — raw os.kill with
@@ -2110,8 +2110,8 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         seen.add(resolved)
 
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = orjson.loads(path.read_text(encoding="utf-8"))
+        except (OSError, orjson.JSONDecodeError):
             continue
 
         hosts = raw.get("hosts")
@@ -2135,7 +2135,7 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         hosts[new_host] = hosts.pop(source_host)
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
-            tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            tmp.write_text(orjson.dumps(raw, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n", encoding="utf-8")
             tmp.replace(path)
         except OSError:
             try:

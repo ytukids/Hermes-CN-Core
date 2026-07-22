@@ -1047,7 +1047,7 @@ class TestKimiMoonshotModelListIsolation:
     def test_moonshot_list_excludes_coding_plan_only_models(self):
         from hermes_cli.main import _PROVIDER_MODELS
         moonshot_models = _PROVIDER_MODELS["moonshot"]
-        coding_plan_only = {"kimi-for-coding", "kimi-k2-thinking-turbo"}
+        coding_plan_only = {"kimi-for-coding", "kimi-for-coding-highspeed", "kimi-k2-thinking-turbo"}
         leaked = set(moonshot_models) & coding_plan_only
         assert not leaked, f"Moonshot list contains Coding Plan-only models: {leaked}"
 
@@ -1238,8 +1238,8 @@ class TestNovitaProvider:
                 return False
 
             def read(self):
-                import json as _json
-                return _json.dumps(fake_payload).encode()
+                import orjson as _json
+                return _json.dumps(fake_payload)
 
         def fake_urlopen(req, timeout=None):
             call_count["n"] += 1

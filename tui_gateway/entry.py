@@ -10,7 +10,7 @@ import hermes_bootstrap
 
 hermes_bootstrap.harden_import_path()
 
-import json
+import orjson
 import logging
 import signal
 import time
@@ -186,7 +186,7 @@ if hasattr(signal, "SIGPIPE"):
 if hasattr(signal, "SIGTERM"):
     signal.signal(signal.SIGTERM, _log_signal)
 if hasattr(signal, "SIGHUP"):
-    signal.signal(signal.SIGHUP, _log_signal)
+    signal.signal(signal.SIGHUP, _log_signal)  # windows-footgun: ok — hasattr-guarded above
 elif hasattr(signal, "SIGBREAK"):
     # Windows-only: Ctrl+Break in a console window delivers SIGBREAK.
     # Route it through the same handler so kills are diagnosable.
@@ -415,8 +415,8 @@ def main():
             continue
 
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
+            req = orjson.loads(line)
+        except orjson.JSONDecodeError:
             if not write_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "parse error"}, "id": None}):
                 _log_exit("parse-error-response write failed (broken stdout pipe)")
                 sys.exit(0)

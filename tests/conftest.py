@@ -390,6 +390,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # should never perform that implicit network/bootstrap path; Tirith-specific
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
+    # P-028: never spawn the models.dev background prewarm thread in tests —
+    # it would fire a real network fetch off-thread (non-deterministic, and
+    # the prewarm is exercised by its own focused tests instead).
+    monkeypatch.setenv("HERMES_DISABLE_MODELS_DEV_PREWARM", "1")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
@@ -465,7 +469,7 @@ def mock_config():
 def _ensure_current_event_loop(request):
     """Provide a default event loop for sync tests that call get_event_loop().
 
-    Python 3.11+ no longer guarantees a current loop for plain synchronous tests.
+    Python 3.14+ no longer guarantees a current loop for plain synchronous tests.
     A number of gateway tests still use asyncio.get_event_loop().run_until_complete(...).
     Ensure they always have a usable loop without interfering with pytest-asyncio's
     own loop management for @pytest.mark.asyncio tests.

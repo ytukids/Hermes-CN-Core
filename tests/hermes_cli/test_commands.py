@@ -205,7 +205,7 @@ class TestGatewayHelpLines:
         assert len(lines) > 10
 
     def test_excludes_cli_only_commands_without_config_gate(self):
-        import re
+        from agent.re_compat import re
         lines = gateway_help_lines()
         joined = "\n".join(lines)
         for cmd in COMMAND_REGISTRY:
@@ -237,7 +237,7 @@ class TestTelegramBotCommands:
 
     def test_all_names_valid_telegram_chars(self):
         """Telegram requires: lowercase a-z, 0-9, underscores only."""
-        import re
+        from agent.re_compat import re
         tg_valid = re.compile(r"^[a-z0-9_]+$")
         for name, _ in telegram_bot_commands():
             assert tg_valid.match(name), f"Invalid Telegram command name: {name!r}"
@@ -1529,8 +1529,7 @@ class TestTelegramMenuCommands:
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""
         from unittest.mock import patch
-        import re
-
+        from agent.re_compat import re
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
         fake_skills_dir = str(tmp_path / "skills")
@@ -2284,6 +2283,7 @@ class TestGetProjectFilesRipgrepy:
                 cmd, 0, stdout=f"{tmp_path / 'src' / 'main.py'}\n"
             )
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("hermes_cli.dep_ensure._find_rg", lambda: "rg")
 
         with patch("hermes_cli.commands.os.getcwd", return_value=str(tmp_path)):
             files = completer._get_project_files()

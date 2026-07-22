@@ -11,6 +11,7 @@ import sys
 import sysconfig
 from contextvars import ContextVar, Token
 from pathlib import Path
+from agent.re_compat import re
 
 
 _profile_fallback_warned: bool = False
@@ -52,65 +53,11 @@ def _get_platform_default_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
-def _hermes_home_from_env() -> Path:
-    """Resolve HERMES_HOME from the process environment only.
-
-    Reads the ``HERMES_HOME`` env var, falling back to the platform-native
-    default.  Deliberately ignores the context-local override installed by
-    :func:`set_hermes_home_override`, so this reflects the process/launch
-    scope rather than a per-task profile.  Shared by :func:`get_hermes_home`
-    and :func:`get_process_hermes_home` so the two never drift.
-    """
-    val = os.environ.get("HERMES_HOME", "").strip()
-    if val:
-        return Path(val)
-    return _get_platform_default_hermes_home()
-
-
-def _warn_profile_fallback_once() -> None:
-    """Warn once when falling back to the default home while a profile is active.
-
-    Guard: if a non-default profile is sticky-active but ``HERMES_HOME`` is
-    unset, the fallback to the default profile is almost certainly wrong.
-    """
-    global _profile_fallback_warned
-    if _profile_fallback_warned:
-        return
-    try:
-        fallback_home = _get_platform_default_hermes_home()
-        active_path = fallback_home / "active_profile"
-        active = active_path.read_text().strip() if active_path.exists() else ""
-    except (UnicodeDecodeError, OSError):
-        active = ""
-    if active and active != "default":
-        _profile_fallback_warned = True
-        # Write directly to stderr.  We intentionally do NOT route this
-        # through ``logging`` because (a) this function is called at
-        # module-import time from 30+ sites, often before logging is
-        # configured, and (b) root-logger propagation would double-emit
-        # on consoles where a StreamHandler is already attached.
-        msg = (
-            f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
-            f"profile is {active!r}. Falling back to {fallback_home}, which "
-            f"is the DEFAULT profile — not {active!r}. Any data this "
-            f"process writes will land in the wrong profile. The "
-            f"subprocess spawner should pass HERMES_HOME explicitly "
-            f"(see issue #18594)."
-        )
-        try:
-            sys.stderr.write(msg + "\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-
-
 def get_hermes_home() -> Path:
     """Return the Hermes home directory (default: platform-native path).
 
-    Resolution order: context-local override (see
-    :func:`set_hermes_home_override`) → ``HERMES_HOME`` env var → the
-    platform-native default.  This is the single source of truth — all other
-    copies should import this.
+    Reads HERMES_HOME env var, falls back to the platform-native default.
+    This is the single source of truth — all other copies should import this.
 
     When ``HERMES_HOME`` is unset but an ``active_profile`` file indicates
     a non-default profile is active, logs a loud one-shot warning to
@@ -126,29 +73,42 @@ def get_hermes_home() -> Path:
     if override:
         return Path(override)
 
-    if not os.environ.get("HERMES_HOME", "").strip():
-        _warn_profile_fallback_once()
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return Path(val)
 
-    return _hermes_home_from_env()
+    # Guard: if a non-default profile is sticky-active, warn once that
+    # the fallback to the default profile is almost certainly wrong.
+    global _profile_fallback_warned
+    if not _profile_fallback_warned:
+        try:
+            fallback_home = _get_platform_default_hermes_home()
+            active_path = fallback_home / "active_profile"
+            active = active_path.read_text().strip() if active_path.exists() else ""
+        except (UnicodeDecodeError, OSError):
+            active = ""
+        if active and active != "default":
+            _profile_fallback_warned = True
+            # Write directly to stderr.  We intentionally do NOT route this
+            # through ``logging`` because (a) this function is called at
+            # module-import time from 30+ sites, often before logging is
+            # configured, and (b) root-logger propagation would double-emit
+            # on consoles where a StreamHandler is already attached.
+            msg = (
+                f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
+                f"profile is {active!r}. Falling back to {fallback_home}, which "
+                f"is the DEFAULT profile — not {active!r}. Any data this "
+                f"process writes will land in the wrong profile. The "
+                f"subprocess spawner should pass HERMES_HOME explicitly "
+                f"(see issue #18594)."
+            )
+            try:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
 
-
-def get_process_hermes_home() -> Path:
-    """Return the Hermes home for the running process, ignoring task overrides.
-
-    Unlike :func:`get_hermes_home`, this never follows the context-local
-    override set by :func:`set_hermes_home_override`.  It resolves only the
-    process ``HERMES_HOME`` env var (falling back to the platform default),
-    so it reflects the scope the process was launched under **as long as
-    nothing mutates ``os.environ`` in-process**.
-
-    Use this for machine/process-level dashboard-owned assets — theme YAML,
-    dashboard plugin manifests — that live under the server's launch home and
-    must stay visible even while a request is scoped to another profile (e.g.
-    the embedded ``/chat`` running under ``--open-profile``).  Do NOT use it
-    for genuinely profile-scoped data (memories, backups, checkpoints,
-    provider config) — those should keep following the override.
-    """
-    return _hermes_home_from_env()
+    return _get_platform_default_hermes_home()
 
 
 def get_default_hermes_root() -> Path:
@@ -189,6 +149,62 @@ def get_default_hermes_root() -> Path:
 
     # Not a profile path — HERMES_HOME itself is the root
     return env_path
+
+
+# Third-party framework / tooling caches that otherwise default into the user's
+# home dir (e.g. ~/.cache/huggingface, %USERPROFILE%\.cache\torch) and so escape
+# the converged runtime tree. Each maps to a subdir under <HERMES_HOME>/cache so
+# that, in the desktop-managed runtime, they follow HERMES_HOME onto whatever
+# drive the app was installed to instead of bloating C:. The matching anchor on
+# the desktop side is Hermes-CN-Desktop's runtime_root().
+_MANAGED_CACHE_ENV_DIRS: dict[str, str] = {
+    "HF_HOME": "huggingface",
+    "HUGGINGFACE_HUB_CACHE": "huggingface/hub",
+    "TORCH_HOME": "torch",
+    "TIKTOKEN_CACHE_DIR": "tiktoken",
+    "MPLCONFIGDIR": "matplotlib",
+    "NLTK_DATA": "nltk",
+    "PLAYWRIGHT_BROWSERS_PATH": "ms-playwright",
+}
+
+# Temp-dir vars share one "tmp" subdir. We only redirect them when the process
+# has no temp dir configured at all, so we never override an explicit TMPDIR.
+_MANAGED_TMP_ENV_VARS: tuple[str, ...] = ("TMPDIR", "TEMP", "TMP")
+
+
+def configure_managed_runtime_caches() -> None:
+    """Point third-party caches/temp at ``<HERMES_HOME>/cache`` when desktop-managed.
+
+    The Hermes-CN desktop sets ``HERMES_DESKTOP_MANAGED=1`` and a ``HERMES_HOME``
+    under its converged runtime root.  Without this, libraries such as
+    huggingface/transformers, torch, tiktoken, matplotlib, nltk and playwright
+    write their caches into the user's home directory (C: on Windows), defeating
+    the goal of keeping all app data under the chosen install drive.
+
+    Uses ``setdefault`` so an explicitly-configured value always wins, and is
+    gated on ``HERMES_DESKTOP_MANAGED`` so standalone CLI installs keep their
+    existing shared caches (no surprise re-downloads).  Best-effort and
+    idempotent: it never raises, so a bad path can't block startup.
+    """
+    if os.environ.get("HERMES_DESKTOP_MANAGED") != "1":
+        return
+    try:
+        cache_root = get_hermes_home() / "cache"
+        for var, subdir in _MANAGED_CACHE_ENV_DIRS.items():
+            os.environ.setdefault(var, str(cache_root.joinpath(*subdir.split("/"))))
+        # Only take over temp if nothing is configured, then keep the three vars
+        # consistent (a half-set TMPDIR/TEMP/TMP confuses cross-tool temp usage).
+        if not any(os.environ.get(var) for var in _MANAGED_TMP_ENV_VARS):
+            tmp_dir = cache_root / "tmp"
+            try:
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            for var in _MANAGED_TMP_ENV_VARS:
+                os.environ[var] = str(tmp_dir)
+    except Exception:
+        # Cache redirection is best-effort; never block startup over it.
+        pass
 
 
 def _get_packaged_data_dir(name: str) -> Path | None:
@@ -388,8 +404,7 @@ def hermes_managed_node_tree_present(home: Path | None = None) -> bool:
 
 
 def _heal_managed_node_windows() -> bool:
-    """Redownload the portable Node zip into ``%HERMES_HOME%\\node`` on Windows."""
-    import re
+    """Redownload the portable Node zip into ``%HERMES_HOME%\node`` on Windows."""
     import tempfile
     import urllib.request
     import zipfile
@@ -832,16 +847,13 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
         env["HOME"] = home
 
 
-VALID_REASONING_EFFORTS = (
-    "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-)
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max",
-    "ultra".
+    Valid levels: "none", "off", "minimal", "low", "medium", "high", "xhigh", "max".
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
     YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``
@@ -857,197 +869,11 @@ def parse_reasoning_effort(effort) -> dict | None:
     if not effort.strip():
         return None
     effort = effort.strip().lower()
-    if effort in {"none", "false", "disabled"}:
+    if effort in {"none", "off", "false", "disabled"}:
         return {"enabled": False}
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
-
-
-def _canonical_model_variants(model: str) -> list[str]:
-    """Generate bounded spelling variants for tolerant override matching.
-
-    Model names mix two types of separators:
-    - **Word separators**: dashes between words (``claude-opus``)
-    - **Version separators**: dots or dashes between version digits (``4.5``, ``4-5``)
-
-    The tricky case is that ``.`` appears in BOTH roles (word sep in some
-    spellings, version sep in others), so a blanket ``.replace('.', '-')``
-    is lossy — it collapses version dots into dashes and no later step
-    recovers the canonical form (``claude-opus-4.5``).
-
-    Strategy: generate a small set of base forms, then apply version-dot
-    recovery to EACH of them. This ensures symmetry:
-    ``claude-opus-4.5``, ``claude-opus-4-5``, and ``claude-opus.4.5`` all
-    produce the same variant set.
-
-    Steps:
-    1. Exact input
-    2. Dots/dashes cross-substitution on the entire string
-    3. Version-dot recovery applied to ALL derivatives
-    4. Strip provider/aggregator prefix → bare model variants
-    5. Apply version-dot recovery to bare derivatives
-    6. Prepend known provider/aggregator prefixes
-
-    Duplicates removed in insertion order (exact always wins).
-    """
-    import re
-
-    # Version-dot regexes — digit-separator-digit interconversion
-    _dash_to_dot = lambda s: re.sub(r'(\d)-(\d)', r'\1.\2', s)
-    _dot_to_dash = lambda s: re.sub(r'(\d)\.(\d)', r'\1-\2', s)
-
-    seen = set()
-    variants = []
-
-    def _add(v):
-        if v and v not in seen:
-            seen.add(v)
-            variants.append(v)
-
-    def _add_with_derivatives(s):
-        """Add s plus its dots↔dashes and version-dot derivatives."""
-        _add(s)
-        all_dashed = s.replace('.', '-')
-        _add(all_dashed)
-        all_dotted = s.replace('-', '.')
-        _add(all_dotted)
-        # Version-dot recovery on each base form
-        _add(_dash_to_dot(s))
-        _add(_dot_to_dash(s))
-        _add(_dash_to_dot(all_dashed))
-        _add(_dot_to_dash(all_dotted))
-
-    # 1-3. Base variants for the full string
-    _add_with_derivatives(model)
-
-    # Split by / to handle provider prefix
-    parts = model.split('/')
-
-    # 4. Bare model variants (strip provider/aggregator prefix)
-    if len(parts) >= 2:
-        bare = parts[-1]
-        _add_with_derivatives(bare)
-
-    # Strip aggregator only (3+ parts)
-    # e.g. "openrouter/anthropic/claude-opus-4.5" → "anthropic/claude-opus-4.5"
-    if len(parts) >= 3:
-        _add_with_derivatives('/'.join(parts[1:]))
-
-    # 5. Prepend known provider prefixes to bare variants
-    known_providers = (
-        'anthropic', 'openai', 'google', 'openrouter', 'groq', 'mistral',
-        'xai', 'cohere', 'perplexity', 'together', 'fireworks', 'deepseek',
-    )
-    bare_variants = [v for v in variants if '/' not in v]
-    for v in bare_variants:
-        for provider in known_providers:
-            _add(f"{provider}/{v}")
-
-    # Prepend aggregator to single-slash variants
-    single_slash_variants = [v for v in variants if v.count('/') == 1]
-    known_aggregators = ('openrouter', 'opencode', 'fireworks', 'groq', 'together')
-    for v in single_slash_variants:
-        for agg in known_aggregators:
-            _add(f"{agg}/{v}")
-
-    return variants
-
-
-def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> dict | None:
-    """Lookup a per-model reasoning_effort override with spelling-tolerance.
-
-    Args:
-        model: The model string (any spelling — exact, normalized, bare,
-               with provider prefix, etc.)
-        overrides: The dict of per-model overrides from
-                   agent.reasoning_overrides in config.yaml. Keys can be
-                   any sensible spelling of the model name.
-
-    Returns:
-        The parsed reasoning_config dict if a match is found,
-        None otherwise (caller should fall back to global reasoning_effort).
-
-    Resolution order:
-    1. Exact match
-    2. Dots ↔ dashes variants
-    3. Strip provider prefix (bare model name only)
-    4. Strip aggregator prefix (middle segment only)
-    5. Prepend known aggregator prefixes to bare/single-slash variants
-
-    First non-None parse_reasoning_effort result wins.
-    """
-    if not overrides or not isinstance(overrides, dict) or not model:
-        return None
-
-    for variant in _canonical_model_variants(model):
-        if variant in overrides:
-            result = parse_reasoning_effort(overrides[variant])
-            if result is not None:
-                return result
-
-    return None
-
-
-def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
-    """Resolve the effective reasoning config for *model* from a config dict.
-
-    Single chokepoint for reasoning-effort resolution, shared by every
-    surface (CLI startup, messaging gateway, Desktop/TUI, cron, ``/model``
-    switch, fallback activation). Priority:
-
-    1. Per-model override from ``agent.reasoning_overrides``
-       (spelling-tolerant — see :func:`resolve_per_model_reasoning_effort`)
-    2. Global ``agent.reasoning_effort`` — the raw value is passed through
-       so a YAML boolean ``False`` (``reasoning_effort: false``/``off``/
-       ``no``) means "thinking disabled", never silently re-enabled.
-
-    Session-scoped overrides (gateway ``/reasoning --session``) are resolved
-    by the caller BEFORE this function — they always win.
-
-    Args:
-        cfg: A loaded config dict (any of the three loaders' shapes — only
-             the ``agent`` and ``model`` sections are read).
-        model: The effective model for this surface/session. When empty,
-               it is derived from the config's ``model`` section (string
-               form, or a dict's ``default``/``model`` keys).
-
-    Returns:
-        The parsed reasoning config dict, or None when unset/unrecognized
-        (caller uses the provider default).
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    agent_cfg = cfg.get("agent")
-    if not isinstance(agent_cfg, dict):
-        agent_cfg = {}
-
-    if not model:
-        model_cfg = cfg.get("model")
-        if isinstance(model_cfg, str):
-            model = model_cfg.strip()
-        elif isinstance(model_cfg, dict):
-            model = str(
-                model_cfg.get("default") or model_cfg.get("model") or ""
-            ).strip()
-        else:
-            model = ""
-
-    overrides = agent_cfg.get("reasoning_overrides") or {}
-    per_model = resolve_per_model_reasoning_effort(model, overrides)
-    if per_model is not None:
-        return per_model
-
-    # Global fallback — keep the raw value; coercing with ``or ""`` turns a
-    # YAML boolean False into "", silently re-enabling thinking for users
-    # who explicitly disabled it.
-    effort = agent_cfg.get("reasoning_effort", "")
-    result = parse_reasoning_effort(effort)
-    if effort and str(effort).strip() and result is None:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Unknown reasoning_effort '%s', using default (medium)", effort
-        )
-    return result
 
 
 def is_termux() -> bool:
@@ -1079,48 +905,6 @@ def is_wsl() -> bool:
     except Exception:
         _wsl_detected = False
     return _wsl_detected
-
-
-def windows_path_to_wsl(path: str) -> str | None:
-    """Convert a Windows drive path (``C:\\...``) to its ``/mnt/<drive>/...`` form."""
-    import re
-
-    match = re.match(r"^([A-Za-z]):[\\/](.*)$", str(path or "").strip())
-    if not match:
-        return None
-    drive = match.group(1).lower()
-    tail = match.group(2).replace("\\", "/")
-    return f"/mnt/{drive}/{tail}"
-
-
-def wsl_unc_path_to_posix(path: str) -> str | None:
-    """Convert a Windows WSL UNC path (``\\\\wsl.localhost\\<distro>\\...`` or the
-    legacy ``\\\\wsl$\\...``) to a POSIX path inside the distro."""
-    import re
-
-    normalized = str(path or "").strip().replace("/", "\\")
-    match = re.match(r"^\\\\wsl(?:\.localhost|\$)\\[^\\]+\\(.*)$", normalized, re.IGNORECASE)
-    if not match:
-        return None
-    tail = match.group(1).replace("\\", "/")
-    return f"/{tail}" if tail else "/"
-
-
-def translate_cwd_for_wsl_backend(cwd: str) -> str:
-    """Normalize a cross-boundary cwd when Hermes itself runs inside WSL.
-
-    A Windows-host UI (native picker / drive path / ``\\\\wsl.localhost\\`` UNC)
-    can hand the WSL backend a path it can't ``chdir`` into. Map it to the POSIX
-    equivalent so the picker, sidebar, and sessions all agree on the workspace.
-    No-op off WSL and for paths that are already POSIX.
-    """
-    if not is_wsl():
-        return cwd
-    for translator in (wsl_unc_path_to_posix, windows_path_to_wsl):
-        translated = translator(cwd)
-        if translated is not None:
-            return translated
-    return cwd
 
 
 _container_detected: bool | None = None
@@ -1201,6 +985,29 @@ def get_skills_dir() -> Path:
 def get_env_path() -> Path:
     """Return the path to the ``.env`` file under HERMES_HOME."""
     return get_hermes_home() / ".env"
+
+
+def get_managed_tools_dir() -> Path:
+    """Return the Hermes-managed external tools directory.
+
+    External binaries that Hermes downloads itself (ripgrep, rtk, coreutils,
+    tirith, ...) live here so a broken global PATH copy cannot brick search,
+    terminal post-processing, or security checks.  The canonical location is
+    ``<HERMES_HOME>/tools``; the legacy ``<HERMES_HOME>/bin`` directory is
+    still accepted as a fallback so existing installs keep working without
+    migration.
+
+    Callers should treat the returned directory as the first place to look for
+    a managed binary.  Install scripts download new binaries into this path.
+    """
+    home = get_hermes_home()
+    tools_dir = home / "tools"
+    legacy_bin = home / "bin"
+    # If the legacy bin dir already has content and the new tools dir does not,
+    # keep using it for backward compatibility.  Otherwise prefer tools/.
+    if legacy_bin.exists() and not tools_dir.exists():
+        return legacy_bin
+    return tools_dir
 
 
 # ─── Network Preferences ─────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 """Tests for the WeCom platform adapter."""
 
 import asyncio
-import base64
+import pybase64 as base64
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -125,7 +125,7 @@ class TestWeComConnect:
 
 class TestWeComQrScan:
     @patch("plugins.platforms.wecom.adapter.time")
-    @patch("plugins.platforms.wecom.adapter.json.loads")
+    @patch("plugins.platforms.wecom.adapter.orjson.loads")
     @patch("plugins.platforms.wecom.adapter.logger")
     @patch("urllib.request.urlopen")
     @patch("urllib.request.Request")

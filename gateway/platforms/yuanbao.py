@@ -18,16 +18,16 @@ Configuration in config.yaml (or via env vars):
 from __future__ import annotations
 
 import asyncio
-import base64
+import pybase64 as base64
 import binascii
 import collections
 import dataclasses
 import hashlib
 import hmac
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import secrets
 import time
 import urllib.parse
@@ -1127,7 +1127,7 @@ class DecodeMiddleware(InboundMiddleware):
             msg_content = item.get("msg_content") or item.get("MsgContent", {})
             if isinstance(msg_content, str):
                 try:
-                    msg_content = json.loads(msg_content)
+                    msg_content = orjson.loads(msg_content)
                 except Exception:
                     msg_content = {"text": msg_content}
             result.append({"msg_type": msg_type, "msg_content": msg_content or {}})
@@ -1188,7 +1188,7 @@ class DecodeMiddleware(InboundMiddleware):
     def _decode_single(self, adapter, data: bytes) -> tuple:
         """Decode a single raw frame into (push_dict, decoded_via) or (None, '')."""
         try:
-            conn_json = json.loads(data.decode("utf-8"))
+            conn_json = orjson.loads(data.decode("utf-8"))
         except Exception:
             conn_json = None
 
@@ -1714,9 +1714,9 @@ class ExtractContentMiddleware(InboundMiddleware):
         if not content:
             return None
         try:
-            parsed = json.loads(content)
+            parsed = orjson.loads(content)
             link = parsed.get("link") if isinstance(parsed, dict) else None
-        except (json.JSONDecodeError, TypeError):
+        except (orjson.JSONDecodeError, TypeError):
             link = None
         if not link or not isinstance(link, str):
             return None
@@ -1797,7 +1797,7 @@ class ExtractContentMiddleware(InboundMiddleware):
                 data_val = content.get("data", "")
                 if data_val:
                     try:
-                        custom = json.loads(data_val)
+                        custom = orjson.loads(data_val)
                         if not isinstance(custom, dict):
                             parts.append("[unsupported message type]")
                             continue
@@ -1817,7 +1817,7 @@ class ExtractContentMiddleware(InboundMiddleware):
                             parts.append(custom.get("text", "[chat record]"))
                         else:
                             parts.append("[unsupported message type]")
-                    except (json.JSONDecodeError, TypeError):
+                    except (orjson.JSONDecodeError, TypeError):
                         parts.append(data_val)
                 else:
                     parts.append("[unsupported message type]")
@@ -1827,9 +1827,9 @@ class ExtractContentMiddleware(InboundMiddleware):
                 face_name = ""
                 if raw_data:
                     try:
-                        face_data = json.loads(raw_data)
+                        face_data = orjson.loads(raw_data)
                         face_name = (face_data.get("name") or "").strip()
-                    except (json.JSONDecodeError, TypeError, AttributeError):
+                    except (orjson.JSONDecodeError, TypeError, AttributeError):
                         pass
                 parts.append(f"[emoji: {face_name}]" if face_name else "[emoji]")
             elif elem_type:
@@ -1904,8 +1904,8 @@ class ExtractContentMiddleware(InboundMiddleware):
             if not data_str:
                 continue
             try:
-                custom = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
+                custom = orjson.loads(data_str)
+            except (orjson.JSONDecodeError, TypeError):
                 continue
             if not isinstance(custom, dict):
                 continue
@@ -1918,11 +1918,11 @@ class ExtractContentMiddleware(InboundMiddleware):
                 content = custom.get("content")
                 if content:
                     try:
-                        parsed = json.loads(content)
+                        parsed = orjson.loads(content)
                         link = parsed.get("link") if isinstance(parsed, dict) else None
                         if link and isinstance(link, str):
                             urls.append(link)
-                    except (json.JSONDecodeError, TypeError):
+                    except (orjson.JSONDecodeError, TypeError):
                         pass
         return urls
 
@@ -1952,8 +1952,8 @@ class ExtractContentMiddleware(InboundMiddleware):
             if not data_str:
                 continue
             try:
-                custom = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
+                custom = orjson.loads(data_str)
+            except (orjson.JSONDecodeError, TypeError):
                 continue
             if not (isinstance(custom, dict) and custom.get("elem_type") == 1009):
                 continue
@@ -2157,8 +2157,8 @@ class GroupAtGuardMiddleware(InboundMiddleware):
             if not data_str:
                 continue
             try:
-                custom = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
+                custom = orjson.loads(data_str)
+            except (orjson.JSONDecodeError, TypeError):
                 continue
             if custom.get("elem_type") == 1002 and custom.get("user_id") == bot_id:
                 return True
@@ -2176,8 +2176,8 @@ class GroupAtGuardMiddleware(InboundMiddleware):
             if not data_str:
                 continue
             try:
-                custom = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
+                custom = orjson.loads(data_str)
+            except (orjson.JSONDecodeError, TypeError):
                 continue
             if custom.get("elem_type") == 1002 and custom.get("user_id") == bot_id:
                 mention_text = str(custom.get("text") or "").strip()
@@ -2327,8 +2327,8 @@ class ClassifyMessageTypeMiddleware(InboundMiddleware):
             if etype == "TIMCustomElem":
                 data_str = (elem.get("msg_content") or {}).get("data", "")
                 try:
-                    custom = json.loads(data_str)
-                except (json.JSONDecodeError, TypeError):
+                    custom = orjson.loads(data_str)
+                except (orjson.JSONDecodeError, TypeError):
                     custom = None
                 if isinstance(custom, dict) and custom.get("elem_type") == 1009:
                     return YuanbaoMessageType.CHAT_RECORD
@@ -2350,8 +2350,8 @@ class QuoteContextMiddleware(InboundMiddleware):
         if not cloud_custom_data:
             return None, None
         try:
-            parsed = json.loads(cloud_custom_data)
-        except (json.JSONDecodeError, TypeError):
+            parsed = orjson.loads(cloud_custom_data)
+        except (orjson.JSONDecodeError, TypeError):
             return None, None
 
         quote = parsed.get("quote") if isinstance(parsed, dict) else None
@@ -3801,7 +3801,7 @@ class ConnectionManager:
         Returns 'from_account:group_code' or a fallback unique key.
         """
         try:
-            parsed = json.loads(raw_data.decode("utf-8"))
+            parsed = orjson.loads(raw_data.decode("utf-8"))
             if isinstance(parsed, dict):
                 from_account = (
                     parsed.get("from_account", "")
@@ -4893,7 +4893,7 @@ class MessageSender:
                 msg_body.append({
                     "msg_type": "TIMCustomElem",
                     "msg_content": {
-                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
+                        "data": orjson.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}).decode('utf-8'),
                     },
                 })
             else:

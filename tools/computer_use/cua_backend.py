@@ -36,12 +36,13 @@ same SPI breakage class.
 from __future__ import annotations
 
 import asyncio
-import base64
+import pybase64 as base64
 import concurrent.futures
+import orjson
 import json
 import logging
 import os
-import re
+from agent.re_compat import re
 import shutil
 import subprocess
 import sys
@@ -240,7 +241,7 @@ def _resolve_mcp_invocation(
     if proc.returncode != 0 or not out:
         return driver_cmd, list(_CUA_DRIVER_ARGS)
     try:
-        manifest = json.loads(out)
+        manifest = orjson.loads(out)
     except (ValueError, TypeError):
         return driver_cmd, list(_CUA_DRIVER_ARGS)
     if not isinstance(manifest, dict):
@@ -334,7 +335,7 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
         # Older drivers don't have the verb: usage goes to stderr, stdout empty.
         return None
     try:
-        data = json.loads(out)
+        data = orjson.loads(out)
     except (ValueError, TypeError):
         return None
     if not isinstance(data, dict) or data.get("error"):
@@ -1161,8 +1162,8 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     if text_chunks:
         joined = "\n".join(t for t in text_chunks if t)
         try:
-            data = json.loads(joined) if joined.strip().startswith(("{", "[")) else joined
-        except json.JSONDecodeError:
+            data = orjson.loads(joined) if joined.strip().startswith(("{", "[")) else joined
+        except orjson.JSONDecodeError:
             data = joined
     return {
         "data": data,

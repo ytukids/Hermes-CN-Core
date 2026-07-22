@@ -2,7 +2,8 @@
 
 Pure display functions with no HermesCLI state dependency.
 """
-import json
+
+import orjson
 import logging
 import os
 import shutil
@@ -269,7 +270,7 @@ def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
         url = f"https://pypi.org/pypi/{package}/json"
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
+            data = orjson.loads(resp.read())
             return data.get("info", {}).get("version")
     except Exception:
         return None
@@ -335,7 +336,7 @@ def check_for_updates() -> Optional[int]:
     now = time.time()
     try:
         if cache_file.exists():
-            cached = json.loads(cache_file.read_text())
+            cached = orjson.loads(cache_file.read_text())
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
@@ -361,7 +362,7 @@ def check_for_updates() -> Optional[int]:
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
+            orjson.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}).decode('utf-8')
         )
     except Exception:
         pass
@@ -602,6 +603,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text as _RichText
     if get_toolset_for_tool is None:
         from model_tools import get_toolset_for_tool
 
@@ -918,7 +920,20 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     release_info = get_latest_release_tag()
     if release_info:
         _tag, _url = release_info
-        title_markup = f"[bold {title_color}][link={_url}]{version_label}[/link][/]"
+        # Build a Text object with manual OSC-8 hyperlink wrapping.
+        # Rich's built-in [link=...] markup is suppressed on Windows
+        # because legacy_windows=True prevents Style.render() from
+        # emitting the \x1b]8;... escape sequence. By constructing the
+        # title as a Text object with raw escape codes in unstyled
+        # segments, we bypass that limitation entirely.
+        osc8_open = f"\x1b]8;id=0;{_url}\x1b\\"
+        osc8_close = "\x1b]8;;\x1b\\"
+        inner = _RichText.from_markup(f"[bold {title_color}]{version_label}[/]")
+        title_markup = _RichText.assemble(
+            (osc8_open, ""),
+            inner,
+            (osc8_close, ""),
+        )
     else:
         title_markup = f"[bold {title_color}]{version_label}[/]"
     outer_panel = Panel(

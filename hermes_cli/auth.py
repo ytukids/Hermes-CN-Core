@@ -18,6 +18,7 @@ Nous authentication paths:
 
 from __future__ import annotations
 
+import orjson
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ import shlex
 import ssl
 import stat
 import sys
-import base64
+import pybase64 as base64
 import hashlib
 import subprocess
 import threading
@@ -884,7 +885,7 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
     if sequence_id:
         payload["sequence_id"] = sequence_id
     payload.update(fields)
-    logger.info("oauth_trace %s", json.dumps(payload, sort_keys=True, ensure_ascii=False))
+    logger.info("oauth_trace %s", orjson.dumps(payload, option=orjson.OPT_SORT_KEYS).decode('utf-8'))
 
 
 # =============================================================================
@@ -1112,7 +1113,7 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text())
+        raw = orjson.loads(auth_file.read_text())
     except Exception as exc:
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         try:
@@ -1162,7 +1163,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps(auth_store, indent=2) + "\n"
+    payload = orjson.dumps(auth_store, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
@@ -1925,10 +1926,11 @@ def resolve_provider(
     except ImportError:
         pass  # boto3 not installed — skip Bedrock auto-detection
 
+    home = get_hermes_home()
     raise AuthError(
         "No inference provider configured. Run 'hermes model' to choose a "
         "provider and model, or set an API key (OPENROUTER_API_KEY, "
-        "OPENAI_API_KEY, etc.) in ~/.hermes/.env.",
+        f"OPENAI_API_KEY, etc.) in {home / '.env'}.",
         code="no_provider_configured",
     )
 
@@ -2107,7 +2109,7 @@ def _decode_jwt_claims(token: Any) -> Dict[str, Any]:
     payload += "=" * ((4 - len(payload) % 4) % 4)
     try:
         raw = base64.urlsafe_b64decode(payload.encode("utf-8"))
-        claims = json.loads(raw.decode("utf-8"))
+        claims = orjson.loads(raw.decode("utf-8"))
     except Exception:
         return {}
     return claims if isinstance(claims, dict) else {}
@@ -2313,7 +2315,7 @@ def _read_qwen_cli_tokens() -> Dict[str, Any]:
             code="qwen_auth_missing",
         )
     try:
-        data = json.loads(auth_path.read_text(encoding="utf-8"))
+        data = orjson.loads(auth_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise AuthError(
             f"Failed to read Qwen CLI credentials from {auth_path}: {exc}",
@@ -2347,7 +2349,7 @@ def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(tokens, indent=2, sort_keys=True) + "\n")
+            fh.write(orjson.dumps(tokens, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode('utf-8') + "\n")
             fh.flush()
             os.fsync(fh.fileno())
         atomic_replace(tmp_path, auth_path)
@@ -3701,7 +3703,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     if not auth_path.is_file():
         return None
     try:
-        payload = json.loads(auth_path.read_text())
+        payload = orjson.loads(auth_path.read_text())
         tokens = payload.get("tokens")
         if not isinstance(tokens, dict):
             return None
@@ -4146,7 +4148,7 @@ def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> b
             return False
         payload_b64 = parts[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
+        payload = orjson.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
         exp = payload.get("exp")
         if not isinstance(exp, (int, float)):
             return False
@@ -4175,7 +4177,7 @@ def _xai_proactive_refresh_skew_seconds(access_token: str) -> int:
             return max_skew
         payload_b64 = parts[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
+        payload = orjson.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8"))
         exp = payload.get("exp")
         if not isinstance(exp, (int, float)):
             return max_skew
@@ -4888,7 +4890,7 @@ def _write_shared_nous_state(state: Dict[str, Any]) -> None:
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(json.dumps(shared, indent=2, sort_keys=True))
+                    fh.write(orjson.dumps(shared, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode('utf-8'))
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, path)
@@ -4922,7 +4924,7 @@ def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text())
+        payload = orjson.loads(path.read_text())
     except (OSError, ValueError) as exc:
         logger.debug("Shared Nous auth store at %s is unreadable: %s", path, exc)
         return None
@@ -6778,11 +6780,14 @@ def _confirm_expensive_model_selection(
     try:
         from hermes_cli.model_cost_guard import expensive_model_warning
 
+        # P-028: read the models.dev cache/snapshot only — saving a model must
+        # never block on the network (fail-open: no data → no warning).
         warning = expensive_model_warning(
             model_id,
             provider=provider,
             base_url=base_url,
             api_key=api_key,
+            allow_network=False,
         )
     except Exception:
         warning = None

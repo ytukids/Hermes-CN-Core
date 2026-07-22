@@ -23,7 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
-import json
+import orjson
 import logging
 import os
 import tempfile
@@ -194,6 +194,11 @@ class MemoryStore:
         """
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
+        # Log the resolved directory so a "memory looks lost across restarts"
+        # report (GitHub #335) can be diagnosed: the store is always persisted
+        # synchronously, so the usual cause is a HERMES_HOME / profile drift
+        # making two launches read different `memories/` dirs.
+        logger.info("memory: loading from %s", mem_dir)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
@@ -319,7 +324,13 @@ class MemoryStore:
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        path = self._path_for(target)
+        # Diagnostic for GitHub #335: every mutation persists here synchronously
+        # (mkstemp + fsync + atomic os.replace). Logging the path makes a
+        # cross-launch "lost memory" report traceable to profile/HERMES_HOME
+        # drift rather than a missing write.
+        logger.debug("memory: saving %s to %s", target, path)
+        self._write_file(path, self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -880,11 +891,8 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
-        ensure_ascii=False,
-    )
+    return orjson.dumps({"success": True, "staged": True, "pending_id": record["id"],
+         "message": decision.message}).decode('utf-8')
 
 
 def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
@@ -927,11 +935,8 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
-        ensure_ascii=False,
-    )
+    return orjson.dumps({"success": True, "staged": True, "pending_id": record["id"],
+         "message": decision.message}).decode('utf-8')
 
 
 def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> str:
@@ -951,8 +956,7 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
     entries = store._entries_for(target)
     current = store._char_count(target)
     limit = store._char_limit(target)
-    return json.dumps(
-        {
+    return orjson.dumps({
             "success": False,
             "error": (
                 f"'{action}' needs old_text -- a short unique substring of the entry "
@@ -961,9 +965,7 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
             ),
             "current_entries": entries,
             "usage": f"{current:,}/{limit:,}",
-        },
-        ensure_ascii=False,
-    )
+        }).decode('utf-8')
 
 
 def memory_tool(
@@ -1004,7 +1006,7 @@ def memory_tool(
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
-        return json.dumps(result, ensure_ascii=False)
+        return orjson.dumps(result).decode('utf-8')
 
     # --- Single-op path ---------------------------------------------------
     # Validate required params BEFORE the gate so an invalid write is rejected
@@ -1041,7 +1043,7 @@ def memory_tool(
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
-    return json.dumps(result, ensure_ascii=False)
+    return orjson.dumps(result).decode('utf-8')
 
 
 def check_memory_requirements() -> bool:

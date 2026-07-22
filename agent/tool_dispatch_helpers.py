@@ -24,10 +24,10 @@ working unchanged.
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -153,7 +153,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             continue
 
         try:
-            function_args = json.loads(tool_call.function.arguments)
+            function_args = orjson.loads(tool_call.function.arguments)
         except Exception:
             _raw = tool_call.function.arguments
             logging.debug(
@@ -305,7 +305,7 @@ def _multimodal_text_summary(value: Any) -> str:
     if isinstance(value, str):
         return value
     try:
-        return json.dumps(value, default=str)
+        return orjson.dumps(value, default=str).decode('utf-8')
     except Exception:
         return str(value)
 
@@ -387,7 +387,7 @@ def _extract_landed_file_mutation_paths(
     if tool_name not in _FILE_MUTATING_TOOLS or not isinstance(result, str):
         return targets
     try:
-        data = json.loads(result.strip())
+        data = orjson.loads(result.strip())
     except Exception:
         return targets
     if not isinstance(data, dict):
@@ -419,7 +419,7 @@ def _extract_error_preview(result: Any, max_len: int = 180) -> str:
     stripped = text.strip()
     if stripped.startswith("{"):
         try:
-            data = json.loads(stripped)
+            data = orjson.loads(stripped)
             if isinstance(data, dict) and isinstance(data.get("error"), str):
                 text = data["error"]
         except Exception:

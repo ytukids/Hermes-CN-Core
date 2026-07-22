@@ -47,7 +47,7 @@ import hmac
 import logging
 import mimetypes
 import os
-import re
+from agent.re_compat import re
 import shutil
 import uuid
 from collections import OrderedDict
@@ -80,6 +80,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
 from gateway import rich_sent_store
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
@@ -1247,12 +1248,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         out_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
         try:
+            _subprocess_kwargs = {}
+            if IS_WINDOWS:
+                _subprocess_kwargs["creationflags"] = windows_hide_flags()
             proc = await asyncio.create_subprocess_exec(
                 _FFMPEG_PATH, "-y", "-i", mp3_path,
                 "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
                 "-application", "voip", out_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                **_subprocess_kwargs,
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0 or not Path(out_path).exists():
@@ -1477,7 +1482,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Parse only AFTER signature passes — bad JSON from an attacker is
         # already filtered out, this just guards against Meta sending
         # something malformed.
-        import json as _json
+        import orjson as _json
 
         try:
             payload = _json.loads(raw)

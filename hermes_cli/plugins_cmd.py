@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
-import json
+import orjson
 import logging
 import os
 import shutil
@@ -1149,7 +1149,7 @@ def cmd_list(args: Any | None = None) -> None:
             }
             for name, version, description, source, _dir, key in entries
         ]
-        print(json.dumps(payload, indent=2))
+        print(orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode('utf-8'))
         return
 
     if getattr(args, "plain", False):

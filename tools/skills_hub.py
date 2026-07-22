@@ -13,11 +13,13 @@ This is a library module (not an agent tool). It provides:
 Used by hermes_cli/skills_hub.py for CLI commands and the /skills slash command.
 """
 
+import xxhash as _xxhash
+import orjson
 import hashlib
 import json
 import logging
 import os
-import re
+from agent.re_compat import re
 import shutil
 import subprocess
 import time
@@ -1102,8 +1104,8 @@ class GitHubSource(SkillSource):
         Returns ``None`` when the content isn't a usable grouping document.
         """
         try:
-            data = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
+            data = orjson.loads(content)
+        except (orjson.JSONDecodeError, TypeError):
             return None
         if not isinstance(data, dict):
             return None
@@ -1134,8 +1136,8 @@ class GitHubSource(SkillSource):
             stat = cache_file.stat()
             if time.time() - stat.st_mtime > INDEX_CACHE_TTL:
                 return None
-            return json.loads(cache_file.read_text())
-        except (OSError, json.JSONDecodeError):
+            return orjson.loads(cache_file.read_text())
+        except (OSError, orjson.JSONDecodeError):
             return None
 
     def _write_cache(self, key: str, data: list) -> None:
@@ -1144,7 +1146,7 @@ class GitHubSource(SkillSource):
         index_cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = index_cache_dir / f"{key}.json"
         try:
-            cache_file.write_text(json.dumps(data, ensure_ascii=False))
+            cache_file.write_text(orjson.dumps(data).decode('utf-8'))
         except OSError as e:
             logger.debug("Could not write cache: %s", e)
 
@@ -1360,7 +1362,7 @@ class WellKnownSkillSource(SkillSource):
         }
 
     def _parse_index(self, index_url: str) -> Optional[dict]:
-        cache_key = f"well_known_index_{hashlib.md5(index_url.encode()).hexdigest()}"
+        cache_key = f"well_known_index_{_xxhash.xxh64(index_url.encode()).hexdigest()}"
         cached = _read_index_cache(cache_key)
         if isinstance(cached, dict) and isinstance(cached.get("skills"), list):
             return cached
@@ -1370,7 +1372,7 @@ class WellKnownSkillSource(SkillSource):
             return None
         try:
             data = resp.json()
-        except json.JSONDecodeError:
+        except orjson.JSONDecodeError:
             return None
 
         skills = data.get("skills", []) if isinstance(data, dict) else []
@@ -1645,7 +1647,7 @@ class SkillsShSource(SkillSource):
             # entries; the sitemap walks the full ~20k+ catalog.
             return self._sitemap_catalog(limit)
 
-        cache_key = f"skills_sh_search_{hashlib.md5(f'{query}|{limit}'.encode()).hexdigest()}"
+        cache_key = f"skills_sh_search_{_xxhash.xxh64(f'{query}|{limit}'.encode()).hexdigest()}"
         cached = _read_index_cache(cache_key)
         if cached is not None:
             return [SkillMeta(**item) for item in cached][:limit]
@@ -1659,7 +1661,7 @@ class SkillsShSource(SkillSource):
             if resp.status_code != 200:
                 return []
             data = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except (httpx.HTTPError, orjson.JSONDecodeError):
             return []
 
         items = data.get("skills", []) if isinstance(data, dict) else []
@@ -1872,7 +1874,7 @@ class SkillsShSource(SkillSource):
         )
 
     def _fetch_detail_page(self, identifier: str) -> Optional[dict]:
-        cache_key = f"skills_sh_detail_{hashlib.md5(identifier.encode()).hexdigest()}"
+        cache_key = f"skills_sh_detail_{_xxhash.xxh64(identifier.encode()).hexdigest()}"
         cached = _read_index_cache(cache_key)
         if isinstance(cached, dict):
             return cached
@@ -2366,7 +2368,7 @@ class ClawHubSource(SkillSource):
 
         # Non-empty query catalog miss, or catalog walker failure: fall back to
         # the lightweight listing API for a best-effort response.
-        cache_key = f"clawhub_search_listing_v1_{hashlib.md5(query.encode()).hexdigest()}_{limit}"
+        cache_key = f"clawhub_search_listing_v1_{_xxhash.xxh64(query.encode()).hexdigest()}_{limit}"
         cached = _read_index_cache(cache_key)
         if cached is not None:
             return self._finalize_search_results(
@@ -2384,7 +2386,7 @@ class ClawHubSource(SkillSource):
             if resp.status_code != 200:
                 return []
             data = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except (httpx.HTTPError, orjson.JSONDecodeError):
             return []
 
         skills_data = data.get("items", data) if isinstance(data, dict) else data
@@ -2539,7 +2541,7 @@ class ClawHubSource(SkillSource):
                 if resp.status_code != 200:
                     break
                 data = resp.json()
-            except (httpx.HTTPError, json.JSONDecodeError):
+            except (httpx.HTTPError, orjson.JSONDecodeError):
                 break
 
             items = data.get("items", []) if isinstance(data, dict) else []
@@ -2588,7 +2590,7 @@ class ClawHubSource(SkillSource):
             if resp.status_code != 200:
                 return None
             return resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except (httpx.HTTPError, orjson.JSONDecodeError):
             return None
 
     def _resolve_latest_version(self, slug: str, skill_data: Dict[str, Any]) -> Optional[str]:
@@ -2809,8 +2811,8 @@ class ClaudeMarketplaceSource(SkillSource):
         if resp is None or resp.status_code != 200:
             return []
         try:
-            data = json.loads(resp.text)
-        except json.JSONDecodeError:
+            data = orjson.loads(resp.text)
+        except orjson.JSONDecodeError:
             return []
 
         plugins = data.get("plugins", [])
@@ -2924,7 +2926,7 @@ class LobeHubSource(SkillSource):
             if resp.status_code != 200:
                 return None
             data = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except (httpx.HTTPError, orjson.JSONDecodeError):
             return None
 
         _write_index_cache(cache_key, data)
@@ -2937,7 +2939,7 @@ class LobeHubSource(SkillSource):
             resp = httpx.get(url, timeout=15)
             if resp.status_code == 200:
                 return resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError) as e:
+        except (httpx.HTTPError, orjson.JSONDecodeError) as e:
             logger.debug("LobeHub agent fetch failed: %s", e)
         return None
 
@@ -3013,7 +3015,7 @@ class BrowseShSource(SkillSource):
             if resp.status_code != 200:
                 return []
             data = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except (httpx.HTTPError, orjson.JSONDecodeError):
             return []
         skills = data.get("skills", []) if isinstance(data, dict) else []
         if isinstance(skills, list):
@@ -3137,7 +3139,7 @@ class BrowseShSource(SkillSource):
                     md_url = data.get("skillMdUrl")
                     if isinstance(md_url, str) and md_url.startswith("http"):
                         return md_url
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except (httpx.HTTPError, orjson.JSONDecodeError):
             pass
 
         source_url = item.get("sourceUrl", "") if isinstance(item, dict) else ""
@@ -3229,7 +3231,10 @@ class OptionalSkillSource(SkillSource):
                 and "__pycache__" not in f.parts
                 and f.suffix != ".pyc"
             ):
-                rel_path = str(f.relative_to(skill_dir))
+                # as_posix: bundle file keys are POSIX-style on every platform
+                # (consumers and bundle_content_hash/content_hash symmetry
+                # depend on it); str(Path) would use backslashes on Windows.
+                rel_path = f.relative_to(skill_dir).as_posix()
                 try:
                     files[rel_path] = f.read_bytes()
                 except OSError:
@@ -3345,8 +3350,8 @@ def _read_index_cache(key: str) -> Optional[Any]:
         stat = cache_file.stat()
         if time.time() - stat.st_mtime > INDEX_CACHE_TTL:
             return None
-        return json.loads(cache_file.read_text())
-    except (OSError, json.JSONDecodeError):
+        return orjson.loads(cache_file.read_text())
+    except (OSError, orjson.JSONDecodeError):
         return None
 
 
@@ -3365,7 +3370,7 @@ def _write_index_cache(key: str, data: Any) -> None:
             pass
     cache_file = index_cache_dir / f"{key}.json"
     try:
-        cache_file.write_text(json.dumps(data, ensure_ascii=False, default=str))
+        cache_file.write_text(orjson.dumps(data, default=str).decode('utf-8'))
     except OSError as e:
         logger.debug("Could not write cache: %s", e)
 
@@ -3399,13 +3404,13 @@ class HubLockFile:
         if not self.path.exists():
             return {"version": 1, "installed": {}}
         try:
-            return json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError):
+            return orjson.loads(self.path.read_text())
+        except (orjson.JSONDecodeError, OSError):
             return {"version": 1, "installed": {}}
 
     def save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        self.path.write_text(orjson.dumps(data, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n")
 
     def record_install(
         self,
@@ -3473,14 +3478,14 @@ class TapsManager:
         if not self.path.exists():
             return []
         try:
-            data = json.loads(self.path.read_text())
+            data = orjson.loads(self.path.read_text())
             return data.get("taps", [])
-        except (json.JSONDecodeError, OSError):
+        except (orjson.JSONDecodeError, OSError):
             return []
 
     def save(self, taps: List[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({"taps": taps}, indent=2) + "\n")
+        self.path.write_text(orjson.dumps({"taps": taps}, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n")
 
     def add(self, repo: str, path: str = "skills/") -> bool:
         """Add a tap. Returns False if already exists."""
@@ -3793,8 +3798,8 @@ def _load_hermes_index() -> Optional[dict]:
         try:
             age = time.time() - hermes_index_cache_file.stat().st_mtime
             if age < HERMES_INDEX_TTL:
-                return json.loads(hermes_index_cache_file.read_text())
-        except (OSError, json.JSONDecodeError):
+                return orjson.loads(hermes_index_cache_file.read_text())
+        except (OSError, orjson.JSONDecodeError):
             pass
 
     # Fetch from docs site.
@@ -3847,7 +3852,7 @@ def _load_hermes_index() -> Optional[dict]:
     # Cache locally
     try:
         hermes_index_cache_file.parent.mkdir(parents=True, exist_ok=True)
-        hermes_index_cache_file.write_text(json.dumps(data))
+        hermes_index_cache_file.write_text(orjson.dumps(data).decode('utf-8'))
     except OSError:
         pass
 
@@ -3859,8 +3864,8 @@ def _load_stale_index_cache() -> Optional[dict]:
     hermes_index_cache_file = _hermes_index_cache_file()
     if hermes_index_cache_file.exists():
         try:
-            return json.loads(hermes_index_cache_file.read_text())
-        except (OSError, json.JSONDecodeError):
+            return orjson.loads(hermes_index_cache_file.read_text())
+        except (OSError, orjson.JSONDecodeError):
             pass
     return None
 

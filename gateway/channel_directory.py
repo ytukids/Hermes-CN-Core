@@ -8,6 +8,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import asyncio
 import json
+import orjson
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -32,7 +33,7 @@ def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
         return {}
     try:
         with open(CHANNEL_ALIASES_PATH, encoding="utf-8") as f:
-            data = json.load(f)
+            data = orjson.loads(f.read())
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -345,7 +346,7 @@ def _build_from_sessions_json(platform_name: str) -> List[Dict[str, str]]:
     entries = []
     try:
         with open(sessions_path, encoding="utf-8") as f:
-            data = json.load(f)
+            data = orjson.loads(f.read())
 
         seen_ids = set()
         for _key, session in data.items():
@@ -384,7 +385,7 @@ def load_directory() -> Dict[str, Any]:
         return base
     try:
         with open(DIRECTORY_PATH, encoding="utf-8") as f:
-            data = json.load(f)
+            data = orjson.loads(f.read())
         # Re-apply aliases on read so friendly names take effect immediately,
         # even between timed rebuilds and for brand-new alias entries.
         _apply_channel_aliases(data.setdefault("platforms", {}))

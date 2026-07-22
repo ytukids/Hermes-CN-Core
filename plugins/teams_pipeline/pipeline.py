@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import orjson
 import logging
 import os
 import shutil
@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 from hermes_constants import get_hermes_home
 from plugins.teams_pipeline.meetings import (
     download_recording_artifact,
@@ -495,6 +496,9 @@ class TeamsMeetingPipeline:
                 "Recording fallback requires ffmpeg for audio extraction, but ffmpeg was not found."
             )
         audio_path = recording_path.with_suffix(".wav")
+        _subprocess_kwargs = {}
+        if IS_WINDOWS:
+            _subprocess_kwargs["creationflags"] = windows_hide_flags()
         proc = await asyncio.create_subprocess_exec(
             ffmpeg,
             "-y",
@@ -503,6 +507,7 @@ class TeamsMeetingPipeline:
             str(audio_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_subprocess_kwargs,
         )
         _stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -647,7 +652,7 @@ def _parse_summary_json(content: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start >= 0 and end > start:
         text = text[start : end + 1]
-    payload = json.loads(text)
+    payload = orjson.loads(text)
     return {
         "summary": str(payload.get("summary") or "").strip(),
         "key_decisions": [str(item).strip() for item in payload.get("key_decisions", []) if str(item).strip()],

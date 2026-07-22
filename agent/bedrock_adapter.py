@@ -27,10 +27,10 @@ the same Converse API integration in TypeScript via ``@aws-sdk/client-bedrock``.
 Requires: ``boto3`` (optional dependency — only needed when using the Bedrock provider).
 """
 
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -620,7 +620,7 @@ def convert_messages_to_converse(
         if role == "tool":
             # Tool result messages → merge into the preceding user turn
             tool_call_id = msg.get("tool_call_id", "")
-            result_content = content if isinstance(content, str) else json.dumps(content)
+            result_content = content if isinstance(content, str) else orjson.dumps(content).decode('utf-8')
             tool_result_block = {
                 "toolResult": {
                     "toolUseId": tool_call_id,
@@ -651,8 +651,8 @@ def convert_messages_to_converse(
                 fn = tc.get("function", {})
                 args_str = fn.get("arguments", "{}")
                 try:
-                    args_dict = json.loads(args_str) if isinstance(args_str, str) else args_str
-                except (json.JSONDecodeError, TypeError):
+                    args_dict = orjson.loads(args_str) if isinstance(args_str, str) else args_str
+                except (orjson.JSONDecodeError, TypeError):
                     args_dict = {}
                 content_blocks.append({
                     "toolUse": {
@@ -752,7 +752,7 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
                 type="function",
                 function=SimpleNamespace(
                     name=tu.get("name", ""),
-                    arguments=json.dumps(tu.get("input", {})),
+                    arguments=orjson.dumps(tu.get("input", {})).decode('utf-8'),
                 ),
             ))
 
@@ -912,15 +912,15 @@ def stream_converse_with_callbacks(
         elif "contentBlockStop" in event:
             if current_tool is not None:
                 try:
-                    input_dict = json.loads(current_tool["input_json"]) if current_tool["input_json"] else {}
-                except (json.JSONDecodeError, TypeError):
+                    input_dict = orjson.loads(current_tool["input_json"]) if current_tool["input_json"] else {}
+                except (orjson.JSONDecodeError, TypeError):
                     input_dict = {}
                 tool_calls.append(SimpleNamespace(
                     id=current_tool["toolUseId"],
                     type="function",
                     function=SimpleNamespace(
                         name=current_tool["name"],
-                        arguments=json.dumps(input_dict),
+                        arguments=orjson.dumps(input_dict).decode('utf-8'),
                     ),
                 ))
                 current_tool = None

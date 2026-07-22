@@ -23,6 +23,7 @@ act/
 .notebooklm-playwright/
 .pip-cache/
 .uv-cache/
+reports/
 compose.hermes.local.yml
 export*
 __pycache__/model_tools.cpython-310.pyc
@@ -117,6 +118,9 @@ website/static/api/skills-meta.json
 # website/scripts/extract-automation-blueprints.py during prebuild.
 website/static/api/automation-blueprints-index.json
 models-dev-upstream/
+
+# Hermes CN cache directory
+.kimix_cache/
 
 # Local editor / agent tooling (machine-specific; keep in global config, not the repo)
 .codex/

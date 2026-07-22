@@ -9,7 +9,7 @@ Covers:
 - check_x_search_requirements gating in registry
 """
 
-import json
+import orjson
 
 import requests
 
@@ -18,7 +18,7 @@ class _FakeResponse:
     def __init__(self, payload, *, status_code=200, text=None):
         self._payload = payload
         self.status_code = status_code
-        self.text = text if text is not None else json.dumps(payload)
+        self.text = text if text is not None else orjson.dumps(payload).decode('utf-8')
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -57,7 +57,7 @@ def test_x_search_posts_responses_request(monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
     monkeypatch.setattr("requests.post", _fake_post)
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(
             query="What are people saying about xAI on X?",
             allowed_x_handles=["xai", "@grok"],
@@ -87,7 +87,7 @@ def test_x_search_rejects_conflicting_handle_filters(monkeypatch):
 
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(
             query="latest xAI discussion",
             allowed_x_handles=["xai"],
@@ -130,7 +130,7 @@ def test_x_search_extracts_inline_url_citations(monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
     monkeypatch.setattr("requests.post", _fake_post)
 
-    result = json.loads(x_search_tool(query="latest post from xai"))
+    result = orjson.loads(x_search_tool(query="latest post from xai"))
 
     assert result["success"] is True
     assert result["answer"] == "xAI posted an update on X."
@@ -165,7 +165,7 @@ def test_x_search_returns_structured_http_error(monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
     monkeypatch.setattr("requests.post", lambda *a, **k: _FailingResponse())
 
-    result = json.loads(x_search_tool(query="latest xai discussion"))
+    result = orjson.loads(x_search_tool(query="latest xai discussion"))
 
     assert result["success"] is False
     assert result["provider"] == "xai"
@@ -194,7 +194,7 @@ def test_x_search_retries_read_timeout_then_succeeds(monkeypatch):
     monkeypatch.setattr("requests.post", _fake_post)
     monkeypatch.setattr("tools.x_search_tool.time.sleep", lambda *_: None)
 
-    result = json.loads(x_search_tool(query="grok xai"))
+    result = orjson.loads(x_search_tool(query="grok xai"))
 
     assert calls["count"] == 2
     assert result["success"] is True
@@ -219,7 +219,7 @@ def test_x_search_retries_5xx_then_succeeds(monkeypatch):
     monkeypatch.setattr("requests.post", _fake_post)
     monkeypatch.setattr("tools.x_search_tool.time.sleep", lambda *_: None)
 
-    result = json.loads(x_search_tool(query="grok xai"))
+    result = orjson.loads(x_search_tool(query="grok xai"))
 
     assert calls["count"] == 2
     assert result["success"] is True
@@ -265,7 +265,7 @@ def test_x_search_uses_xai_oauth_when_only_oauth_available(monkeypatch):
 
     monkeypatch.setattr("requests.post", _fake_post)
 
-    result = json.loads(x_search_tool(query="anything about xai"))
+    result = orjson.loads(x_search_tool(query="anything about xai"))
 
     assert result["success"] is True
     assert result["credential_source"] == "xai-oauth"
@@ -303,7 +303,7 @@ def test_x_search_uses_api_key_when_only_xai_api_key_set(monkeypatch):
 
     monkeypatch.setattr("requests.post", _fake_post)
 
-    result = json.loads(x_search_tool(query="anything"))
+    result = orjson.loads(x_search_tool(query="anything"))
 
     assert result["success"] is True
     assert result["credential_source"] == "xai"
@@ -345,7 +345,7 @@ def test_x_search_prefers_oauth_when_both_available(monkeypatch):
 
     monkeypatch.setattr("requests.post", _fake_post)
 
-    result = json.loads(x_search_tool(query="anything"))
+    result = orjson.loads(x_search_tool(query="anything"))
 
     assert result["credential_source"] == "xai-oauth"
     assert captured["headers"]["Authorization"] == "Bearer oauth-bearer-token"
@@ -418,7 +418,7 @@ def test_x_search_honors_config_model_and_timeout(monkeypatch, tmp_path):
 
     monkeypatch.setattr("requests.post", _fake_post)
 
-    result = json.loads(x_search_tool(query="anything"))
+    result = orjson.loads(x_search_tool(query="anything"))
 
     assert result["success"] is True
     assert captured["model"] == "grok-custom-test"
@@ -504,7 +504,7 @@ def test_x_search_rejects_malformed_from_date(monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
     _no_post_allowed(monkeypatch)
 
-    result = json.loads(x_search_tool(query="anything", from_date="not-a-date"))
+    result = orjson.loads(x_search_tool(query="anything", from_date="not-a-date"))
 
     assert "from_date must be YYYY-MM-DD" in result["error"]
 
@@ -515,7 +515,7 @@ def test_x_search_rejects_malformed_to_date(monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
     _no_post_allowed(monkeypatch)
 
-    result = json.loads(x_search_tool(query="anything", to_date="2026/05/01"))
+    result = orjson.loads(x_search_tool(query="anything", to_date="2026/05/01"))
 
     assert "to_date must be YYYY-MM-DD" in result["error"]
 
@@ -526,7 +526,7 @@ def test_x_search_rejects_inverted_date_range(monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
     _no_post_allowed(monkeypatch)
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(
             query="anything",
             from_date="2026-05-10",
@@ -553,7 +553,7 @@ def test_x_search_rejects_future_from_date(monkeypatch):
 
     monkeypatch.setattr("tools.x_search_tool.datetime", _FrozenDateTime)
 
-    result = json.loads(x_search_tool(query="anything", from_date="2030-01-01"))
+    result = orjson.loads(x_search_tool(query="anything", from_date="2030-01-01"))
 
     assert "from_date (2030-01-01) is in the future" in result["error"]
 
@@ -580,7 +580,7 @@ def test_x_search_allows_future_to_date(monkeypatch):
 
     monkeypatch.setattr("requests.post", _fake_post)
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(
             query="anything",
             from_date="2026-05-20",
@@ -611,7 +611,7 @@ def test_x_search_accepts_today_as_from_date(monkeypatch):
         lambda *a, **k: _FakeResponse({"output_text": "ok", "citations": []}),
     )
 
-    result = json.loads(x_search_tool(query="anything", from_date="2026-05-21"))
+    result = orjson.loads(x_search_tool(query="anything", from_date="2026-05-21"))
 
     assert result["success"] is True
 
@@ -633,7 +633,7 @@ def test_x_search_marks_degraded_when_handle_filter_returns_no_citations(monkeyp
         ),
     )
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(query="what has @ghostuser posted", allowed_x_handles=["ghostuser"])
     )
 
@@ -651,7 +651,7 @@ def test_x_search_marks_degraded_when_excluded_handles_and_no_citations(monkeypa
         lambda *a, **k: _FakeResponse({"output_text": "fluff", "citations": []}),
     )
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(query="anything", excluded_x_handles=["someuser"])
     )
 
@@ -668,7 +668,7 @@ def test_x_search_marks_degraded_when_date_range_and_no_citations(monkeypatch):
         lambda *a, **k: _FakeResponse({"output_text": "fluff", "citations": []}),
     )
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(
             query="anything",
             from_date="2026-04-01",
@@ -714,7 +714,7 @@ def test_x_search_not_degraded_when_filter_returns_inline_citations(monkeypatch)
         ),
     )
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(query="latest xAI post", allowed_x_handles=["xai"])
     )
 
@@ -739,7 +739,7 @@ def test_x_search_not_degraded_when_filter_returns_top_level_citations(monkeypat
         ),
     )
 
-    result = json.loads(
+    result = orjson.loads(
         x_search_tool(query="anything", allowed_x_handles=["xai"])
     )
 
@@ -762,7 +762,7 @@ def test_x_search_not_degraded_when_no_filters_active(monkeypatch):
         lambda *a, **k: _FakeResponse({"output_text": "broad answer", "citations": []}),
     )
 
-    result = json.loads(x_search_tool(query="anything"))
+    result = orjson.loads(x_search_tool(query="anything"))
 
     assert result["success"] is True
     assert result["degraded"] is False

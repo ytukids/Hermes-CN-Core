@@ -14,7 +14,7 @@ Config files are stored in ~/.hermes/ for easy access.
 import importlib.util
 import logging
 import os
-import re
+from agent.re_compat import re
 import shutil
 import sys
 import copy
@@ -1245,7 +1245,7 @@ def setup_terminal_backend(config: dict):
 
         # Image and resource limits use defaults; tune via `hermes setup terminal`.
         config["terminal"].setdefault(
-            "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+            "docker_image", "nikolaik/python-nodejs:python3.14-nodejs20"
         )
 
     elif selected_backend == "singularity":
@@ -1264,7 +1264,7 @@ def setup_terminal_backend(config: dict):
         # Image and resource limits use defaults; tune via `hermes setup terminal`.
         config["terminal"].setdefault(
             "singularity_image",
-            "docker://nikolaik/python-nodejs:python3.11-nodejs20",
+            "docker://nikolaik/python-nodejs:python3.14-nodejs20",
         )
 
     elif selected_backend == "modal":
@@ -1384,7 +1384,7 @@ def setup_terminal_backend(config: dict):
 
         # Image and resource limits use defaults; tune via `hermes setup terminal`.
         config["terminal"].setdefault(
-            "daytona_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+            "daytona_image", "nikolaik/python-nodejs:python3.14-nodejs20"
         )
 
     elif selected_backend == "ssh":
@@ -1428,7 +1428,11 @@ def setup_terminal_backend(config: dict):
                 ssh_cmd.extend(["-p", port])
             ssh_cmd.append(f"{user}@{host}" if user else host)
             ssh_cmd.append("echo ok")
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+            _sk = {}
+            if sys.platform == "win32":
+                from hermes_cli._subprocess_compat import windows_hide_flags
+                _sk["creationflags"] = windows_hide_flags()
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10, **_sk)  # windows-footgun: ok — creationflags in _sk
             if result.returncode == 0:
                 print_success("  SSH connection successful!")
             else:
@@ -2372,7 +2376,7 @@ def _load_openclaw_migration_module():
 
     mod = importlib.util.module_from_spec(spec)
     # Register in sys.modules so @dataclass can resolve the module
-    # (Python 3.11+ requires this for dynamically loaded modules)
+    # (Python 3.14+ requires this for dynamically loaded modules)
     import sys as _sys
     _sys.modules[spec.name] = mod
     try:

@@ -54,6 +54,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+
+from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway
 from urllib.parse import quote, unquote
 
 from agent.lsp.protocol import (
@@ -280,10 +282,17 @@ class LSPClient:
 
     @staticmethod
     def _win_wrap_cmd(cmd: List[str]) -> List[str]:
-        """On Windows, wrap .cmd/.bat shims so CreateProcess can run them."""
+        """On Windows, wrap .cmd/.bat shims so CreateProcess can run them.
+
+        cmd[0] is wrapped in quotes to prevent cmd.exe from tokenizing at
+        spaces when the path contains spaces (e.g. ``C:/Program Files/``).
+        Without the quotes, ``cmd.exe /c C:/Program Files/thing.cmd``
+        tries to run ``C:/Program`` as a command and fails with
+        ``'C:/Program' is not recognized``.
+        """
         exe = cmd[0]
         if exe.lower().endswith((".cmd", ".bat")):
-            return ["cmd.exe", "/c", *cmd]
+            return ["cmd.exe", "/c", f'"{cmd[0]}"', *cmd[1:]]
         return cmd
 
     async def _spawn(self) -> None:
@@ -296,13 +305,19 @@ class LSPClient:
             cmd = self._win_wrap_cmd(cmd)
 
         try:
-            # start_new_session=True detaches the LSP server into its own
-            # process group / session. Without this, the LSP server inherits
-            # the gateway's pgid (= TUI parent PID). When mcp_tool's
-            # _kill_orphaned_mcp_children races with LSP spawn and sweeps the
-            # gateway's child set, it captures the LSP PID, records the
-            # inherited pgid, and killpg() then kills the TUI parent itself.
-            # See tui_gateway_crash.log "killpg → SIGTERM received" stacks.
+            # Detach the LSP server into its own process group / session.
+            # Without this, the LSP server inherits the gateway's pgid (= TUI
+            # parent PID). When mcp_tool's _kill_orphaned_mcp_children races
+            # with LSP spawn and sweeps the gateway's child set, it captures
+            # the LSP PID, records the inherited pgid, and killpg() then kills
+            # the TUI parent itself. See tui_gateway_crash.log "killpg →
+            # SIGTERM received" stacks. POSIX uses start_new_session (setsid);
+            # [CN-fork] P-038 does the equivalent on Windows via creationflags.
+            _subprocess_kwargs: Dict[str, Any] = {}
+            if sys.platform == "win32":
+                _subprocess_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
+            else:
+                _subprocess_kwargs["start_new_session"] = True
             self._proc = await asyncio.create_subprocess_exec(
                 cmd[0],
                 *cmd[1:],
@@ -311,7 +326,7 @@ class LSPClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._cwd,
-                start_new_session=True,
+                **_subprocess_kwargs,
             )
         except FileNotFoundError as e:
             raise LSPProtocolError(

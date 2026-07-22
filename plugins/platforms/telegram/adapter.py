@@ -11,11 +11,11 @@ import asyncio
 import dataclasses
 import faulthandler
 import inspect
-import json
+import orjson
 import logging
 import os
 import html as _html
-import re
+from agent.re_compat import re
 import threading
 import time
 from contextvars import ContextVar
@@ -250,6 +250,7 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -1805,7 +1806,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # short exponential schedule.
             _retry_after = getattr(exc, "retry_after", None)
             if _retry_after is None:
-                import re as _re
+                from agent.re_compat import re as _re
                 _m = _re.search(r"retry\s+(?:in\s+)?(\d+)", err_str, _re.IGNORECASE)
                 if _m:
                     _retry_after = float(_m.group(1))
@@ -6338,10 +6339,14 @@ class TelegramAdapter(BasePlatformAdapter):
         cmd = [str(script_path), arg, *extra_args]
         success = False
         try:
+            _subprocess_kwargs = {}
+            if IS_WINDOWS:
+                _subprocess_kwargs["creationflags"] = windows_hide_flags()
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **_subprocess_kwargs,
             )
             _stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(), timeout=60,
@@ -7455,7 +7460,7 @@ class TelegramAdapter(BasePlatformAdapter):
             raw = os.getenv("TELEGRAM_MENTION_PATTERNS", "").strip()
             if raw:
                 try:
-                    loaded = json.loads(raw)
+                    loaded = orjson.loads(raw)
                 except Exception:
                     loaded = [part.strip() for part in raw.splitlines() if part.strip()]
                     if not loaded:
@@ -8773,7 +8778,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 image_url=cached_path,
                 user_prompt=STICKER_VISION_PROMPT,
             )
-            result = json.loads(result_json)
+            result = orjson.loads(result_json)
 
             if result.get("success"):
                 description = result.get("analysis", "a sticker")
@@ -9333,7 +9338,7 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     take precedence over YAML. Returns a dict of extras to merge into
     PlatformConfig.extra (disable_topic_auto_rename + runtime flags), or None.
     """
-    import json as _json
+    import orjson as _json
     extras: dict = {}
 
     if "disable_topic_auto_rename" in telegram_cfg:
@@ -9343,7 +9348,7 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
         os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_effective_rm).lower()
     if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
-        os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"])
+        os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"]).decode('utf-8')
     if "exclusive_bot_mentions" in telegram_cfg and not os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS"):
         os.environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] = str(telegram_cfg["exclusive_bot_mentions"]).lower()
     if "allow_bots" in telegram_cfg and not os.getenv("TELEGRAM_ALLOW_BOTS"):

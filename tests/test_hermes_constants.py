@@ -36,6 +36,7 @@ class TestGetDefaultHermesRoot:
     def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
         """When HERMES_HOME is not set, returns ~/.hermes."""
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "linux")
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         assert get_default_hermes_root() == tmp_path / ".hermes"
@@ -508,11 +509,17 @@ class TestParseReasoningEffort:
 
     @pytest.mark.parametrize(
         "value",
-        ["bogus", "very-high", "0", "off", "true", "default"],
+        ["bogus", "very-high", "0", "true", "default"],
     )
     def test_unknown_levels_return_none(self, value):
         """Unrecognized strings fall back to the caller default (None)."""
         assert parse_reasoning_effort(value) is None
+
+    def test_off_aliases_disable_reasoning(self):
+        """The literal "off" disables reasoning explicitly."""
+        assert parse_reasoning_effort("off") == {"enabled": False}
+        assert parse_reasoning_effort("OFF") == {"enabled": False}
+        assert parse_reasoning_effort(" Off ") == {"enabled": False}
 
     def test_known_supported_levels_are_documented(self):
         """Guard against silently dropping a documented level.

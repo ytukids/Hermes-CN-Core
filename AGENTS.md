@@ -221,6 +221,21 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+### 开发前预检（双仓同步 + Worktree 隔离）
+
+Hermes CN 的需求与 bug 修复通常**同时横跨 Core 与 [Desktop](https://github.com/Eynzof/Hermes-CN-Desktop) 两个仓库**。正式动手写代码前，两个仓库都必须先过这道预检，**不要直接在 `main` 上改**：
+
+1. **确认主分支已与远端同步**。对 Core 与 Desktop 分别 `git fetch origin`，确认本地 `main` 与 `origin/main` 一致（`git rev-list --left-right --count main...origin/main` 应为 `0  0`）；落后就先快进，工作区脏就先收拾干净。Core 是 fork——**永远不要把 `upstream/main` 直接并进 `main`**，上游同步走 `./scripts/sync-upstream.sh`。
+2. **为每个仓库开独立的功能分支 + git worktree**，让 Core 与 Desktop 的改动互不干扰、可并行：
+   ```bash
+   git -C <repo> fetch origin
+   git -C <repo> worktree add ../wt/<repo>-<topic> -b <branch> origin/main
+   ```
+   分支命名沿用各仓库既有约定：Core 的 fork 行为补丁用 `cn/P-xxx-*`（并登记进 `FORK_NOTES.md`），干净上游 PR 用 `upstream-pr/*`，文档/杂项用 `docs/` `chore/`；Desktop 沿用 Conventional 风格。注意 worktree 默认共享主 checkout 的 venv（见上一段的 venv 探测顺序），不必每个 worktree 重装依赖。
+3. 不要在同一个工作目录里来回 `git checkout` 切分支——双仓并行时极易串味；每条线一个 worktree。
+
+**收尾流程（每个仓库都要走完，缺一不可）**：改完 → 跑各自校验（Core：`scripts/run_tests.sh` 全套 + `ruff check .`；Desktop：`pnpm typecheck && pnpm test:unit && cargo check`）→ commit → push → 开 PR → **盯 PR 上 GitHub Actions 全绿**（Core：`lint.yml` + 测试切片），没过就回去修，别把任务当完成。
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
@@ -229,10 +244,10 @@ entry points you'll actually edit.
 
 ```
 hermes-agent/
-├── run_agent.py          # AIAgent class — core conversation loop (~12k LOC)
+├── run_agent.py          # AIAgent class — core conversation loop (~5.5k LOC)
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
-├── cli.py                # HermesCLI class — interactive CLI orchestrator (~11k LOC)
+├── cli.py                # HermesCLI class — interactive CLI orchestrator (~15k LOC)
 ├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
 ├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
@@ -266,7 +281,7 @@ hermes-agent/
 ├── cron/                 # Scheduler — jobs.py, scheduler.py
 ├── scripts/              # run_tests.sh, release.py, auxiliary scripts
 ├── website/              # Docusaurus docs site
-└── tests/                # Pytest suite (~17k tests across ~900 files as of May 2026)
+└── tests/                # Pytest suite (~31k tests across ~1,600 files as of June 2026)
 ```
 
 **User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys only).
@@ -313,7 +328,7 @@ run_agent.py, cli.py, batch_runner.py, environments/
 
 ## AIAgent Class (run_agent.py)
 
-The real `AIAgent.__init__` takes ~60 parameters (credentials, routing, callbacks,
+The real `AIAgent.__init__` takes ~70 parameters (credentials, routing, callbacks,
 session context, budget, credential pool, etc.). The signature below is the
 minimum subset you'll usually touch — read `run_agent.py` for the full list.
 
@@ -491,18 +506,18 @@ The dashboard embeds the real `hermes --tui` — **not** a rewrite.  See `hermes
 
 ### Electron Desktop Chat App (`apps/desktop/`)
 
-A **separate** chat surface from both the classic CLI and the dashboard's embedded TUI. It is an Electron + React + nanostore renderer (`@assistant-ui/react`) that talks to a `tui_gateway` backend over JSON-RPC (`requestGateway(method, params)`). The WebSocket/JSON-RPC transport lives in the framework-agnostic `apps/shared` package (`@hermes/shared` — `JsonRpcGatewayClient` + WS URL helpers), which the web dashboard (`web/`) also consumes; **desktop has no build/runtime dependency on the dashboard frontend** — it spawns a headless `hermes serve` backend server (the same gateway `dashboard` serves, minus the browser UI entirely: `serve` sets `headless_backend=True`, so `cmd_dashboard` skips `_build_web_ui` AND exports `HERMES_SERVE_HEADLESS=1` so `mount_spa()` disables the SPA even if a stray `web_dist/` exists — only the JSON-RPC/WS/API surface is reachable). `dashboard` and `serve` share `cmd_dashboard`/`start_server` but are independent surfaces — neither launches the other. The one exception is a backward-compat *fallback*: `serve` is newer, so the desktop spawn (`electron/backend-command.ts` + `backendSupportsServe()` in `electron/main.ts`) detects whether the resolved runtime registers `serve` and, only when it does not (an older managed install / PATH `hermes` the app hasn't updated yet), rewrites the argv to the legacy `dashboard --no-open`. Without that, a new app against an un-upgraded runtime would crash on an unknown subcommand and brick every mid-upgrade user. It does NOT embed `hermes --tui` — it has its own composer, transcript, and slash-command pipeline. For scoped Desktop architecture, state, resolver, transport, and testing rules, read `apps/desktop/AGENTS.md`.
+A **separate** chat surface from both the classic CLI and the dashboard's embedded TUI. It is an Electron + React + nanostore renderer (`@assistant-ui/react`) that talks to a `tui_gateway` backend over JSON-RPC (`requestGateway(method, params)`). The WebSocket/JSON-RPC transport lives in the framework-agnostic `apps/shared` package (`@hermes/shared` — `JsonRpcGatewayClient` + WS URL helpers), which the web dashboard (`web/`) also consumes; **desktop has no build/runtime dependency on the dashboard frontend** — it spawns a headless `hermes serve` backend server (the same gateway `dashboard` serves, minus the browser UI entirely: `serve` sets `headless_backend=True`, so `cmd_dashboard` skips `_build_web_ui` AND exports `HERMES_SERVE_HEADLESS=1` so `mount_spa()` disables the SPA even if a stray `web_dist/` exists — only the JSON-RPC/WS/API surface is reachable). `dashboard` and `serve` share `cmd_dashboard`/`start_server` but are independent surfaces — neither launches the other. The one exception is a backward-compat *fallback*: `serve` is newer, so the desktop spawn (`electron/backend-command.cjs` + `backendSupportsServe()` in `main.cjs`) detects whether the resolved runtime registers `serve` and, only when it does not (an older managed install / PATH `hermes` the app hasn't updated yet), rewrites the argv to the legacy `dashboard --no-open`. Without that, a new app against an un-upgraded runtime would crash on an unknown subcommand and brick every mid-upgrade user. It does NOT embed `hermes --tui` — it has its own composer, transcript, and slash-command pipeline. Route desktop bugs to the `hermes-desktop-app-work` skill, not `hermes-dashboard-work`.
 
 **Slash commands in the desktop app are curated client-side, then dispatched to the backend.** The pipeline:
 
 - **Backend already provides everything.** `tui_gateway/server.py` `commands.catalog` (empty-query list) and `complete.slash` (typed-query completions) both include built-in commands, user `quick_commands`, AND skill-derived commands (`scan_skill_commands()` / `get_skill_commands()`). The desktop app does not need a new RPC to see skills.
-- **The renderer curates via `apps/desktop/src/lib/desktop-slash-commands.ts`.** This is the load-bearing file. It holds `DESKTOP_COMMAND_SPECS` (the built-ins and their Desktop surfaces) plus `NO_DESKTOP_SURFACE` block-lists for terminal-only / messaging-only / picker-owned / settings-owned / advanced commands that should NOT clutter the desktop popover.
+- **The renderer curates via `apps/desktop/src/lib/desktop-slash-commands.ts`.** This is the load-bearing file. It holds `DESKTOP_COMMANDS` (the ~19 built-ins shown in the palette) plus block-lists for terminal-only / messaging-only / picker-owned / settings-owned / advanced commands that should NOT clutter the desktop popover.
   - `isDesktopSlashCommand(name)` — gates **execution**. Returns true for built-ins AND for any non-built-in (skill / quick command), so typed extension commands run.
   - `isDesktopSlashSuggestion(name)` — gates **discovery/completion**. Used by BOTH completion paths in `app/chat/composer/hooks/use-slash-completions.ts` (empty-query catalog filter + typed-query `complete.slash` filter) and by `filterDesktopCommandsCatalog`.
   - `isDesktopSlashExtensionCommand(name)` — true when the command is NOT a known Hermes built-in (i.e. a skill or user quick command). Both suggestion and catalog-filter paths allow extensions through so skill commands surface in the palette. (Added when fixing "skill commands missing from the desktop slash palette" — the curated allow-list was silently dropping every skill/quick command from completions even though they executed fine when typed.)
-- **Dispatch** lives in `app/session/hooks/use-prompt-actions/slash.ts` (`runSlash`): built-ins that the desktop owns (`/skin`, `/help`, `/new`, …) are handled locally or via `commands.catalog`; everything else goes to `slash.exec`, falling back to `command.dispatch` (which the gateway resolves into skill / alias / exec directives). A skill command resolves to `{type: "skill", message}` and is submitted as a normal prompt.
+- **Dispatch** lives in `app/session/hooks/use-prompt-actions.ts` (`runSlash`): built-ins that the desktop owns (`/skin`, `/help`, `/new`, …) are handled locally or via `commands.catalog`; everything else goes to `slash.exec`, falling back to `command.dispatch` (which the gateway resolves into skill / alias / exec directives). A skill command resolves to `{type: "skill", message}` and is submitted as a normal prompt.
 
-**Rule:** the desktop slash palette's curation is about hiding noise (terminal-only / messaging-only built-ins), NOT about hiding user-activated extensions. Skill commands and `quick_commands` are extensions the backend surfaces — they belong in completions. If you tighten `desktop-slash-commands.ts`, keep `isDesktopSlashExtensionCommand` flowing into both the suggestion and catalog-filter paths. Tests: from `apps/desktop`, run `npx vitest run src/lib/desktop-slash-commands.test.ts` (workspace dependencies are installed at the repo root).
+**Rule:** the desktop slash palette's curation is about hiding noise (terminal-only / messaging-only built-ins), NOT about hiding user-activated extensions. Skill commands and `quick_commands` are extensions the backend surfaces — they belong in completions. If you tighten `desktop-slash-commands.ts`, keep `isDesktopSlashExtensionCommand` flowing into both the suggestion and catalog-filter paths. Tests: `apps/desktop/src/lib/desktop-slash-commands.test.ts` (run via the repo-root `vitest`, since `apps/desktop` resolves deps from the root workspace install).
 
 ---
 
@@ -964,15 +979,16 @@ contributor skill PRs.
 ## Toolsets
 
 All toolsets are defined in `toolsets.py` as a single `TOOLSETS` dict.
-Each platform's adapter picks a base toolset (e.g. Telegram uses
-`"messaging"`); `_HERMES_CORE_TOOLS` is the default bundle most
-platforms inherit from.
+Each platform's adapter picks a base toolset; `_HERMES_CORE_TOOLS` is the
+default bundle most platforms inherit from.
 
-Current toolset keys: `browser`, `clarify`, `code_execution`, `cronjob`,
-`debugging`, `delegation`, `discord`, `discord_admin`, `feishu_doc`,
-`feishu_drive`, `file`, `homeassistant`, `image_gen`, `kanban`, `memory`,
-`messaging`, `moa`, `rl`, `safe`, `search`, `session_search`, `skills`,
-`spotify`, `terminal`, `todo`, `tts`, `video`, `vision`, `web`, `yuanbao`.
+Toolset keys include (canonical list lives in `toolsets.py`): `browser`,
+`clarify`, `code_execution`, `coding`, `computer_use`, `context_engine`,
+`cronjob`, `debugging`, `delegation`, `discord`, `discord_admin`,
+`feishu_doc`, `feishu_drive`, `file`, `homeassistant`, `image_gen`,
+`kanban`, `memory`, `moa`, `safe`, `search`, `session_search`, `skills`,
+`spotify`, `terminal`, `todo`, `tts`, `video`, `video_gen`, `vision`,
+`web`, `x_search`, `yuanbao`.
 
 Enable/disable per platform via `hermes tools` (the curses UI) or the
 `tools.<platform>.enabled` / `tools.<platform>.disabled` lists in
@@ -1094,16 +1110,14 @@ kanban task.
 
 - **CLI:** `hermes_cli/kanban.py` wires `hermes kanban` with verbs
   `init`, `create`, `list` (alias `ls`), `show`, `assign`, `link`,
-  `unlink`, `comment`, `attach`, `attachments`, `attach-rm`, `complete`,
-  `block`, `unblock`, `archive`, `tail`, plus less-commonly-used `watch`,
-  `stats`, `runs`, `log`, `assignees`, `heartbeat`, `notify-*`,
-  `dispatch`, `daemon`, `gc`.
+  `unlink`, `comment`, `complete`, `block`, `unblock`, `archive`,
+  `tail`, plus less-commonly-used `watch`, `stats`, `runs`, `log`,
+  `assignees`, `heartbeat`, `notify-*`, `dispatch`, `daemon`, `gc`.
 - **Worker/orchestrator toolset:** `tools/kanban_tools.py` exposes
   `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`,
-  `kanban_comment`, `kanban_create`, `kanban_link`, `kanban_attach`,
-  `kanban_attach_url`, `kanban_attachments`; profiles that explicitly
-  enable the `kanban` toolset outside a dispatcher-spawned task also get
-  `kanban_list` and `kanban_unblock` for board routing.
+  `kanban_comment`, `kanban_create`, `kanban_link`; profiles that
+  explicitly enable the `kanban` toolset outside a dispatcher-spawned
+  task also get `kanban_list` and `kanban_unblock` for board routing.
 - **Dispatcher:** long-lived loop that (default every 60s) reclaims
   stale claims, promotes ready tasks, atomically claims, and spawns
   assigned profiles. Runs **inside the gateway** by default via
@@ -1261,7 +1275,7 @@ unused module into a live code path, E2E test the real resolution chain
 with actual imports (not mocks) against a temp `HERMES_HOME`.
 
 ### Tests must not write to `~/.hermes/`
-The `_isolate_hermes_home` autouse fixture in `tests/conftest.py` redirects `HERMES_HOME` to a temp dir. Never hardcode `~/.hermes/` paths in tests.
+The `_hermetic_environment` autouse fixture in `tests/conftest.py` redirects `HERMES_HOME` to a per-test temp dir. Never hardcode `~/.hermes/` paths in tests.
 
 **Profile tests**: When testing profile features, also mock `Path.home()` so that
 `_get_profiles_root()` and `_get_default_hermes_home()` resolve within the temp dir.
@@ -1280,53 +1294,75 @@ def profile_env(tmp_path, monkeypatch):
 
 ## Testing
 
-### Python
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces
-hermetic environment parity with CI (unset credential vars, TZ=UTC, LANG=C.UTF-8,
-`-n auto` xdist workers, in-tree subprocess-isolation plugin). Direct `pytest`
-on a 16+ core developer machine with API keys set diverges from CI in ways
-that have caused multiple "works locally, fails in CI" incidents (and the reverse).
+hermetic environment parity with CI (clean env via `env -i`, credential vars unset, TZ=UTC,
+LANG/LC_ALL=C.UTF-8, PYTHONHASHSEED=0) and runs each test file in its own
+`python -m pytest <file>` subprocess via `scripts/run_tests_parallel.py` (no xdist, no shared
+workers). Direct `pytest` on a 16+ core developer machine with API keys set diverges from CI
+in ways that have caused multiple "works locally, fails in CI" incidents (and the reverse).
 
 ```bash
 scripts/run_tests.sh                                  # full suite, CI-parity
 scripts/run_tests.sh tests/gateway/                   # one directory
 scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
-scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
+scripts/run_tests.sh tests/foo.py -- --tb=long        # path + pass-through pytest flags (after `--`)
 ```
 
-**Flake policy:** the runner auto-retries a failing test FILE once in a fresh
-subprocess (`--file-retries`, default 1; `HERMES_TEST_FILE_RETRIES=0` to
-disable). Pass-on-retry counts as green but is printed in a `⚠ FLAKY` summary
-section with both attempts' output. A FLAKY report is a bug to fix, not noise
-to ignore — timing-sensitive tests must not assume a quiet runner (loose
-wall-clock bounds ≥ 2s, event-based sync, no `assert not _wait_until(...)`
-negative-timing races).
+### Subprocess-per-file isolation
 
-#### Subprocess-per-test-file isolation
+Every test **file** runs in a freshly-spawned `python -m pytest <file>`
+subprocess, orchestrated by `scripts/run_tests_parallel.py`. This means
+module-level dicts/sets and ContextVars from one file cannot leak into the
+next — the historic `_reset_module_state` autouse fixture is gone.
 
-Every test file runs in a freshly-spawned Python subprocess via `run_tests_parallel.py`. This means module-level dicts/sets and
-ContextVars from one test file cannot leak into the next.
+### Why the wrapper
 
-#### Why the wrapper
+- Each file is a separate `python -m pytest <file>` process — there is no
+  xdist and no in-tree pytest plugin. Parallelism is `--jobs` (default
+  `cpu_count * 2`) concurrent file-subprocesses.
+- Per-file overhead is Python startup + pytest collection; the per-file
+  fan-out amortizes it across cores while staying flake-free.
+- `--file-timeout` (default 140s per file, env `HERMES_TEST_FILE_TIMEOUT`)
+  SIGKILLs an overrunning file and surfaces it as a failure report.
+- CI shards the suite with `--slice N/8`.
 
-|                     | Without wrapper                             | With wrapper                              |
-| ------------------- | ------------------------------------------- | ----------------------------------------- |
-| Provider API keys   | Whatever is in your env (auto-detects pool) | All env vars except a specific few unset. |
-| HOME / `~/.hermes/` | Your real config+auth.json                  | Temp dir per test                         |
-| Timezone            | Local TZ (PDT etc.)                         | UTC                                       |
-| Locale              | Whatever is set                             | C.UTF-8                                   |
+### Why the wrapper (and why the old "just call pytest" doesn't work)
 
-### Where to place what tests
+Five real sources of local-vs-CI drift the script closes:
 
-The CI change classifier (`scripts/ci/classify_changes.py`) runs specific jobs based on what files changed. A Python test that asserts
-about the contents of `package.json`, `package-lock.json`, `.ts`/`.tsx`
-source, or any other JS-side artifact will not run on a PR that only touches
-those files. This means a regression can go green on a PR and red on `main` (where the
-classifier fails open and runs everything).
+| | Without wrapper | With wrapper |
+|---|---|---|
+| Provider API keys | Whatever is in your env (auto-detects pool) | All `*_API_KEY`/`*_TOKEN`/etc. unset |
+| HOME / `~/.hermes/` | Your real config+auth.json | Temp dir per test |
+| Timezone | Local TZ (PDT etc.) | UTC |
+| Locale | Whatever is set | C.UTF-8 |
+| Parallelism | raw `pytest` in one process | per-file `--jobs` subprocesses (no xdist) |
 
-Any test that reads or asserts about `package.json`,
-`package-lock.json`, `tsconfig.json`, `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs`
-source files configuration belongs in the JS (vitest) test suite, not in `tests/*.py`.
+`tests/conftest.py` also enforces points 1-4 as an autouse fixture so ANY pytest
+invocation (including IDE integrations) gets hermetic behavior — but the wrapper
+is belt-and-suspenders.
+
+### Running without the wrapper (only if you must)
+
+If you can't use the wrapper (e.g. inside an IDE that shells pytest directly),
+at minimum activate the venv. Note that raw `pytest` does **not** get per-file
+subprocess isolation — that comes only from `scripts/run_tests_parallel.py`
+(the wrapper). The autouse `_hermetic_environment` fixture in `tests/conftest.py`
+still gives you the clean env / temp `HERMES_HOME` / UTC / C.UTF-8, but
+module-state leakage between files is on you.
+
+```bash
+source .venv/bin/activate   # or: source venv/bin/activate
+python -m pytest tests/ -q
+```
+
+For an isolated single-file run that matches CI behavior, use the wrapper:
+
+```bash
+scripts/run_tests.sh tests/agent/test_foo.py
+```
+
+Always run the full suite before pushing changes.
 
 ### Don't write change-detector tests
 
@@ -1376,58 +1412,3 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
-
-### Never read source code in tests
-
-A test that reads a source file's text is testing *the shape of the
-source code*, not its behavior. This is a hard antipattern, banned outright.
-Any test that reads a .py, .ts, .tsx, etc., file is suspect.
-
-**Why it's actively harmful, not just weak:**
-
-- It passes when the implementation is subtly broken (the regex matches a
-  call site that exists but is wired wrong) and fails when a correct
-  refactor changes formatting, variable names, or control flow with
-  identical runtime behavior. Both directions of failure are wrong.
-- It can't be run against a built/bundled/minified artifact, so it silently
-  stops testing anything the moment code moves, gets renamed, or a
-  dependency reformats it.
-- It actively blocks refactors: reviewers see "keeps a pattern intact" tests
-  fail during pure structural cleanup with no behavior change, and either
-  hand-wave the failure (dangerous) or waste time updating regexes that add
-  nothing (waste).
-- It gives false confidence. a green suite full of source-regex tests
-  looks like coverage but has never once executed the code path it claims
-  to guard.
-
-**Do not write:**
-
-```ts
-const source = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
-
-test('backend spawn hides the Windows console', () => {
-  assert.match(source, /spawn\(\s*backend\.command,\s*backend\.args[\s\S]{0,300}hiddenWindowsChildOptions/)
-})
-```
-
-**Do write — extract the logic into a small pure/DI-testable function and
-call it for real:**
-
-```ts
-// backend-spawn.ts
-export function hiddenWindowsChildOptions(options: SpawnOptionsLike = {}, isWindows = process.platform === 'win32') {
-  if (!isWindows || 'windowsHide' in options) return options
-  return { ...options, windowsHide: true }
-}
-
-// backend-spawn.test.ts
-test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
-  assert.equal(hiddenWindowsChildOptions({}, true).windowsHide, true)
-  assert.equal(hiddenWindowsChildOptions({}, false).windowsHide, undefined)
-  assert.equal(hiddenWindowsChildOptions({ windowsHide: false }, true).windowsHide, false)
-})
-```
-
-If the logic lives inline in a god-file (`main.ts`, `cli.py`,
-`gateway/run.py`) and extracting it feels disruptive: that's the actual
-signal to do the extraction, not to regex around it.

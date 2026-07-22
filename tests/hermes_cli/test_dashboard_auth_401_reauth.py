@@ -461,14 +461,11 @@ class TestHtmlRedirectNext:
         assert r.status_code == 200
 
     def test_auth_loop_avoided(self, gated_app):
-        """A failed cookie on /auth/me (auth-required path) must drop
-        the next= rather than risk a /login?next=/api/auth/me loop."""
-        # /api/auth/me requires auth. Without cookie → 401 with login_url
-        # but next= must NOT point at /api/auth/.
+        """A failed cookie on /api/auth/me returns a single JSON 401 —
+        APIs never redirect, so no reauth loop can form (the SPA
+        AuthWidget treats the 401 as "not logged in")."""
         r = gated_app.get("/api/auth/me")
         assert r.status_code == 401
-        body = r.json()
-        assert "next=" not in body["login_url"]
 
 
 # ---------------------------------------------------------------------------

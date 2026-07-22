@@ -14,9 +14,10 @@ from collections import deque
 from datetime import datetime, timezone
 import hmac
 import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import secrets
 import shutil
 import subprocess
@@ -160,7 +161,7 @@ def _content_string(value: Any) -> Optional[tuple[str, bool]]:
         text = value
     else:
         try:
-            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            text = json.dumps(value, sort_keys=True)
         except Exception:
             return None
     if not text:
@@ -618,8 +619,8 @@ class RaftAdapter(BasePlatformAdapter):
         payload: Dict[str, Any] = {}
         if raw_body.strip():
             try:
-                parsed = json.loads(raw_body)
-            except json.JSONDecodeError:
+                parsed = orjson.loads(raw_body)
+            except orjson.JSONDecodeError:
                 return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
             if not isinstance(parsed, dict):
                 return web.json_response({"ok": False, "error": "invalid_payload"}, status=400)
@@ -671,9 +672,9 @@ class RaftAdapter(BasePlatformAdapter):
             return web.json_response({"ok": False, "error": "payload_too_large"}, status=413)
 
         try:
-            payload = json.loads(raw_text)
+            payload = orjson.loads(raw_text)
             self._activity_queue.push(payload)
-        except json.JSONDecodeError:
+        except orjson.JSONDecodeError:
             return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)

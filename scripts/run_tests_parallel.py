@@ -382,7 +382,6 @@ def _parse_pytest_summary(output: str) -> dict[str, int]:
     ``xfailed``, ``xpassed`` (only keys found in the output are present).
     """
     import re
-
     result: dict[str, int] = {}
     # Walk backwards from the end — the summary line is always near the tail.
     for line in reversed(output.splitlines()):
@@ -654,7 +653,7 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.process_cpu_count() or 4) * 2),
         help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
     )
     parser.add_argument(
@@ -853,7 +852,7 @@ def main() -> int:
             ]
         }
         # Print to stdout so the CI step can capture it with $().
-        print(json.dumps(matrix))
+        print(json.dumps(matrix, ensure_ascii=False))
         return 0
 
     # Count individual tests per file

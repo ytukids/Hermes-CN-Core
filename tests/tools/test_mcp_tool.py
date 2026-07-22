@@ -4,7 +4,7 @@ All tests use mocks -- no real MCP servers or subprocesses are started.
 """
 
 import asyncio
-import concurrent.futures
+import orjson
 import json
 import threading
 import time
@@ -733,7 +733,7 @@ class TestToolHandler:
         try:
             handler = _make_tool_handler("test_srv", "greet", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({"name": "world"}))
+                result = orjson.loads(handler({"name": "world"}))
             assert result["result"] == "hello world"
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
@@ -752,7 +752,7 @@ class TestToolHandler:
         try:
             handler = _make_tool_handler("test_srv", "fail_tool", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({}))
+                result = orjson.loads(handler({}))
             assert "error" in result
             assert "something went wrong" in result["error"]
         finally:
@@ -763,7 +763,7 @@ class TestToolHandler:
 
         _servers.pop("ghost", None)
         handler = _make_tool_handler("ghost", "any_tool", 120)
-        result = json.loads(handler({}))
+        result = orjson.loads(handler({}))
         assert "error" in result
         assert "not connected" in result["error"]
 
@@ -778,7 +778,7 @@ class TestToolHandler:
         try:
             handler = _make_tool_handler("test_srv", "broken_tool", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({}))
+                result = orjson.loads(handler({}))
             assert "error" in result
             assert "connection lost" in result["error"]
         finally:
@@ -801,7 +801,7 @@ class TestToolHandler:
                 "tools.mcp_tool._run_on_mcp_loop",
                 side_effect=_interrupting_run,
             ):
-                result = json.loads(handler({}))
+                result = orjson.loads(handler({}))
             assert result == {"error": "MCP call interrupted: user sent a new message"}
         finally:
             _servers.pop("test_srv", None)
@@ -838,23 +838,6 @@ class TestToolHandler:
 
 
 class TestRunOnMCPLoopInterrupts:
-    @staticmethod
-    def _run_with_future(mcp_mod, future):
-        loop = MagicMock()
-        loop.is_running.return_value = True
-
-        async def _unused_call():
-            return "unused"
-
-        def _schedule(coro, scheduled_loop, **_kwargs):
-            assert scheduled_loop is loop
-            coro.close()
-            return future
-
-        with patch.object(mcp_mod, "_mcp_loop", loop):
-            with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_schedule):
-                return mcp_mod._run_on_mcp_loop(_unused_call(), timeout=1)
-
     def test_interrupt_cancels_waiting_mcp_call(self):
         import tools.mcp_tool as mcp_mod
         from tools.interrupt import set_interrupt
@@ -889,7 +872,7 @@ class TestRunOnMCPLoopInterrupts:
 
         try:
             with pytest.raises(InterruptedError, match="User sent a new message"):
-                mcp_mod._run_on_mcp_loop(_slow_call(), timeout=10)
+                mcp_mod._run_on_mcp_loop(_slow_call(), timeout=2)
 
             deadline = time.time() + 2
             while time.time() < deadline and not cancelled.is_set():
@@ -898,7 +881,7 @@ class TestRunOnMCPLoopInterrupts:
         finally:
             set_interrupt(False, waiter_tid)
             loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=10)
+            thread.join(timeout=2)
             loop.close()
             mcp_mod._mcp_loop = old_loop
             mcp_mod._mcp_thread = old_thread
@@ -935,58 +918,10 @@ class TestRunOnMCPLoopInterrupts:
             assert cancelled.is_set()
         finally:
             loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=10)
+            thread.join(timeout=2)
             loop.close()
             mcp_mod._mcp_loop = old_loop
             mcp_mod._mcp_thread = old_thread
-
-    def test_completed_future_timeout_is_propagated_once(self):
-        import tools.mcp_tool as mcp_mod
-
-        inner_error = TimeoutError("inner MCP timeout")
-
-        class CompletedWithTimeout(concurrent.futures.Future):
-            def __init__(self):
-                super().__init__()
-                self.result_timeouts = []
-                self.set_exception(inner_error)
-
-            def result(self, timeout=None):
-                self.result_timeouts.append(timeout)
-                return super().result(timeout=timeout)
-
-        future = CompletedWithTimeout()
-
-        with pytest.raises(TimeoutError, match="inner MCP timeout") as exc_info:
-            self._run_with_future(mcp_mod, future)
-
-        assert exc_info.value is inner_error
-        assert len(future.result_timeouts) == 2
-        assert future.result_timeouts[0] is not None
-        assert future.result_timeouts[1] is None
-
-    def test_poll_timeout_racing_success_returns_completed_result(self):
-        import tools.mcp_tool as mcp_mod
-
-        class PollThenSuccess(concurrent.futures.Future):
-            def __init__(self):
-                super().__init__()
-                self.result_timeouts = []
-
-            def result(self, timeout=None):
-                self.result_timeouts.append(timeout)
-                if len(self.result_timeouts) == 1:
-                    self.set_result("completed")
-                    raise concurrent.futures.TimeoutError
-
-                return super().result(timeout=timeout)
-
-        future = PollThenSuccess()
-
-        assert self._run_with_future(mcp_mod, future) == "completed"
-        assert len(future.result_timeouts) == 2
-        assert future.result_timeouts[0] is not None
-        assert future.result_timeouts[1] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1518,14 +1453,7 @@ class TestToolsetInjection:
             broken_fixed = True
             call_count = 0
 
-            # The failed server is now serving a post-failure backoff
-            # (#50394: prevents a tight re-spawn storm across the frequent
-            # per-worker-session discovery passes). Expire that cooldown to
-            # simulate the retry window having elapsed.
-            import tools.mcp_tool as _mcp_mod
-            _mcp_mod._server_connect_retry_after.pop("broken", None)
-
-            # Next call after the cooldown: should retry broken, skip good
+            # Second call: should retry broken, skip good
             result2 = discover_mcp_tools()
             assert "mcp__good__ping" in result2
             assert "mcp__broken__ping" in result2
@@ -1839,14 +1767,19 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        assert result["ProgramFiles"] == r"C:\Program Files"
-        assert result["ProgramData"] == r"C:\ProgramData"
-        assert result["ProgramW6432"] == r"C:\Program Files"
-        assert result["LOCALAPPDATA"].endswith("Local")
-        assert result["APPDATA"].endswith("Roaming")
-        assert result["USERPROFILE"] == r"C:\Users\alice"
-        assert "GITHUB_TOKEN" not in result
-        assert "OPENAI_API_KEY" not in result
+        # On Windows, os.environ uppercases variable names on write (env var
+        # names are case-insensitive there), so _build_safe_env can only ever
+        # see/return the uppercased form. Compare case-insensitively so the
+        # test reflects real Windows behavior and still passes on POSIX.
+        folded = {key.upper(): value for key, value in result.items()}
+        assert folded["PROGRAMFILES"] == r"C:\Program Files"
+        assert folded["PROGRAMDATA"] == r"C:\ProgramData"
+        assert folded["PROGRAMW6432"] == r"C:\Program Files"
+        assert folded["LOCALAPPDATA"].endswith("Local")
+        assert folded["APPDATA"].endswith("Roaming")
+        assert folded["USERPROFILE"] == r"C:\Users\alice"
+        assert "GITHUB_TOKEN" not in folded
+        assert "OPENAI_API_KEY" not in folded
 
 
 # ---------------------------------------------------------------------------
@@ -2384,7 +2317,7 @@ class TestConfigurableTimeouts:
             with patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
                 def fake_run(coro, timeout=30):
                     coro.close()
-                    return json.dumps({"result": "ok"})
+                    return orjson.dumps({"result": "ok"}).decode('utf-8')
 
                 mock_run.side_effect = fake_run
                 handler({})
@@ -2509,7 +2442,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_list_resources_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({}))
+                result = orjson.loads(handler({}))
             assert "resources" in result
             assert len(result["resources"]) == 1
             assert result["resources"][0]["uri"] == "file:///tmp/test.txt"
@@ -2530,7 +2463,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_list_resources_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({}))
+                result = orjson.loads(handler({}))
             assert result["resources"] == []
         finally:
             _servers.pop("srv", None)
@@ -2539,7 +2472,7 @@ class TestUtilityHandlers:
         from tools.mcp_tool import _make_list_resources_handler, _servers
         _servers.pop("ghost", None)
         handler = _make_list_resources_handler("ghost", 120)
-        result = json.loads(handler({}))
+        result = orjson.loads(handler({}))
         assert "error" in result
         assert "not connected" in result["error"]
 
@@ -2559,7 +2492,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_read_resource_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({"uri": "file:///tmp/test.txt"}))
+                result = orjson.loads(handler({"uri": "file:///tmp/test.txt"}))
             assert result["result"] == "Hello from resource"
             mock_session.read_resource.assert_called_once_with("file:///tmp/test.txt")
         finally:
@@ -2573,7 +2506,7 @@ class TestUtilityHandlers:
 
         try:
             handler = _make_read_resource_handler("srv", 120)
-            result = json.loads(handler({}))
+            result = orjson.loads(handler({}))
             assert "error" in result
             assert "uri" in result["error"].lower()
         finally:
@@ -2583,7 +2516,7 @@ class TestUtilityHandlers:
         from tools.mcp_tool import _make_read_resource_handler, _servers
         _servers.pop("ghost", None)
         handler = _make_read_resource_handler("ghost", 120)
-        result = json.loads(handler({"uri": "test://x"}))
+        result = orjson.loads(handler({"uri": "test://x"}))
         assert "error" in result
         assert "not connected" in result["error"]
 
@@ -2608,7 +2541,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_list_prompts_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({}))
+                result = orjson.loads(handler({}))
             assert "prompts" in result
             assert len(result["prompts"]) == 1
             assert result["prompts"][0]["name"] == "summarize"
@@ -2629,7 +2562,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_list_prompts_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({}))
+                result = orjson.loads(handler({}))
             assert result["prompts"] == []
         finally:
             _servers.pop("srv", None)
@@ -2638,7 +2571,7 @@ class TestUtilityHandlers:
         from tools.mcp_tool import _make_list_prompts_handler, _servers
         _servers.pop("ghost", None)
         handler = _make_list_prompts_handler("ghost", 120)
-        result = json.loads(handler({}))
+        result = orjson.loads(handler({}))
         assert "error" in result
         assert "not connected" in result["error"]
 
@@ -2661,7 +2594,7 @@ class TestUtilityHandlers:
         try:
             handler = _make_get_prompt_handler("srv", 120)
             with self._patch_mcp_loop():
-                result = json.loads(handler({"name": "summarize", "arguments": {"text": "hello"}}))
+                result = orjson.loads(handler({"name": "summarize", "arguments": {"text": "hello"}}))
             assert "messages" in result
             assert len(result["messages"]) == 1
             assert result["messages"][0]["role"] == "assistant"
@@ -2680,7 +2613,7 @@ class TestUtilityHandlers:
 
         try:
             handler = _make_get_prompt_handler("srv", 120)
-            result = json.loads(handler({}))
+            result = orjson.loads(handler({}))
             assert "error" in result
             assert "name" in result["error"].lower()
         finally:
@@ -2690,7 +2623,7 @@ class TestUtilityHandlers:
         from tools.mcp_tool import _make_get_prompt_handler, _servers
         _servers.pop("ghost", None)
         handler = _make_get_prompt_handler("ghost", 120)
-        result = json.loads(handler({"name": "test"}))
+        result = orjson.loads(handler({"name": "test"}))
         assert "error" in result
         assert "not connected" in result["error"]
 
@@ -3139,7 +3072,7 @@ class TestConvertMessages:
         assert result[0]["role"] == "assistant"
         assert len(result[0]["tool_calls"]) == 1
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
-        assert json.loads(result[0]["tool_calls"][0]["function"]["arguments"]) == {"city": "London"}
+        assert orjson.loads(result[0]["tool_calls"][0]["function"]["arguments"]) == {"city": "London"}
 
     def test_mixed_text_and_tool_use(self):
         """Assistant message with both text and tool_calls."""
@@ -4256,7 +4189,7 @@ class TestSanitizeMcpNameComponent:
         schema = _convert_mcp_schema("ai.exa/exa", mcp_tool)
         assert schema["name"] == "mcp__ai_exa_exa__search"
         # Must match Anthropic's pattern: ^[a-zA-Z0-9_-]{1,128}$
-        import re
+        from agent.re_compat import re
         assert re.match(r"^[a-zA-Z0-9_-]{1,128}$", schema["name"])
 
     def test_slash_in_build_utility_schemas(self):

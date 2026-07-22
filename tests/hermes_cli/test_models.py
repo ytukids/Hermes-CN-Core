@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from hermes_cli.nous_account import NousPortalAccountInfo
 from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
@@ -58,6 +60,14 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
+    @pytest.fixture(autouse=True)
+    def _use_static_curated_snapshot(self, monkeypatch):
+        """Keep OpenRouter API tests independent from the hosted catalog."""
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            lambda: None,
+        )
+
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
         class _Resp:
             def __enter__(self):
@@ -775,9 +785,9 @@ class TestNousRecommendedModels:
 
     def _mock_urlopen(self, payload):
         """Return a context-manager mock mimicking urllib.request.urlopen()."""
-        import json as _json
+        import orjson as _json
         response = MagicMock()
-        response.read.return_value = _json.dumps(payload).encode()
+        response.read.return_value = _json.dumps(payload)
         cm = MagicMock()
         cm.__enter__.return_value = response
         cm.__exit__.return_value = False

@@ -32,8 +32,8 @@ Reference: https://bot.q.qq.com/wiki/develop/api-v2/
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
+import pybase64 as base64
+import orjson
 import logging
 import mimetypes
 import os
@@ -60,6 +60,7 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -906,7 +907,7 @@ class QQAdapter(BasePlatformAdapter):
     @staticmethod
     def _parse_json(raw: Any) -> Optional[Dict[str, Any]]:
         try:
-            payload = json.loads(raw)
+            payload = orjson.loads(raw)
         except Exception:
             logger.warning("[QQBot] Failed to parse JSON: %r", raw)
             return None
@@ -2112,6 +2113,9 @@ class QQAdapter(BasePlatformAdapter):
     async def _convert_ffmpeg_to_wav(self, src_path: str, wav_path: str) -> Optional[str]:
         """Convert audio file to WAV using ffmpeg."""
         try:
+            _subprocess_kwargs = {}
+            if IS_WINDOWS:
+                _subprocess_kwargs["creationflags"] = windows_hide_flags()
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
                 "-y",
@@ -2124,6 +2128,7 @@ class QQAdapter(BasePlatformAdapter):
                 wav_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                **_subprocess_kwargs,
             )
             await asyncio.wait_for(proc.wait(), timeout=30)
             if proc.returncode != 0:
@@ -3155,8 +3160,7 @@ class QQAdapter(BasePlatformAdapter):
     def _strip_at_mention(content: str) -> str:
         """Strip the @bot mention prefix from group message content."""
         # QQ group @-messages may have the bot's QQ/ID as prefix
-        import re
-
+        from agent.re_compat import re
         stripped = re.sub(r"^@\S+\s*", "", content.strip())
         return stripped
 

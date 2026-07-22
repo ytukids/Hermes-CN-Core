@@ -1,5 +1,6 @@
 import argparse
 import json
+import orjson
 from types import SimpleNamespace
 
 from hermes_cli import plugins_cmd
@@ -77,7 +78,7 @@ def test_cmd_list_json_output(monkeypatch, capsys):
 
     plugins_cmd.cmd_list(_args(json=True))
 
-    payload = json.loads(capsys.readouterr().out)
+    payload = orjson.loads(capsys.readouterr().out)
     assert payload == [
         {
             "name": "web-search-plus",

@@ -1,6 +1,6 @@
 """Tests for hermes_cli/webhook.py — webhook subscription CLI."""
 
-import json
+import orjson
 import os
 import pytest
 import stat
@@ -160,7 +160,7 @@ class TestPersistence:
         webhook_command(_make_args(webhook_action="subscribe", name="persist"))
         path = _subscriptions_path()
         assert path.exists()
-        data = json.loads(path.read_text())
+        data = orjson.loads(path.read_text())
         assert "persist" in data
 
     def test_corrupted_file(self):
@@ -186,7 +186,7 @@ class TestPersistence:
         # Simulate a pre-existing 0o644 file from before this hardening landed.
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"old": {"secret": "stale", "prompt": "x"}}))
+        path.write_text(orjson.dumps({"old": {"secret": "stale", "prompt": "x"}}).decode('utf-8'))
         path.chmod(0o644)
 
         _save_subscriptions({"demo": {"secret": "FRESH", "prompt": "x"}})

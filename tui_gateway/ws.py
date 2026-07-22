@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import json
+import orjson
 import logging
 import socket
 import threading
@@ -94,6 +94,12 @@ class WSTransport:
         self._loop = loop
         self._peer = peer
         self._closed = False
+        # Every coroutine that writes to the socket must pass through one
+        # serialized writer. Token coalescing can schedule a timer batch while
+        # a non-streaming frame schedules another batch; without this lock the
+        # two ``send_text`` loops interleave at their await points and a
+        # message.complete frame can overtake older message.delta frames.
+        self._send_lock = asyncio.Lock()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
         # "armed" flag against the worker threads that call write(); the timer
@@ -115,7 +121,7 @@ class WSTransport:
         if self._closed:
             return False
 
-        line = json.dumps(obj, ensure_ascii=False)
+        line = orjson.dumps(obj).decode('utf-8')
 
         try:
             on_loop = asyncio.get_running_loop() is self._loop
@@ -215,32 +221,29 @@ class WSTransport:
         with self._token_lock:
             pending = self._pending_tokens
             self._pending_tokens = []
-        if pending:
-            await self._safe_send_many(pending)
-        await self._safe_send(json.dumps(obj, ensure_ascii=False))
+        pending.append(orjson.dumps(obj).decode("utf-8"))
+        await self._safe_send_many(pending)
         return not self._closed
 
     async def _safe_send(self, line: str) -> None:
-        try:
-            await self._ws.send_text(line)
-        except Exception as exc:
-            self._closed = True
-            _log.warning(
-                "ws send failed peer=%s error_type=%s error=%s",
-                self._peer, type(exc).__name__, exc,
-            )
+        await self._safe_send_many([line])
 
     async def _safe_send_many(self, lines: list[str]) -> None:
-        """Send a batch of pre-serialized frames in order on the loop thread."""
-        try:
-            for line in lines:
-                await self._ws.send_text(line)
-        except Exception as exc:
-            self._closed = True
-            _log.warning(
-                "ws send failed peer=%s error_type=%s error=%s",
-                self._peer, type(exc).__name__, exc,
-            )
+        """Send one indivisible batch of pre-serialized frames in wire order."""
+        async with self._send_lock:
+            if self._closed:
+                return
+            try:
+                for line in lines:
+                    await self._ws.send_text(line)
+            except Exception as exc:
+                self._closed = True
+                _log.warning(
+                    "ws send failed peer=%s error_type=%s error=%s",
+                    self._peer,
+                    type(exc).__name__,
+                    exc,
+                )
 
     def close(self) -> None:
         self._closed = True
@@ -356,8 +359,8 @@ async def handle_ws(ws: Any) -> None:
             messages += 1
 
             try:
-                req = json.loads(line)
-            except json.JSONDecodeError as exc:
+                req = orjson.loads(line)
+            except orjson.JSONDecodeError as exc:
                 parse_errors += 1
                 _log.warning(
                     "ws parse error peer=%s index=%d error=%s payload=%r",

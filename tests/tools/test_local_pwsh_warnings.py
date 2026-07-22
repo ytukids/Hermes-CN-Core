@@ -1,10 +1,12 @@
 """Tests for pwsh_transform warning propagation through LocalEnvironment.
 
-Verifies that _run_powershell captures warnings from pwsh_transform (always-on),
-execute() attaches them to the result dict, and terminal_tool surfaces them in JSON.
+Verifies that _wrap_command_powershell captures warnings from pwsh_transform
+(always-on, run on the raw command — see P-037), execute() attaches them to the
+result dict, and terminal_tool surfaces them in JSON.
+Also verifies that pwsh (PowerShell 7) skips the transform entirely.
 """
 
-import json
+import orjson
 import os
 import sys
 import pytest
@@ -31,22 +33,26 @@ def _fake_popen_for_powershell(stdout_data="output"):
 
 
 # ---------------------------------------------------------------------------
-# _run_powershell captures warnings (always-on pwsh_transform)
+# _wrap_command_powershell captures warnings (always-on pwsh_transform, P-037)
 # ---------------------------------------------------------------------------
 
-class TestRunPowershellCapturesWarnings:
-    """Test that _run_powershell always stores pwsh_transform warnings on self._pwsh_warnings."""
+class TestWrapCommandCapturesWarnings:
+    """Test that _wrap_command_powershell runs pwsh_transform on the RAW command
+    and stores its warnings on self._pwsh_warnings (P-037).
+
+    The transform moved here from _run_powershell: the wrapper embeds the user
+    command as a single-quoted Invoke-Expression literal, and the transform's
+    region mask skips single-quoted strings — so transforming the assembled
+    wrapper (the old call site) never reached the user's command.
+    """
 
     def test_refresh_env_from_registry_called(self):
-        """refresh_env_from_registry is called before pwsh_transform."""
+        """refresh_env_from_registry is still called by _run_powershell."""
         from tools.environments.local import LocalEnvironment
 
         with patch(
             "tools.environments.local.refresh_env_from_registry",
         ) as mock_refresh, patch(
-            "tools.environments.local.pwsh_transform",
-            return_value=("code", []),
-        ), patch(
             "tools.environments.local.subprocess.Popen",
             _fake_popen_for_powershell(),
         ):
@@ -57,7 +63,7 @@ class TestRunPowershellCapturesWarnings:
             mock_refresh.assert_called_once()
 
     def test_warnings_stored_on_instance(self):
-        """When pwsh_transform returns warnings, they are stored on self._pwsh_warnings."""
+        """When pwsh_transform returns warnings, the wrapper stores them on self._pwsh_warnings."""
         from tools.environments.local import LocalEnvironment
 
         # Mock to return tuple with warnings
@@ -66,34 +72,77 @@ class TestRunPowershellCapturesWarnings:
         with patch(
             "tools.environments.local.pwsh_transform",
             return_value=mock_transform_result,
-        ), patch(
-            "tools.environments.local.subprocess.Popen",
-            _fake_popen_for_powershell(),
         ):
             env = LocalEnvironment(cwd=r"C:\tmp", timeout=30)
-            env._shell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-            env._run_powershell("$a ? $b : $c")
+            env._shell_type = "powershell"
+            env._wrap_command_powershell("$a ? $b : $c", r"C:\tmp")
 
             assert hasattr(env, "_pwsh_warnings")
             assert env._pwsh_warnings == ["Line 1: ternary operator `$a ? $b : $c` rewritten"]
 
-    def test_pwsh_transform_always_called(self):
-        """pwsh_transform is now always-on — called for every command."""
+    def test_pwsh_transform_applied_to_raw_command(self):
+        """pwsh_transform is run on the RAW command (not the assembled wrapper)."""
         from tools.environments.local import LocalEnvironment
 
         with patch(
             "tools.environments.local.pwsh_transform",
             return_value=("code", []),
-        ) as mock_transform, patch(
-            "tools.environments.local.subprocess.Popen",
-            _fake_popen_for_powershell(),
-        ):
+        ) as mock_transform:
             env = LocalEnvironment(cwd=r"C:\tmp", timeout=30)
-            env._shell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-            env._run_powershell("Write-Output hello")
+            env._shell_type = "powershell"
+            env._wrap_command_powershell("Write-Output hello", r"C:\tmp")
 
-            # pwsh_transform should always be called (no conditional guard)
-            mock_transform.assert_called_once()
+            # Transform must see the user's raw command, not the wrapper script.
+            mock_transform.assert_called_once_with("Write-Output hello")
+
+    def test_real_transform_downlevels_command_inside_wrapper(self):
+        """Regression for P-037: the down-leveled command actually lands inside
+        the Invoke-Expression literal (the bug left `&&` un-leveled there)."""
+        from tools.environments.local import LocalEnvironment
+
+        env = LocalEnvironment(cwd=r"C:\tmp", timeout=30)
+        env._shell_type = "powershell"
+        # Real pwsh_transform (not mocked).
+        wrapped = env._wrap_command_powershell(
+            "git add . && git commit -m x", r"C:\tmp"
+        )
+
+        # The PS7 `&&` must be gone — it would raise a ParserError under 5.1.
+        assert "&&" not in wrapped
+        # The down-leveled `; if ($?) { ... }` short-circuit is present, still
+        # wrapped in Invoke-Expression, and both halves of the command survive.
+        assert "Invoke-Expression" in wrapped
+        assert "if ($?)" in wrapped
+        assert "git add ." in wrapped
+        assert "git commit -m x" in wrapped
+        # And the transform recorded a down-level warning for the LLM.
+        assert env._pwsh_warnings
+
+    def test_pwsh_skips_transform(self):
+        """When shell_type is 'pwsh', pwsh_transform is NOT called."""
+        from tools.environments.local import LocalEnvironment
+
+        with patch(
+            "tools.environments.local.pwsh_transform",
+        ) as mock_transform:
+            env = LocalEnvironment(cwd=r"C:\tmp", timeout=30)
+            env._shell_type = "pwsh"
+            # Use PS7 syntax that would normally be transformed
+            env._wrap_command_powershell("$a ?? $b", r"C:\tmp")
+
+            # Transform must NOT be called for pwsh
+            mock_transform.assert_not_called()
+
+    def test_pwsh_no_warnings(self):
+        """When shell_type is 'pwsh', _pwsh_warnings is empty list."""
+        from tools.environments.local import LocalEnvironment
+
+        env = LocalEnvironment(cwd=r"C:\tmp", timeout=30)
+        env._shell_type = "pwsh"
+        env._wrap_command_powershell("$a ?? $b", r"C:\tmp")
+
+        assert hasattr(env, "_pwsh_warnings")
+        assert env._pwsh_warnings == []
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +177,24 @@ class TestExecuteAttachesWarnings:
             assert "pwsh_warnings" in result
             assert result["pwsh_warnings"] == ["Line 2: null-coalescing `??` rewritten"]
 
+    def test_execute_pwsh_no_warnings_in_result(self):
+        """When shell_type is 'pwsh', execute() result does NOT contain pwsh_warnings."""
+        from tools.environments.local import LocalEnvironment
+
+        with patch(
+            "tools.environments.local.subprocess.Popen",
+            _fake_popen_for_powershell("foo"),
+        ), patch(
+            "tools.environments.local.os.path.isdir", return_value=True
+        ):
+            env = LocalEnvironment(cwd=r"C:\tmp", timeout=30)
+            env._shell_path = r"C:\Program Files\PowerShell\7\pwsh.exe"
+            env._shell_type = "pwsh"
+            result = env.execute("$a ?? $b")
+
+            # pwsh should not have warnings
+            assert "pwsh_warnings" not in result
+
 
 # ---------------------------------------------------------------------------
 # terminal_tool surfaces warnings in JSON
@@ -153,7 +220,7 @@ class TestTerminalToolSurfacesWarnings:
         with patch.object(tt, "_create_environment", return_value=fake_env), \
              patch.dict(tt._active_environments, {}, clear=True):
             raw = tt.terminal_tool("echo hi", task_id=task_id)
-        return json.loads(raw)
+        return orjson.loads(raw)
 
     def test_terminal_tool_json_includes_pwsh_warnings(self, tmp_path):
         parsed = self._run_with_fake_env_result(

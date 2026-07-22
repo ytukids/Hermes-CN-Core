@@ -1,8 +1,13 @@
 graft skills
 graft optional-skills
-graft optional-mcps
+graft plugins
 graft hermes_cli/web_dist
-graft locales
+graft gateway/assets
+# Offline-first models.dev snapshot (P-028) — sdist parity with the wheel
+# package-data entry so source builds also ship the bundled fallback.
+include agent/models_dev_snapshot.json
+
+graft optional-mcpsgraft locales
 # Bundled plugin manifests (plugin.yaml / plugin.yml). Without these the
 # PluginManager scan (hermes_cli/plugins.py) finds zero plugins on installs
 # built from the sdist (e.g. Homebrew, downstream packagers). package-data

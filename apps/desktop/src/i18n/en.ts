@@ -1314,27 +1314,6 @@ export const en: Translations = {
     failedUpdate: name => `Failed to update ${name}`,
     failedSave: name => `Failed to save ${name}`,
     failedClear: key => `Failed to clear ${key}`,
-    conflictTitle: 'Another Hermes Agent is blocking the gateway',
-    conflictServiceBody:
-      "A previously-installed Hermes gateway service is running on this PC and isn't managed by the desktop app. Restarting it would use its own config and ignore the params you just saved.",
-    conflictPortBody:
-      'The messaging port is already in use by another Hermes Agent — typically a second install or one running inside WSL reachable over the shared localhost. The desktop gateway can’t bind it.',
-    conflictHelpService: [
-      'Stop the Windows service: run `hermes gateway service uninstall` in a terminal.',
-      'Or let the desktop take over: it stops that service and runs its own gateway.'
-    ],
-    conflictHelpPort: [
-      'If the other instance is in WSL, stop it there: `hermes gateway stop`.',
-      'If it’s a second Windows install, quit it (or stop its gateway), then retry.',
-      'Once the port is free, click “Force the desktop to take over”.'
-    ],
-    conflictTakeoverUnavailable:
-      'The conflicting instance isn’t reachable from here (e.g. it runs in WSL), so the desktop can’t stop it automatically. Stop it manually, then retry.',
-    forceTakeover: 'Force the desktop to take over',
-    takingOver: 'Taking over…',
-    howToStopOthers: 'How to stop the other instance',
-    takeoverStarted: 'Taking over the gateway',
-    takeoverFailed: 'Could not take over the gateway',
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'Bot token',
@@ -1416,7 +1395,8 @@ export const en: Translations = {
         label: 'Allowed WhatsApp users',
         help: 'Recommended. Comma-separated phone numbers or WhatsApp IDs.'
       }
-    },    platformIntro: {}
+    },
+    platformIntro: {}
   },
 
   profiles: {

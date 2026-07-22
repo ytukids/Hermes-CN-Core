@@ -1508,27 +1508,6 @@ export const zh: Translations = {
     failedUpdate: name => `更新 ${name} 失败`,
     failedSave: name => `保存 ${name} 失败`,
     failedClear: key => `清除 ${key} 失败`,
-    conflictTitle: '检测到另一个 Hermes Agent 正在占用网关',
-    conflictServiceBody:
-      '这台电脑上有一个之前安装的 Hermes 网关服务正在运行，且不是桌面端托管的进程。直接重启它会沿用它自己的旧配置，忽略你刚保存的参数。',
-    conflictPortBody:
-      '消息端口已被另一个 Hermes Agent 占用——通常是第二个安装，或运行在 WSL 中、通过共享 localhost 可达的实例。桌面端网关无法绑定该端口。',
-    conflictHelpService: [
-      '停止 Windows 服务：在终端运行 `hermes gateway service uninstall`。',
-      '或让桌面端接管：它会停止该服务并运行自己托管的网关。'
-    ],
-    conflictHelpPort: [
-      '若另一个实例在 WSL 中，请在 WSL 里停止：`hermes gateway stop`。',
-      '若是第二个 Windows 安装，请退出它（或停止其网关）后重试。',
-      '端口释放后，点击「强制由桌面端接管并重启」。'
-    ],
-    conflictTakeoverUnavailable:
-      '冲突的实例无法从这里访问（例如它运行在 WSL 中），桌面端无法自动停止它。请手动停止后重试。',
-    forceTakeover: '强制由桌面端接管并重启',
-    takingOver: '正在接管…',
-    howToStopOthers: '查看如何停止其他实例',
-    takeoverStarted: '正在接管网关',
-    takeoverFailed: '接管网关失败',
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'Bot 令牌',

@@ -353,8 +353,8 @@ def test_write_file_reports_resolved_absolute_path(_isolated_cwd, monkeypatch):
     workspace, decoy = _isolated_cwd
     terminal_tool.record_session_cwd("t1", str(workspace))
 
-    import json
-    out = json.loads(ft.write_file_tool("newfile.txt", "hello\n", task_id="t1"))
+    import orjson
+    out = orjson.loads(ft.write_file_tool("newfile.txt", "hello\n", task_id="t1"))
 
     expected = str((workspace / "newfile.txt").resolve())
     assert out.get("resolved_path") == expected
@@ -367,8 +367,8 @@ def test_patch_reports_resolved_absolute_path(_isolated_cwd, monkeypatch):
     workspace, decoy = _isolated_cwd
     terminal_tool.record_session_cwd("t1", str(workspace))
 
-    import json
-    out = json.loads(ft.patch_tool(
+    import orjson
+    out = orjson.loads(ft.patch_tool(
         mode="replace", path="target.py",
         old_string="WORKSPACE_ORIGINAL", new_string="WORKSPACE_PATCHED",
         task_id="t1",

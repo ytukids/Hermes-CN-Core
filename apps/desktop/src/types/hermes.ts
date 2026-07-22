@@ -211,19 +211,6 @@ export interface MessagingHomeChannel {
   thread_id?: string
 }
 
-// Structured conflict info attached when the gateway can't start because
-// another Hermes Agent owns the resource (issue #168). `can_takeover` is true
-// only when the conflicting owner is a same-machine process the desktop can
-// stop; a WSL/cross-VM owner is false (stop-it-yourself guidance instead).
-export interface MessagingConflictDetail {
-  kind?: 'service' | 'port' | 'app_lock' | 'other' | string
-  can_takeover?: boolean
-  port?: number | null
-  owner_pid?: number | null
-  owner_home?: null | string
-  message?: null | string
-}
-
 export interface MessagingPlatformInfo {
   configured: boolean
   description: string
@@ -231,7 +218,6 @@ export interface MessagingPlatformInfo {
   enabled: boolean
   env_vars: MessagingEnvVarInfo[]
   error_code?: null | string
-  error_detail?: MessagingConflictDetail | null
   error_message?: null | string
   gateway_running: boolean
   home_channel?: MessagingHomeChannel | null

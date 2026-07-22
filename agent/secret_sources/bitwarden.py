@@ -30,7 +30,7 @@ is easier to lazy-install than a wheels-with-Rust-extension dependency.
 from __future__ import annotations
 
 import hashlib
-import json
+import orjson
 import logging
 import os
 import platform
@@ -496,8 +496,8 @@ def _run_bws_list(
         return {}, ["bws returned no output (empty project?)"]
 
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        payload = orjson.loads(raw)
+    except orjson.JSONDecodeError as exc:
         raise RuntimeError(f"bws returned non-JSON output: {exc}") from exc
 
     if not isinstance(payload, list):

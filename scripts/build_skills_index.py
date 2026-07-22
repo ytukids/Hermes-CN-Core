@@ -414,7 +414,7 @@ def main():
     }
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
+        f.write(json.dumps(index, ensure_ascii=False))
     file_size = os.path.getsize(OUTPUT_PATH)
     print(f"\nDone! {len(deduped)} skills indexed in "
           f"{time.time() - overall_start:.0f}s")

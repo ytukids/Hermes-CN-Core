@@ -31,16 +31,20 @@ Usage:
     result = terminal_tool("python server.py", background=True)
 """
 
+import functools
 import importlib.util
+import json
+import orjson
 import json
 import logging
 import os
 import platform
-import re
+from agent.re_compat import re
 import time
 import threading
 import atexit
 import shutil
+import uuid
 import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -59,6 +63,15 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 
 
+# ---------------------------------------------------------------------------
+# PowerShell / pwsh console init — prepended to every PowerShell command so
+# the shell always emits UTF-8 and Ctrl+C is forwarded to the child process
+# rather than killing the shell itself.
+# ---------------------------------------------------------------------------
+_PWSH_CONSOLE_INIT = (
+    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+    "$OutputEncoding=[System.Text.Encoding]::UTF8;"
+)
 
 
 # =============================================================================
@@ -978,6 +991,93 @@ PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REP
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
 
+
+@functools.lru_cache(maxsize=1)
+def _detect_shell_for_description() -> str:
+    """Detect shell type for description purposes.
+
+    Returns ``"pwsh"``, ``"powershell"``, or ``"bash"``.
+
+    On Windows, probes for PowerShell 7 (pwsh) first; if found returns
+    ``"pwsh"``, otherwise returns ``"powershell"`` (Windows PowerShell
+    5.1, which ships with every Windows 10/11 system).
+    On non-Windows, returns ``"bash"``.
+
+    Cached via ``@lru_cache`` so repeated calls are essentially free.
+    """
+    if platform.system() != "Windows":
+        return "bash"
+
+    shell_type = os.environ.get("HERMES_SHELL_TYPE", "auto").strip().lower() or "auto"
+
+    if shell_type == "bash":
+        return "powershell"  # _resolve_shell() in local.py will raise RuntimeError
+
+    # Probe for pwsh (PowerShell 7)
+    try:
+        from tools.environments.local import _find_pwsh
+        if _find_pwsh():
+            return "pwsh"
+    except Exception:
+        pass
+
+    # Fallback to Windows PowerShell 5.1
+    return "powershell"
+
+
+def _build_dynamic_terminal_description() -> dict:
+    """Return dynamic schema overrides reflecting the actual shell in use.
+
+    Called lazily each time ``registry.get_definitions()`` assembles the
+    terminal tool schema, so the description always matches the shell
+    the agent will actually execute against.
+    """
+    shell_type = _detect_shell_for_description()
+
+    if shell_type == "pwsh":
+        platform_env = "Execute powershell commands in a PowerShell 7 (pwsh) environment"
+    elif shell_type == "powershell":
+        platform_env = "Execute powershell commands on a Windows PowerShell environment"
+    else:
+        platform_env = "Execute shell commands on a Linux environment"
+
+    # Replace the hardcoded "Linux environment" with the real platform
+    new_description = TERMINAL_TOOL_DESCRIPTION.replace(
+        "Execute shell commands on a Linux environment.",
+        platform_env
+    )
+
+    # ------------------------------------------------------------------
+    # For PowerShell (both pwsh and powershell.exe), also adapt
+    # Linux/bash-specific command references so the agent sees cmdlets it
+    # might actually be tempted to misuse. The core guidance ("use agent
+    # tools instead of shell commands") stays the same; only the example
+    # commands change.
+    if shell_type in ("powershell", "pwsh"):
+        new_description = new_description.replace(
+            "Do NOT use cat/head/tail to read files",
+            "Do NOT use Get-Content/cat/type to read files",
+        )
+        new_description = new_description.replace(
+            "Do NOT use grep/rg/find to search",
+            "Do NOT use Select-String/findstr to search",
+        )
+        new_description = new_description.replace(
+            "Do NOT use ls to list directories",
+            "Do NOT use Get-ChildItem/ls/dir to list directories",
+        )
+        new_description = new_description.replace(
+            "Do NOT use echo/cat heredoc to create files",
+            "Do NOT use echo/Set-Content/Out-File to create files",
+        )
+        new_description = new_description.replace(
+            "Pipe git output to cat if it might page.",
+            "Pipe git output to Out-Host -Paging if it might page.",
+        )
+
+    return {"description": new_description}
+
+
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
@@ -1069,58 +1169,6 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 # Thread-safe because each task_id is unique per rollout.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 
-# ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
-#
-# The durable source of truth for "which directory is THIS session working
-# in". Keyed by the raw session/task key (NOT the collapsed container id):
-# the terminal env is shared across sessions, so any cwd state stored on the
-# env is a global mutable timeshared between sessions — the root cause of the
-# wrong-worktree bug class (env.cwd_owner stamping, _last_known_cwd, and the
-# ownership ladder in file_tools are all patches over that misplacement).
-#
-# Step 1 (this change): dual-write only. Every site that learns a session's
-# live cwd (post-command tracking, cwd-override registration) also records it
-# here. Readers still use the legacy env.cwd ladder. Later steps flip
-# file_tools and _resolve_command_cwd to read this store, then delete the
-# env-side tracking + ownership guards.
-_session_cwd: Dict[str, str] = {}
-_session_cwd_lock = threading.Lock()
-
-
-def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
-    """Record *cwd* as the working directory of *session_key*.
-
-    Called wherever a session's live cwd becomes known: after a terminal
-    command completes (the env's post-command tracking has just parsed the
-    resulting cwd) and when a surface registers a workspace cwd override.
-    Empty/None session keys collapse to ``"default"`` (single-session CLI).
-    Non-string / empty cwds are ignored.
-    """
-    if not isinstance(cwd, str) or not cwd.strip():
-        return
-    key = str(session_key or "default")
-    with _session_cwd_lock:
-        if _session_cwd.get(key) != cwd:
-            _session_cwd[key] = cwd
-
-
-def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
-    """Return the recorded working directory for *session_key*, if any.
-
-    No fallback chain here on purpose: callers decide what an absent record
-    means (config default, TERMINAL_CWD seed, process cwd). ``None``/empty
-    keys read the ``"default"`` record.
-    """
-    key = str(session_key or "default")
-    with _session_cwd_lock:
-        return _session_cwd.get(key)
-
-
-def clear_session_cwd(session_key: str) -> None:
-    """Drop a session's cwd record (session teardown)."""
-    with _session_cwd_lock:
-        _session_cwd.pop(session_key, None)
-
 
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     """
@@ -1142,14 +1190,15 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
-    # mid-session via ``session/load`` / ``session/resume``) must take effect
-    # immediately. The session record is what commands resolve against;
-    # the live env's cwd is also updated so env-side seeding stays consistent.
+    # mid-session via ``session/load`` / ``session/resume``) must take effect on
+    # the cached env too. ``terminal_tool`` resolves the per-command cwd as
+    # ``workdir > env.cwd > config/override cwd`` so that ordinary in-session
+    # ``cd`` state is preserved; without syncing here the override would sit
+    # below the (already-set) ``env.cwd`` and be silently ignored once any
+    # command has run. Pushing it onto the live env keeps ``cd`` tracking intact
+    # while letting an explicit ACP cwd change win, as the client expects.
     new_cwd = overrides.get("cwd")
     if isinstance(new_cwd, str) and new_cwd.strip():
-        # A registered workspace cwd IS the session's working directory until
-        # a `cd` changes it.
-        record_session_cwd(task_id, new_cwd)
         # The live env is cached under the raw task_id for per-session surfaces
         # (ACP/gateway/dashboard) and under the collapsed container id for
         # isolation-keyed rollouts. Try the raw id first, then the container id,
@@ -1169,7 +1218,6 @@ def clear_task_env_overrides(task_id: str):
     Called during cleanup to avoid stale entries accumulating.
     """
     _task_env_overrides.pop(task_id, None)
-    clear_session_cwd(task_id)
 
 
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
@@ -1238,7 +1286,7 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
     raw = os.getenv(name, default)
     try:
         return converter(raw)
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, orjson.JSONDecodeError):
         raise ValueError(
             f"Invalid value for {name}: {raw!r} (expected {type_label}). "
             f"Check ~/.hermes/.env or environment variables."
@@ -1305,52 +1353,10 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     return False
 
 
-# One-shot guard for the config-fallback bridge below.  Purely an
-# optimization: after the first attempt either TERMINAL_ENV is set (bridge
-# succeeded — merged config always carries terminal.backend) or the import
-# failed and retrying every call would be wasted work.
-_terminal_config_bridge_attempted = False
-
-
-def _ensure_terminal_env_bridged() -> None:
-    """Backfill TERMINAL_* env vars from config.yaml when no launcher did.
-
-    terminal_tool reads ALL terminal settings from os.environ (TERMINAL_*).
-    The CLI (cli.py ``env_mappings``), the gateway (gateway/run.py
-    ``_terminal_env_map``), and TUI/dashboard PTY launches
-    (``apply_terminal_config_to_env``) bridge ``terminal.*`` config into env
-    vars at startup — but processes that skip all of those paths (``hermes
-    serve`` / the Desktop app backend's in-process agents, the desktop cron
-    ticker, ACP) used to silently fall back to the local backend even when
-    config.yaml selects ``terminal.backend: docker``, running commands on the
-    host the user intended to sandbox (#63141, #54449, #61115, #65696).
-
-    Explicit env always wins: when TERMINAL_ENV is already set (a launcher's
-    bridge or the user's .env made a deliberate choice) this is a no-op.  The
-    config bridge only fills the unset case, so it changes an accidental
-    default — never an explicit selection.
-    """
-    global _terminal_config_bridge_attempted
-    if "TERMINAL_ENV" in os.environ or _terminal_config_bridge_attempted:
-        return
-    _terminal_config_bridge_attempted = True
-    try:
-        from hermes_cli.config import apply_terminal_config_to_env
-
-        # env=None targets os.environ inside the helper; override=False keeps
-        # any already-set TERMINAL_* values (e.g. from .env) authoritative.
-        apply_terminal_config_to_env(env=None, override=False)
-    except Exception:
-        # Never let a config problem take the terminal tool down — the
-        # historical local default still applies.
-        logger.debug("terminal config → env fallback bridge failed", exc_info=True)
-
-
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
-    default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
-    _ensure_terminal_env_bridged()
+    default_image = "nikolaik/python-nodejs:python3.14-nodejs20"
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
@@ -1401,9 +1407,13 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
-        candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+        expanded = os.path.expanduser(docker_cwd_source)
+        candidate = os.path.abspath(expanded)
+        # Check raw source value FIRST (before abspath changes drive letters on Windows)
+        # so POSIX-style /Users/... paths are recognized on all platforms.
         if (
-            any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
+            any(docker_cwd_source.startswith(p) for p in _HOST_CWD_PREFIXES)
+            or any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
         ):
             host_cwd = candidate
@@ -2080,21 +2090,25 @@ def _resolve_notification_flag_conflict(
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
+    env: Any,
     default_cwd: str,
-    session_key: Optional[str] = None,
 ) -> str:
-    """Return the cwd for a command. Explicit ``workdir=`` overrides everything.
+    """Return the cwd for a command, preferring the live session cwd.
 
-    Otherwise the session's own cwd RECORD (``get_session_cwd``) wins — it is
-    written after every completed command for this session, so it IS the
-    session's ``cd`` state, with no shared-env ambiguity: another session's
-    ``cd`` lands in another record and can't affect us. A session with no
-    record yet (first command) runs in ``default_cwd`` (config/override cwd),
-    which is also what seeds a fresh environment.
+    ``terminal_tool`` historically re-sent the init-time/config cwd on every
+    call. That broke session-local ``cd`` state: the environment tracked the
+    new directory in ``env.cwd``, but foreground/background calls kept forcing
+    the old cwd back through ``env.execute(..., cwd=...)``. Explicit
+    ``workdir=`` must still override everything.
     """
     if workdir:
         return workdir
-    return get_session_cwd(session_key) or default_cwd
+
+    live_cwd = getattr(env, "cwd", None)
+    if isinstance(live_cwd, str) and live_cwd.strip():
+        return live_cwd
+
+    return default_cwd
 
 
 def terminal_tool(
@@ -2108,6 +2122,8 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    token_kill: bool = True,
+    max_lines: Optional[int] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2123,6 +2139,8 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        token_kill: When True (default), known commands are rewritten to use the rtk binary which collapses repeated output lines to save tokens. Set False to preserve raw command output.
+        max_lines: Maximum number of output lines to return. When set, keeps the first floor(max_lines/2) and last ceil(max_lines/2)-1 lines with an omitted-lines marker between them. When unset, all lines are returned (subject to the byte cap).
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -2139,6 +2157,12 @@ def terminal_tool(
         
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
+        
+        # With token_kill disabled
+        >>> result = terminal_tool(command="git log", token_kill=False)
+        
+        # With max_lines limit
+        >>> result = terminal_tool(command="dmesg", max_lines=100)
     """
     try:
         if not isinstance(command, str):
@@ -2146,12 +2170,12 @@ def terminal_tool(
                 "Rejected invalid terminal command value: %s",
                 type(command).__name__,
             )
-            return json.dumps({
+            return orjson.dumps({
                 "output": "",
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
-            }, ensure_ascii=False)
+            }).decode('utf-8')
 
         # Get configuration
         config = _get_env_config()
@@ -2183,7 +2207,7 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        cwd = overrides.get("cwd") or config["cwd"]
         # A per-task cwd override (registered by the gateway/TUI for workspace
         # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
         # config["cwd"] was already sanitized for container backends in
@@ -2209,25 +2233,25 @@ def terminal_tool(
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-            return json.dumps({
+            return orjson.dumps({
                 "error": (
                     f"Foreground timeout {timeout}s exceeds the maximum of "
                     f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
                     f"notify_on_complete=true for long-running commands."
                 ),
-            }, ensure_ascii=False)
+            }).decode('utf-8')
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
         if not background:
             guidance = _foreground_background_guidance(command)
             if guidance:
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": guidance,
                     "status": "error",
-                }, ensure_ascii=False)
+                }).decode('utf-8')
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2236,7 +2260,6 @@ def terminal_tool(
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
-        env = None
         with _env_lock:
             # Prefer the collapsed container id, but fall back to an env cached
             # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
@@ -2325,28 +2348,18 @@ def terminal_tool(
                             host_cwd=config.get("host_cwd"),
                         )
                     except ImportError as e:
-                        return json.dumps({
+                        return orjson.dumps({
                             "output": "",
                             "exit_code": -1,
                             "error": f"Terminal tool disabled: environment creation failed ({e})",
                             "status": "disabled"
-                        }, ensure_ascii=False)
+                        }).decode('utf-8')
 
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
                         _last_activity[effective_task_id] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
-
-        if env is None:
-            # Unreachable in practice (either the cached branch or the creation
-            # branch assigned env above); guard for type-safety and so a future
-            # refactor of the branches can't fall through to an AttributeError.
-            return json.dumps({
-                "output": "",
-                "exit_code": -1,
-                "error": "Terminal environment unavailable (creation raced cleanup)",
-            }, ensure_ascii=False)
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
@@ -2358,7 +2371,7 @@ def terminal_tool(
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from hermes_cli.cron import _contains_gateway_lifecycle_command
             if _contains_gateway_lifecycle_command(command):
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": 1,
                     "error": (
@@ -2369,7 +2382,7 @@ def terminal_tool(
                         "the running gateway."
                     ),
                     "status": "error",
-                }, ensure_ascii=False)
+                }).decode('utf-8')
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
@@ -2387,7 +2400,7 @@ def terminal_tool(
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
-                    return json.dumps({
+                    return orjson.dumps({
                         "output": "",
                         "exit_code": -1,
                         "error": "",
@@ -2396,21 +2409,19 @@ def terminal_tool(
                         "command": approval.get("command", command),
                         "description": approval.get("description", "command flagged"),
                         "pattern_key": approval.get("pattern_key", ""),
-                        "smart_denied": approval.get("smart_denied", False),
-                        "allow_permanent": approval.get("allow_permanent", True),
-                    }, ensure_ascii=False)
+                    }).decode('utf-8')
                 # Command was blocked
                 desc = approval.get("description", "command flagged")
                 fallback_msg = (
                     f"Command denied: {desc}. "
                     "Use the approval prompt to allow it, or rephrase the command."
                 )
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": approval.get("message", fallback_msg),
                     "status": "blocked"
-                }, ensure_ascii=False)
+                }).decode('utf-8')
             # Track whether approval was explicitly granted by the user
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")
@@ -2426,12 +2437,12 @@ def terminal_tool(
             if workdir_error:
                 logger.warning("Blocked dangerous workdir: %s (command: %s)",
                                workdir[:200], _safe_command_preview(command))
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": workdir_error,
                     "status": "blocked"
-                }, ensure_ascii=False)
+                }).decode('utf-8')
 
         # Prepare command for execution
         pty_disabled_reason = None
@@ -2445,13 +2456,20 @@ def terminal_tool(
                 "EOF."
             )
 
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
+        # Claim the (shared "default") terminal env for the session driving this
+        # command. File tools read env.cwd_owner to decide whether the env's live
+        # cwd is THIS session's `cd` or a different worktree session's — without
+        # it, two open worktree sessions sharing the env route each other's edits
+        # to the wrong checkout. get_current_session_key()'s contextvar doesn't
+        # cross tool-worker threads, so fall back to the raw task_id (which IS the
+        # session_key for the top-level agent) — a stable, thread-safe anchor.
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        try:
+            env.cwd_owner = session_key
+        except Exception:
+            pass
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2461,11 +2479,18 @@ def terminal_tool(
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
+                env=env,
                 default_cwd=cwd,
-                session_key=session_key,
             )
             try:
                 if env_type == "local":
+                    cwd_file = None
+                    if hasattr(env, "get_temp_dir"):
+                        try:
+                            temp_dir = env.get_temp_dir().rstrip("/") or "/"
+                            cwd_file = f"{temp_dir}/hermes-bg-cwd-{uuid.uuid4().hex[:12]}.txt"
+                        except Exception:
+                            pass
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
@@ -2473,6 +2498,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        cwd_file=cwd_file,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2623,10 +2649,9 @@ def terminal_tool(
                         watch_patterns = None
                         result_data["notify_on_complete"] = False
                         result_data["notify_unsupported"] = (
-                            "notify_on_complete / watch_patterns are not available in "
-                            "this session — it cannot receive an async completion after "
-                            "the turn ends (a one-shot runner such as `hermes -z` or a "
-                            "cron job, or a stateless HTTP endpoint). The process is "
+                            "notify_on_complete / watch_patterns are not available on "
+                            "this endpoint (stateless HTTP API — no channel to deliver "
+                            "an async completion after the turn ends). The process is "
                             "running in the background; retrieve its result with "
                             "process(action='poll') or process(action='wait')."
                         )
@@ -2694,13 +2719,13 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
-                return json.dumps(result_data, ensure_ascii=False)
+                return orjson.dumps(result_data).decode('utf-8')
             except Exception as e:
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": f"Failed to start background process: {str(e)}"
-                }, ensure_ascii=False)
+                }).decode('utf-8')
         else:
             # Run foreground command with retry logic
             max_retries = 3
@@ -2722,28 +2747,34 @@ def terminal_tool(
                 try:
                     command_cwd = _resolve_command_cwd(
                         workdir=workdir,
+                        env=env,
                         default_cwd=cwd,
-                        session_key=session_key,
                     )
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while
-                        # streaming (head/tail window) so a verbose command
-                        # can't OOM the gateway before truncation (#64435).
-                        # Internal env.execute() consumers (file ops cat
-                        # reads, RPC reads) intentionally stay unbounded.
-                        "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    # Apply token_kill command rewriting before execution
+                    exec_command = command
+                    rtk_rewritten = False
+                    if token_kill:
+                        from tools.rtk_provision import _rtk_available
+                        if _rtk_available():
+                            from tools.terminal_command_rewrite import _maybe_rewrite_shell_command_with_rtk
+                            exec_command, rtk_rewritten = _maybe_rewrite_shell_command_with_rtk(
+                                command, token_kill=True
+                            )
+                            if rtk_rewritten:
+                                logger.info("Rewrote command with rtk: %r -> %r", command, exec_command)
+                    result = env.execute(exec_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
-                        return json.dumps({
+                        return orjson.dumps({
                             "output": "",
                             "exit_code": 124,
                             "error": f"Command timed out after {effective_timeout} seconds"
-                        }, ensure_ascii=False)
+                        }).decode('utf-8')
                     
                     # Retry on transient errors
                     if retry_count < max_retries:
@@ -2756,23 +2787,15 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
+                    return orjson.dumps({
                         "output": "",
                         "exit_code": -1,
                         "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
-                    }, ensure_ascii=False)
+                    }).decode('utf-8')
                 
                 # Got a result
                 break
-
-            # Dual-write (cwd rearch step 1): the env's post-command tracking
-            # (marker parse / local sync) has just updated env.cwd with the
-            # directory this command finished in. That cwd belongs to THIS
-            # session — record it under the session key so the durable record
-            # never depends on the shared env surviving or on who drives the
-            # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
-
+            
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
@@ -2793,10 +2816,9 @@ def terminal_tool(
                         "command."
                     )
 
-            # Foreground terminal output canonicalization seam: process capture
-            # is already bounded by BaseEnvironment before sudo checks and hooks
-            # run. Plugins may replace that bounded string; replacements are
-            # still subject to the final output limit below.
+            # Foreground terminal output canonicalization seam: plugins receive
+            # the full output string before default truncation and may only
+            # replace it by returning a string from transform_terminal_output.
             # The hook is fail-open, and the first valid string return wins.
             try:
                 from hermes_cli.plugins import invoke_hook
@@ -2814,8 +2836,29 @@ def terminal_tool(
                         break
             except Exception:
                 pass
-            
-            # Truncate output if too long, keeping both head and tail
+
+            # ── New post-processing pipeline ──
+            from tools.terminal_post_process import (
+                _token_filter_output,
+                filter_output,
+            )
+
+            # Stage 1: Raw output filtering (ANSI + line ending normalization)
+            output = filter_output(output)
+
+            # Stage 2: Token filter pipeline (dedup + line truncation + original save)
+            post_result = _token_filter_output(
+                output,
+                token_kill=token_kill,
+                rtk_rewritten=rtk_rewritten,
+                max_lines=max_lines,
+            )
+            output = post_result.output
+
+            # Stage 3: Byte-cap truncation, keeping both head and tail. This is
+            # the hard output-size contract (head 40% / tail 60%) — dedup and
+            # max_lines above reduce tokens but do NOT bound bytes, and the
+            # transform_terminal_output hook may have just expanded the output.
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
             if len(output) > MAX_OUTPUT_CHARS:
@@ -2827,11 +2870,6 @@ def terminal_tool(
                     f"out of {len(output)} total] ...\n\n"
                 )
                 output = output[:head_chars] + truncated_notice + output[-tail_chars:]
-
-            # Strip ANSI escape sequences so the model never sees terminal
-            # formatting — prevents it from copying escapes into file writes.
-            from tools.ansi_strip import strip_ansi
-            output = strip_ansi(output)
 
             # Redact secrets from command output. For source/config dumps
             # (MAX_TOKENS=100, "apiKey": "x" fixtures, postgresql:// f-string
@@ -2853,6 +2891,7 @@ def terminal_tool(
                 "output": output,
                 "exit_code": returncode,
                 "error": None,
+                "command": exec_command,
             }
             try:
                 from agent.verification_evidence import record_terminal_result
@@ -2889,24 +2928,26 @@ def terminal_tool(
                     result_dict["approval"] = approval_note
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
+            if result.get("pwsh_warnings"):
+                result_dict["pwsh_warnings"] = result["pwsh_warnings"]
             if sudo_auth_failed:
                 result_dict["sudo_auth_failed"] = True
             if sudo_cache_cleared:
                 result_dict["sudo_cache_cleared"] = True
 
-            return json.dumps(result_dict, ensure_ascii=False)
+            return orjson.dumps(result_dict).decode('utf-8')
 
     except Exception as e:
         import traceback
         tb_str = traceback.format_exc()
         logger.error("terminal_tool exception:\n%s", tb_str)
-        return json.dumps({
+        return orjson.dumps({
             "output": "",
             "exit_code": -1,
             "error": f"Failed to execute command: {str(e)}",
             "traceback": tb_str,
             "status": "error"
-        }, ensure_ascii=False)
+        }).decode('utf-8')
 
 
 def check_terminal_requirements() -> bool:
@@ -2924,13 +2965,19 @@ def check_terminal_requirements() -> bool:
             if not docker:
                 logger.error("Docker executable not found in PATH or common install locations")
                 return False
-            result = subprocess.run([docker, "version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+            _dk = {}
+            if sys.platform == "win32":
+                _dk["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            result = subprocess.run([docker, "version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL, **_dk)  # windows-footgun: ok — creationflags in _dk
             return result.returncode == 0
 
         elif env_type == "singularity":
             executable = shutil.which("apptainer") or shutil.which("singularity")
             if executable:
-                result = subprocess.run([executable, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+                _tk = {}
+                if sys.platform == "win32":
+                    _tk["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                result = subprocess.run([executable, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL, **_tk)  # windows-footgun: ok — creationflags in _tk
                 return result.returncode == 0
             return False
 
@@ -3049,7 +3096,7 @@ if __name__ == "__main__":
     print("  result = terminal_tool(command='python server.py', background=True)")
 
     print("\nEnvironment Variables:")
-    default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
+    default_img = "nikolaik/python-nodejs:python3.14-nodejs20"
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
@@ -3109,6 +3156,16 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
+            },
+            "token_kill": {
+                "type": "boolean",
+                "description": "When true (default), known commands are rewritten to use the rtk binary which collapses repeated lines to save tokens. Set false to preserve raw command output.",
+                "default": True
+            },
+            "max_lines": {
+                "type": "integer",
+                "description": "Maximum number of output lines to return. When set, keeps the first floor(max_lines/2) and last ceil(max_lines/2)-1 lines with an omitted-lines marker between them. When unset, all lines are returned (subject to the byte cap).",
+                "minimum": 10
             }
         },
         "required": ["command"]
@@ -3127,6 +3184,8 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        token_kill=args.get("token_kill", True),
+        max_lines=args.get("max_lines"),
     )
 
 
@@ -3138,4 +3197,5 @@ registry.register(
     check_fn=check_terminal_requirements,
     emoji="💻",
     max_result_size_chars=100_000,
+    dynamic_schema_overrides=_build_dynamic_terminal_description,
 )

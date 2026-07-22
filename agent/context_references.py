@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
+import orjson
 import mimetypes
 import os
-import re
+from agent.re_compat import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -340,7 +340,7 @@ async def _default_url_fetcher(url: str) -> str:
     from tools.web_tools import web_extract_tool
 
     raw = await web_extract_tool([url], format="markdown")
-    payload = json.loads(raw)
+    payload = orjson.loads(raw)
     docs = payload.get("results", [])
     if not docs:
         return ""
@@ -528,13 +528,17 @@ def _iter_visible_entries(path: Path, cwd: Path, limit: int) -> list[Path]:
 
 
 def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
+    from hermes_cli.dep_ensure import _find_rg
+    rg_path = _find_rg()
+    if not rg_path:
+        return None
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
         from ripgrepy import Ripgrepy, RipGrepNotFound
     except ImportError:
         return None
     try:
-        rg = Ripgrepy("", str(cwd))
+        rg = Ripgrepy("", str(cwd), rg_path=rg_path)
         rg = rg.files()
         result = subprocess.run(
             rg.command + [str(path.relative_to(cwd))],

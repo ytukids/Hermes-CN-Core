@@ -10,7 +10,7 @@ asserting the expected env var outcomes.
 """
 
 import os
-import json
+import orjson
 
 from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
 from tools.terminal_tool import _is_ssh_remote_tilde_cwd
@@ -60,7 +60,7 @@ def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
                     if not _is_ssh_remote_tilde_cwd(terminal_backend, val.strip()):
                         val = os.path.expanduser(val)
                 if isinstance(val, list):
-                    env[env_var] = json.dumps(val)
+                    env[env_var] = orjson.dumps(val).decode('utf-8')
                 else:
                     env[env_var] = str(val)
 

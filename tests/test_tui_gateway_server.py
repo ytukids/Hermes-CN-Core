@@ -1,4 +1,4 @@
-import json
+import orjson
 import os
 import subprocess
 import sys
@@ -750,7 +750,7 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
     lines = "".join(out.parts).splitlines()
 
     assert len(lines) == 8
-    assert {json.loads(line)["seq"] for line in lines} == set(range(8))
+    assert {orjson.loads(line)["seq"] for line in lines} == set(range(8))
 
 
 def test_write_json_returns_false_on_broken_pipe(monkeypatch):
@@ -1305,10 +1305,18 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
+    # Sorted: ["kanban", "memory", "project", "swarm"]. `kanban` and `swarm`
+    # are auto-recovered by
     # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
     # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
+    # [CN-fork] context_engine is a first-class default toolset on every platform.
+    assert server._load_enabled_toolsets() == [
+        "context_engine",
+        "kanban",
+        "memory",
+        "project",
+        "swarm",
+    ]
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -1329,7 +1337,14 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
+    # [CN-fork] context_engine is a first-class default toolset on every platform.
+    assert server._load_enabled_toolsets() == [
+        "context_engine",
+        "kanban",
+        "memory",
+        "project",
+        "swarm",
+    ]
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -1412,7 +1427,7 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
                     "id": "call_1",
                     "function": {
                         "name": "search_files",
-                        "arguments": json.dumps({"pattern": "resume"}),
+                        "arguments": orjson.dumps({"pattern": "resume"}).decode('utf-8'),
                     },
                 }
             ],
@@ -2104,7 +2119,7 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
             return {"model_config": '{"_branched_from":"root"}'}
 
         def update_session_meta(self, session_id, model_config_json, model=None):
-            updates["meta"] = (session_id, json.loads(model_config_json), model)
+            updates["meta"] = (session_id, orjson.loads(model_config_json), model)
 
     agent = types.SimpleNamespace(
         model="gpt-5.4",
@@ -8850,7 +8865,7 @@ def test_verification_status_returns_recorded_evidence(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     (project / "package.json").write_text(
-        json.dumps({"scripts": {"test": "vitest"}}),
+        orjson.dumps({"scripts": {"test": "vitest"}}).decode('utf-8'),
         encoding="utf-8",
     )
     (project / "pnpm-lock.yaml").write_text("", encoding="utf-8")
@@ -10164,7 +10179,7 @@ def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, t
     assert saved_file.parent == saved_dir
     assert saved_file.exists()
 
-    payload = json.loads(saved_file.read_text())
+    payload = orjson.loads(saved_file.read_text())
     assert payload["model"] == "hermes-test"
     assert payload["session_id"] == "20260101_120000_abc123"
     assert payload["session_start"] == "2026-01-01T12:00:00"
@@ -10362,8 +10377,7 @@ def test_image_attach_bytes_rejects_invalid_base64(monkeypatch, tmp_path):
 
 
 def test_image_attach_bytes_rejects_oversize(monkeypatch, tmp_path):
-    import base64 as _b64
-
+    import pybase64 as _b64
     _attach_bytes_cli(monkeypatch)
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     monkeypatch.setattr(server, "_ATTACH_BYTES_MAX_BYTES", 10)
@@ -10421,8 +10435,7 @@ def test_pdf_attach_requires_poppler(monkeypatch, tmp_path):
 
 
 def test_pdf_attach_rejects_non_pdf_bytes(monkeypatch, tmp_path):
-    import base64 as _b64
-
+    import pybase64 as _b64
     _attach_bytes_cli(monkeypatch)
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/pdftoppm")
@@ -10454,8 +10467,7 @@ def test_pdf_attach_requires_path_or_bytes(monkeypatch, tmp_path):
 
 
 def test_decode_attach_base64_helper():
-    import base64 as _b64
-
+    import pybase64 as _b64
     raw = _b64.b64encode(b"hello").decode("ascii")
     assert server._decode_attach_base64(raw, mime_prefix="image/") == b"hello"
     assert (
@@ -11499,6 +11511,44 @@ class TestResolveRuntimeWithFallback:
         assert captured["base_url"] == "https://fallback.invalid/v1"
         assert captured["api_key"] == "fb-tok"
 
+
+def test_should_log_config_warning_dedupes_identical_warnings():
+    """The config-health warning is process-global, so an unchanged warning is
+    logged once and suppressed on subsequent session creates; a different
+    warning still surfaces."""
+    saved = server._last_logged_config_warning
+    server._last_logged_config_warning = None
+    try:
+        warn_a = "config.yaml has empty section(s): `foo`."
+        warn_b = "config.yaml has empty section(s): `bar`."
+        # First occurrence logs; immediate repeat is suppressed.
+        assert server._should_log_config_warning(warn_a) is True
+        assert server._should_log_config_warning(warn_a) is False
+        # A genuinely different warning is not suppressed.
+        assert server._should_log_config_warning(warn_b) is True
+        assert server._should_log_config_warning(warn_b) is False
+        # Empty string is never logged.
+        assert server._should_log_config_warning("") is False
+    finally:
+        server._last_logged_config_warning = saved
+
+
+def test_probe_config_health_warns_once_for_empty_sections():
+    """End-to-end with the real warning text: empty (null) config sections are
+    flagged, and the dedup helper only greenlights logging the first time."""
+    saved = server._last_logged_config_warning
+    server._last_logged_config_warning = None
+    try:
+        cfg = {"context_file_max_chars": None, "max_concurrent_sessions": None}
+        cfg_warn = server._probe_config_health(cfg)
+        assert "empty section(s)" in cfg_warn
+        assert "context_file_max_chars" in cfg_warn
+        assert "max_concurrent_sessions" in cfg_warn
+        # Same warning across repeated session creates: log once, then suppress.
+        assert server._should_log_config_warning(cfg_warn) is True
+        assert server._should_log_config_warning(cfg_warn) is False
+    finally:
+        server._last_logged_config_warning = saved
 
 def test_get_usage_does_not_substitute_cumulative_total_for_context_used():
     """An external context engine that does not report last_prompt_tokens must

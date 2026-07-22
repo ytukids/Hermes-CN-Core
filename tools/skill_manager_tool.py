@@ -32,10 +32,10 @@ Directory layout for user skills:
             └── SKILL.md
 """
 
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import shutil
 import tempfile
 import contextvars as _ctxvars
@@ -1308,11 +1308,8 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         new_string=payload_kwargs.get("new_string") or "",
     )
     record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "gist": gist, "message": decision.message},
-        ensure_ascii=False,
-    )
+    return orjson.dumps({"success": True, "staged": True, "pending_id": record["id"],
+         "gist": gist, "message": decision.message}).decode('utf-8')
 
 
 def apply_skill_pending(payload: Dict[str, Any]) -> str:
@@ -1356,7 +1353,7 @@ def skill_manage(
     """
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
-        return json.dumps(preflight, ensure_ascii=False)
+        return orjson.dumps(preflight).decode('utf-8')
 
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
@@ -1435,7 +1432,7 @@ def skill_manage(
         except Exception:
             pass
 
-    return json.dumps(result, ensure_ascii=False)
+    return orjson.dumps(result).decode('utf-8')
 
 
 # =============================================================================

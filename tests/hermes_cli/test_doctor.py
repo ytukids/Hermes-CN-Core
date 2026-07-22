@@ -1421,6 +1421,99 @@ class TestDoctorStaleMaxIterationsDrift:
         assert "shadows" not in out
 
 
+# ── ripgrep + ripgrepy check ────────────────────────────────────────────
+
+
+class TestDoctorRipgrepRipgrepy:
+    """Tests for the ripgrep+ripgrepy combined check in run_doctor()."""
+
+    @staticmethod
+    def _capture_checks(monkeypatch, tmp_path, *, rg_present, ripgrepy_present):
+        """Run doctor and capture check_ok / check_warn / check_info calls
+        that mention 'ripgrep' or 'ripgrepy'."""
+        import io
+        import contextlib
+        import types
+        from argparse import Namespace
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir(parents=True)
+        (hermes_home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+        project = tmp_path / "project"
+        project.mkdir(exist_ok=True)
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(hermes_home))
+
+        # Control which("rg")
+        orig_which = doctor_mod.shutil.which
+        monkeypatch.setattr(
+            doctor_mod.shutil, "which",
+            lambda cmd: "/usr/bin/rg" if (cmd == "rg" and rg_present) else orig_which(cmd)
+        )
+
+        # Control ripgrepy import
+        import builtins
+        orig_import = builtins.__import__
+
+        if not ripgrepy_present:
+            def blocking_import(name, *args, **kwargs):
+                if name == "ripgrepy" or name.startswith("ripgrepy."):
+                    raise ImportError("No module named ripgrepy")
+                return orig_import(name, *args, **kwargs)
+            monkeypatch.setattr(builtins, "__import__", blocking_import)
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {"logged_in": False})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {"logged_in": False})
+        monkeypatch.setattr(_auth_mod, "get_minimax_oauth_auth_status", lambda: {"logged_in": False})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {"logged_in": False})
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False))
+        out = buf.getvalue()
+
+        # Collect lines mentioning ripgrep or ripgrepy
+        rg_lines = [l.strip() for l in out.splitlines()
+                    if "ripgrep" in l.lower() or "ripgrepy" in l.lower()]
+        return rg_lines, out
+
+    def test_rg_present_ripgrepy_present_shows_ok(self, monkeypatch, tmp_path):
+        """When both rg and ripgrepy are present, check_ok is emitted."""
+        rg_lines, out = self._capture_checks(
+            monkeypatch, tmp_path, rg_present=True, ripgrepy_present=True
+        )
+        assert any("ripgrep" in l.lower() and "ripgrepy" in l.lower() for l in rg_lines), \
+            f"Expected 'ripgrep + ripgrepy' in: {rg_lines}"
+        assert any("faster file search" in l for l in rg_lines)
+
+    def test_rg_present_ripgrepy_missing_shows_warn(self, monkeypatch, tmp_path):
+        """When rg is present but ripgrepy is missing, warn is emitted."""
+        rg_lines, out = self._capture_checks(
+            monkeypatch, tmp_path, rg_present=True, ripgrepy_present=False
+        )
+        assert any("ripgrepy" in l.lower() and "python wrapper missing" in l.lower()
+                   for l in rg_lines), \
+            f"Expected ripgrepy warning in: {rg_lines}"
+        assert any("pip install ripgrepy" in l.lower() for l in rg_lines)
+
+    def test_rg_missing_shows_warn_and_install_hint(self, monkeypatch, tmp_path):
+        """When rg is missing, warn is emitted with install hint."""
+        rg_lines, out = self._capture_checks(
+            monkeypatch, tmp_path, rg_present=False, ripgrepy_present=False
+        )
+        assert any("ripgrep" in l.lower() and "not found" in l.lower() for l in rg_lines), \
+            f"Expected 'ripgrep not found' in: {rg_lines}"
+        assert any("install" in l.lower() for l in rg_lines)
+
 def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path):
     """`hermes doctor` must not hand users `npm audit fix --workspace <name>`:
     that exact form crashes npm with "Cannot read properties of null (reading
@@ -1488,171 +1581,3 @@ def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path
     assert "build-time tooling" in out
     assert "known npm bug" in out
     assert "lockfile bump" in out
-
-
-class TestDoctorDeprecatedConfigAndEnv:
-    """Doctor must surface deprecated/legacy config keys and env vars with
-    modern replacements as non-failing warnings — without auto-migrating.
-    """
-
-    def test_collect_deprecated_config_keys_flags_legacy(self):
-        raw = {
-            "display": {"tool_progress_overrides": {"telegram": "all"}},
-            "delegation": {"max_async_children": 5, "max_concurrent_children": 3},
-            "compression": {"summary_model": "gpt-4o-mini", "enabled": True},
-        }
-        findings = doctor_mod.collect_deprecated_config_keys(raw)
-        paths = {legacy for legacy, _ in findings}
-        assert "display.tool_progress_overrides" in paths
-        assert "delegation.max_async_children" in paths
-        assert "compression.summary_model" in paths
-        by_key = dict(findings)
-        assert by_key["display.tool_progress_overrides"] == "display.platforms"
-        assert by_key["delegation.max_async_children"] == (
-            "delegation.max_concurrent_children"
-        )
-        assert by_key["compression.summary_model"] == "auxiliary.compression"
-
-    def test_collect_deprecated_config_keys_clean(self):
-        raw = {
-            "display": {"platforms": {"telegram": {"tool_progress": "all"}}},
-            "delegation": {"max_concurrent_children": 3},
-            "compression": {"enabled": True},
-        }
-        assert doctor_mod.collect_deprecated_config_keys(raw) == []
-
-    def test_collect_deprecated_env_vars(self):
-        env = {
-            "HERMES_TOOL_PROGRESS": "true",
-            "TERMINAL_CWD": "/tmp/proj",
-            "QQ_HOME_CHANNEL": "12345",
-            "OPENAI_API_KEY": "sk-test",  # not deprecated
-        }
-        findings = doctor_mod.collect_deprecated_env_vars(env)
-        names = {n for n, _ in findings}
-        assert "HERMES_TOOL_PROGRESS" in names
-        assert "TERMINAL_CWD" in names
-        assert "QQ_HOME_CHANNEL" in names
-        assert "OPENAI_API_KEY" not in names
-        by_name = dict(findings)
-        assert "display.tool_progress" in by_name["HERMES_TOOL_PROGRESS"]
-        assert "terminal.cwd" in by_name["TERMINAL_CWD"]
-        assert by_name["QQ_HOME_CHANNEL"] == "QQBOT_HOME_CHANNEL"
-
-    def test_collect_deprecated_env_vars_ignores_empty(self):
-        assert doctor_mod.collect_deprecated_env_vars({"TERMINAL_CWD": "  "}) == []
-        assert doctor_mod.collect_deprecated_env_vars({}) == []
-        assert doctor_mod.collect_deprecated_env_vars(None) == []
-
-    def _run_doctor_with_config(self, monkeypatch, tmp_path, *, config_yaml: str, env_text: str = ""):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir(parents=True)
-        (hermes_home / "config.yaml").write_text(config_yaml, encoding="utf-8")
-        env_body = env_text if env_text else "OPENAI_API_KEY=sk-test\n"
-        (hermes_home / ".env").write_text(env_body, encoding="utf-8")
-
-        monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
-        monkeypatch.setattr(doctor_mod, "get_hermes_home", lambda: hermes_home)
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        # Clear process-level legacy env so tests only see the on-disk .env.
-        for k in (
-            "HERMES_TOOL_PROGRESS",
-            "HERMES_TOOL_PROGRESS_MODE",
-            "TERMINAL_CWD",
-            "MESSAGING_CWD",
-            "QQ_HOME_CHANNEL",
-            "QQ_HOME_CHANNEL_NAME",
-        ):
-            monkeypatch.delenv(k, raising=False)
-
-        fake_model_tools = types.SimpleNamespace(
-            check_tool_availability=lambda *a, **kw: (_ for _ in ()).throw(SystemExit(0)),
-            TOOLSET_REQUIREMENTS={},
-        )
-        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf), pytest.raises(SystemExit):
-            doctor_mod.run_doctor(Namespace(fix=False))
-        return buf.getvalue(), hermes_home
-
-    def test_doctor_warns_on_tool_progress_overrides_and_max_async_children(
-        self, monkeypatch, tmp_path
-    ):
-        cfg = """\
-display:
-  tool_progress_overrides:
-    telegram: all
-delegation:
-  max_async_children: 8
-  max_concurrent_children: 3
-"""
-        out, hermes_home = self._run_doctor_with_config(monkeypatch, tmp_path, config_yaml=cfg)
-        assert "Deprecated: display.tool_progress_overrides" in out
-        assert "display.platforms" in out
-        assert "Deprecated: delegation.max_async_children" in out
-        assert "max_concurrent_children" in out
-        # Warn-only: must not mutate config.
-        on_disk = (hermes_home / "config.yaml").read_text(encoding="utf-8")
-        assert "tool_progress_overrides" in on_disk
-        assert "max_async_children" in on_disk
-
-    def test_doctor_warns_on_compression_summary_and_legacy_env(
-        self, monkeypatch, tmp_path
-    ):
-        cfg = """\
-compression:
-  summary_model: gpt-4o-mini
-  summary_provider: openai
-"""
-        env = (
-            "OPENAI_API_KEY=sk-test\n"
-            "HERMES_TOOL_PROGRESS=true\n"
-            "TERMINAL_CWD=/old/path\n"
-            "QQ_HOME_CHANNEL=999\n"
-        )
-        out, _ = self._run_doctor_with_config(
-            monkeypatch, tmp_path, config_yaml=cfg, env_text=env
-        )
-        assert "Deprecated: compression.summary_model" in out
-        assert "auxiliary.compression" in out
-        assert "Deprecated: HERMES_TOOL_PROGRESS" in out
-        assert "display.tool_progress" in out
-        assert "Deprecated: TERMINAL_CWD" in out
-        assert "terminal.cwd" in out
-        assert "Deprecated: QQ_HOME_CHANNEL" in out
-        assert "QQBOT_HOME_CHANNEL" in out
-
-    def test_doctor_clean_config_has_no_deprecated_warning(self, monkeypatch, tmp_path):
-        cfg = """\
-display:
-  platforms:
-    telegram:
-      tool_progress: all
-delegation:
-  max_concurrent_children: 3
-compression:
-  enabled: true
-terminal:
-  cwd: /project
-"""
-        out, _ = self._run_doctor_with_config(monkeypatch, tmp_path, config_yaml=cfg)
-        assert "Deprecated: display.tool_progress_overrides" not in out
-        assert "Deprecated: delegation.max_async_children" not in out
-        assert "Deprecated: compression.summary_model" not in out
-        assert "Deprecated: HERMES_TOOL_PROGRESS" not in out
-        assert "Deprecated: TERMINAL_CWD" not in out
-        assert "Deprecated: QQ_HOME_CHANNEL" not in out
-        assert "No deprecated config keys or env vars" in out
-
-    def test_report_does_not_count_as_blocking_issue(self, monkeypatch, tmp_path, capsys):
-        """report_deprecated_config_and_env is warn-only — no issues list mutation."""
-        findings = doctor_mod.report_deprecated_config_and_env(
-            {"delegation": {"max_async_children": 2}},
-            {"HERMES_TOOL_PROGRESS_MODE": "verbose"},
-        )
-        out = capsys.readouterr().out
-        assert len(findings) == 2
-        assert "Deprecated: delegation.max_async_children" in out
-        assert "Deprecated: HERMES_TOOL_PROGRESS_MODE" in out
-        assert "⚠" in out or "Deprecated" in out

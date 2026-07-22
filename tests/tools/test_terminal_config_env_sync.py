@@ -24,6 +24,7 @@ mirrors the pattern used in tests/hermes_cli/test_config_drift.py.
 """
 
 import ast
+import json
 import inspect
 
 
@@ -123,7 +124,7 @@ def _terminal_tool_env_var_names() -> set[str]:
     import tools.terminal_tool as tt
     source = inspect.getsource(tt)
     # Naive scan: every os.getenv("TERMINAL_X", ...) and _parse_env_var("TERMINAL_X", ...).
-    import re
+    from agent.re_compat import re
     pat = re.compile(r'["\'](TERMINAL_[A-Z0-9_]+)["\']')
     return set(pat.findall(source))
 

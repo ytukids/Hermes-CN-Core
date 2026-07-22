@@ -1,6 +1,6 @@
 """Tests for tools/skills_tool.py — skill discovery and viewing."""
 
-import json
+import orjson
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -329,7 +329,7 @@ class TestSkillsList:
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
             raw = skills_list()
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["skills"] == []
         assert skills_dir.exists()
@@ -339,7 +339,7 @@ class TestSkillsList:
             _make_skill(tmp_path, "alpha")
             _make_skill(tmp_path, "beta")
             raw = skills_list()
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["count"] == 2
 
     def test_category_filter(self, tmp_path):
@@ -347,7 +347,7 @@ class TestSkillsList:
             _make_skill(tmp_path, "skill-a", category="devops")
             _make_skill(tmp_path, "skill-b", category="mlops")
             raw = skills_list(category="devops")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["count"] == 1
         assert result["skills"][0]["name"] == "skill-a"
 
@@ -362,7 +362,7 @@ class TestSkillsList:
         with patch("tools.skills_tool.SKILLS_DIR", skills_root):
             raw = skills_list(category="linked")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["count"] == 1
         assert result["categories"] == ["linked"]
@@ -379,7 +379,7 @@ class TestSkillView:
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "my-skill")
             raw = skill_view("my-skill")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["name"] == "my-skill"
         assert "Step 1" in result["content"]
@@ -400,7 +400,7 @@ class TestSkillView:
         )
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             raw = skill_view("real-skill-name")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert "Step 1" in result["content"]
 
@@ -419,7 +419,7 @@ class TestSkillView:
             )
             raw = skill_view("templated", task_id="session-123")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert f"Run {skill_dir}/scripts/do.sh in session-123" in result["content"]
         assert "${HERMES_SKILL_DIR}" not in result["content"]
@@ -443,7 +443,7 @@ class TestSkillView:
             )
             raw = skill_view("dynamic")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert "Current date: 2026-04-24" in result["content"]
         assert "!`printf 2026-04-24`" not in result["content"]
@@ -463,7 +463,7 @@ class TestSkillView:
             )
             raw = skill_view("static")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert "Current date: !`printf SHOULD_NOT_RUN`" in result["content"]
         assert "Current date: SHOULD_NOT_RUN" not in result["content"]
@@ -472,7 +472,7 @@ class TestSkillView:
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "other-skill")
             raw = skill_view("nonexistent")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
         assert "not found" in result["error"].lower()
         assert "available_skills" in result
@@ -484,7 +484,7 @@ class TestSkillView:
             refs_dir.mkdir()
             (refs_dir / "api.md").write_text("# API Docs\nEndpoint info.")
             raw = skill_view("my-skill", file_path="references/api.md")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert "Endpoint info" in result["content"]
 
@@ -492,7 +492,7 @@ class TestSkillView:
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "my-skill")
             raw = skill_view("my-skill", file_path="references/nope.md")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
 
     def test_view_shows_linked_files(self, tmp_path):
@@ -502,7 +502,7 @@ class TestSkillView:
             refs_dir.mkdir()
             (refs_dir / "guide.md").write_text("guide content")
             raw = skill_view("my-skill")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["linked_files"] is not None
         assert "references" in result["linked_files"]
 
@@ -514,14 +514,14 @@ class TestSkillView:
                 frontmatter_extra="metadata:\n  hermes:\n    tags: [fine-tuning, llm]\n",
             )
             raw = skill_view("tagged")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert "fine-tuning" in result["tags"]
         assert "llm" in result["tags"]
 
     def test_view_nonexistent_skills_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "nope"):
             raw = skill_view("anything")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
 
     def test_view_disabled_skill_blocked(self, tmp_path):
@@ -535,7 +535,7 @@ class TestSkillView:
         ):
             _make_skill(tmp_path, "hidden-skill")
             raw = skill_view("hidden-skill")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
         assert "disabled" in result["error"].lower()
 
@@ -550,7 +550,7 @@ class TestSkillView:
         ):
             _make_skill(tmp_path, "active-skill")
             raw = skill_view("active-skill")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
 
     def test_view_finds_skill_in_symlinked_category_dir(self, tmp_path):
@@ -564,7 +564,7 @@ class TestSkillView:
         with patch("tools.skills_tool.SKILLS_DIR", skills_root):
             raw = skill_view("knowledge-brain")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["name"] == "knowledge-brain"
 
@@ -574,8 +574,8 @@ class TestSkillView:
             _make_skill(tmp_path, "alpha", category="a-cat")
             _make_skill(tmp_path, "beta", category="a-cat")
 
-            list_result = json.loads(skills_list())
-            view_result = json.loads(skill_view("missing-skill"))
+            list_result = orjson.loads(skills_list())
+            view_result = orjson.loads(skill_view("missing-skill"))
 
         assert view_result["success"] is False
         assert view_result["available_skills"] == [
@@ -625,7 +625,7 @@ class TestSkillViewSecureSetupOnLoad:
             )
             raw = skill_view("gif-search")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["name"] == "gif-search"
         assert calls == [
@@ -672,7 +672,7 @@ class TestSkillViewSecureSetupOnLoad:
             )
             raw = skill_view("gif-search")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_skipped"] is True
         assert result["content"].startswith("---")
@@ -895,7 +895,7 @@ class TestSkillViewPrerequisites:
                 frontmatter_extra="prerequisites:\n  env_vars: [MISSING_KEY_XYZ]\n",
             )
             raw = skill_view("gated-skill")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is True
         assert result["missing_required_environment_variables"] == ["MISSING_KEY_XYZ"]
@@ -915,7 +915,7 @@ class TestSkillViewPrerequisites:
                 frontmatter_extra="prerequisites:\n  env_vars: [PRESENT_KEY]\n",
             )
             raw = skill_view("ready-skill")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is False
         assert result["missing_required_environment_variables"] == []
@@ -937,7 +937,7 @@ class TestSkillViewPrerequisites:
             monkeypatch.delenv("PERSISTED_REMOTE_KEY", raising=False)
             raw = skill_view("remote-ready")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is False
         assert result["missing_required_environment_variables"] == []
@@ -947,7 +947,7 @@ class TestSkillViewPrerequisites:
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "plain-skill")
             raw = skill_view("plain-skill")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is False
         assert result["required_environment_variables"] == []
@@ -964,7 +964,7 @@ class TestSkillViewPrerequisites:
                 frontmatter_extra="prerequisites:\n  env_vars: [BACKEND_ONLY_KEY]\n",
             )
             raw = skill_view("backend-ready")
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is True
         assert result["missing_required_environment_variables"] == ["BACKEND_ONLY_KEY"]
@@ -981,7 +981,7 @@ class TestSkillViewPrerequisites:
             )
             raw = skill_view("shell-ready")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is True
         assert result["missing_required_environment_variables"] == ["SHELL_ONLY_KEY"]
@@ -1027,7 +1027,7 @@ class TestSkillViewPrerequisites:
             )
             raw = skill_view("gif-search")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert len(calls) == 1
         assert result["setup_needed"] is False
@@ -1051,7 +1051,7 @@ class TestSkillViewPrerequisites:
             monkeypatch.setattr(Path, "read_text", fake_read_text)
             raw = skill_view("broken-skill")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
         assert "Failed to read skill 'broken-skill'" in result["error"]
 
@@ -1080,7 +1080,7 @@ Do the legacy thing.
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             raw = skill_view("legacy-skill")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["name"] == "legacy-flat"
         assert result["description"] == "Legacy flat skill."
@@ -1128,7 +1128,7 @@ Do the legacy thing.
             save_env_value("TENOR_API_KEY", "")
             raw = skill_view("gif-search")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["setup_needed"] is False
         assert result["missing_required_environment_variables"] == []
@@ -1182,7 +1182,7 @@ class TestSkillViewCollisionDetection:
         with p1, p2:
             raw = skill_view("explore-codebase")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
         assert "Ambiguous skill name 'explore-codebase'" in result["error"]
         assert "matches" in result
@@ -1207,7 +1207,7 @@ class TestSkillViewCollisionDetection:
         with p1, p2:
             raw = skill_view("shared-name")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
@@ -1232,7 +1232,7 @@ class TestSkillViewCollisionDetection:
         with p1, p2:
             raw = skill_view("foundations/runtime/explore-codebase")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert "LOCAL VERSION" in result["content"]
 
@@ -1266,7 +1266,7 @@ class TestSkillViewCollisionDetection:
         with p1, p2:
             raw = skill_view("sketch")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert result["path"] == "creative/sketch/SKILL.md"
         assert "REAL SKETCH SKILL" in result["content"]
@@ -1309,13 +1309,13 @@ class TestSkillViewCollisionDetection:
 
         assert "umbrella" in names
         assert "old-skill" not in names
-        old_result = json.loads(old_raw)
+        old_result = orjson.loads(old_raw)
         assert old_result["success"] is False
         assert "not found" in old_result["error"]
-        direct_package_result = json.loads(direct_package_raw)
+        direct_package_result = orjson.loads(direct_package_raw)
         assert direct_package_result["success"] is False
         assert "not found" in direct_package_result["error"]
-        package_result = json.loads(package_raw)
+        package_result = orjson.loads(package_raw)
         assert package_result["success"] is True
         assert "OLD BODY" in package_result["content"]
 
@@ -1333,7 +1333,7 @@ class TestSkillViewCollisionDetection:
         with p1, p2:
             raw = skill_view("external-only")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert "EXTERNAL BODY" in result["content"]
 
@@ -1354,7 +1354,7 @@ class TestSkillViewCollisionDetection:
         with p1, p2:
             raw = skill_view("pr")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
@@ -1378,6 +1378,6 @@ class TestSkillViewCollisionDetection:
         with p1, p2:
             raw = skill_view("my-skill")
 
-        result = json.loads(raw)
+        result = orjson.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]

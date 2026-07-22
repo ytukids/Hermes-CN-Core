@@ -25,8 +25,7 @@ of being silently dropped.
 """
 
 from __future__ import annotations
-
-import re
+from agent.re_compat import re
 from typing import Any
 
 from providers import register_provider

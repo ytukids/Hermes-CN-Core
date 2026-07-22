@@ -6,7 +6,7 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 
 import logging
 import os
-import re
+from agent.re_compat import re
 import sys
 import threading
 import time
@@ -18,6 +18,15 @@ from typing import Any
 from utils import safe_json_loads
 from agent.redact import redact_sensitive_text
 from agent.tool_result_classification import file_mutation_result_landed
+
+
+# Hardcoded tool emoji lookup as a fallback between the skin/registry chain and
+# the generic "⚡" default.  These cover dynamically-injected context engine tools
+# (context_usage, compact) that are not registered in the static tool registry.
+_TOOL_EMOJIS: dict = {
+    "context_usage": "📊",
+    "compact": "🗜️",
+}
 
 # ANSI escape codes for coloring tool failure indicators
 _RED = "\033[31m"
@@ -150,7 +159,8 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     Resolution order:
     1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
     2. Tool registry's per-tool ``emoji`` field
-    3. *default* fallback
+    3. Hardcoded ``_TOOL_EMOJIS`` lookup (for dynamically-injected tools)
+    4. *default* fallback
     """
     # 1. Skin override
     skin = _get_skin()
@@ -166,7 +176,11 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
             return emoji
     except Exception:
         pass
-    # 3. Hardcoded fallback
+    # 3. Hardcoded lookup (context engine tools, etc.)
+    hardcoded = _TOOL_EMOJIS.get(tool_name)
+    if hardcoded:
+        return hardcoded
+    # 4. Caller-provided default
     return default
 
 
@@ -1364,7 +1378,14 @@ def _get_cute_tool_message(
             return _wrap(f"┊ 📄 fetch     {_trunc(domain, 35)}{extra}  {dur}")
         return _wrap(f"┊ 📄 fetch     pages  {dur}")
     if tool_name == "terminal":
-        return _wrap(f"┊ 💻 $         {_trunc(build_tool_preview(tool_name, args) or args.get('command', ''), 42)}  {dur}")
+        # Use the actual executed command from result (may include rtk prefix)
+        result_cmd = None
+        if result:
+            parsed = safe_json_loads(result)
+            if isinstance(parsed, dict) and parsed.get("command"):
+                result_cmd = parsed["command"]
+        display_cmd = result_cmd or args.get("command", "")
+        return _wrap(f"┊ 💻 $         {_trunc(build_tool_preview(tool_name, args) or display_cmd, 42)}  {dur}")
     if tool_name == "process":
         action = args.get("action", "?")
         sid = args.get("session_id", "")[:12]

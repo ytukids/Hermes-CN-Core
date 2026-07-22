@@ -1,5 +1,6 @@
 """Tests for tools/mcp_oauth.py — OAuth 2.1 PKCE support for MCP servers."""
 
+import orjson
 import json
 import os
 import stat
@@ -58,7 +59,7 @@ class TestHermesTokenStorage:
         # File exists with correct permissions
         token_path = tmp_path / "mcp-tokens" / "test-server.json"
         assert token_path.exists()
-        data = json.loads(token_path.read_text())
+        data = orjson.loads(token_path.read_text())
         assert data["access_token"] == "abc123"
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
@@ -196,7 +197,7 @@ class TestBuildOAuthAuth:
 
         client_path = tmp_path / "mcp-tokens" / "slack.client.json"
         assert client_path.exists()
-        data = json.loads(client_path.read_text())
+        data = orjson.loads(client_path.read_text())
         assert data["client_id"] == "my-app-id"
         assert data["client_secret"] == "my-secret"
 
@@ -235,6 +236,7 @@ class TestUtilities:
         monkeypatch.setenv("SSH_CLIENT", "1.2.3.4 1234 22")
         assert _can_open_browser() is False
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason="os.uname not available on Windows")
     def test_can_open_browser_false_without_display(self, monkeypatch):
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
@@ -768,10 +770,10 @@ class TestBuildOAuthAuthNonInteractive:
         # Pre-populate cached tokens
         d = tmp_path / "mcp-tokens"
         d.mkdir(parents=True)
-        (d / "atlassian.json").write_text(json.dumps({
+        (d / "atlassian.json").write_text(orjson.dumps({
             "access_token": "cached",
             "token_type": "Bearer",
-        }))
+        }).decode('utf-8'))
 
         import logging
         with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth"):

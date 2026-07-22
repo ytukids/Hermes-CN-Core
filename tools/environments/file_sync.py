@@ -6,8 +6,8 @@ and Daytona.  Docker and Singularity use bind mounts (live host FS
 view) and don't need this.
 """
 
-import hashlib
 import logging
+import hashlib
 import os
 import posixpath
 import shlex

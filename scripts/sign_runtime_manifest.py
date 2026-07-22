@@ -31,7 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
+import pybase64 as base64
 import datetime as _dt
 import hashlib
 import json
@@ -214,7 +214,7 @@ def main() -> int:
     manifest["signature"] = base64.standard_b64encode(signature).decode()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    args.output.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {args.output}", file=sys.stderr)
     return 0
 

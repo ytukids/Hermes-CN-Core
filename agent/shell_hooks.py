@@ -105,11 +105,11 @@ emitted by each built-in hook site.
 
 from __future__ import annotations
 
-import difflib
-import json
+import rapidfuzz.process as _fuzz_process
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import shlex
 import subprocess
 import sys
@@ -322,13 +322,13 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
         if event_name in ("output_spill",):
             continue
         if event_name not in VALID_HOOKS:
-            suggestion = difflib.get_close_matches(
-                str(event_name), VALID_HOOKS, n=1, cutoff=0.6,
+            suggestion = _fuzz_process.extract(
+                str(event_name), VALID_HOOKS, limit=1, score_cutoff=60.0,
             )
             if suggestion:
                 logger.warning(
                     "unknown hook event %r in hooks: config — did you mean %r?",
-                    event_name, suggestion[0],
+                    event_name, suggestion[0][0],
                 )
             else:
                 logger.warning(
@@ -549,7 +549,7 @@ def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
         "cwd": cwd,
         "extra": extras,
     }
-    return json.dumps(payload, ensure_ascii=False, default=str)
+    return orjson.dumps(payload, default=str).decode('utf-8')
 
 
 def _block_message(primary: Any, secondary: Any) -> str:
@@ -584,8 +584,8 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
+        data = orjson.loads(stdout)
+    except orjson.JSONDecodeError:
         logger.warning(
             "shell hook stdout was not valid JSON (event=%s): %s",
             event, stdout[:200],
@@ -632,8 +632,8 @@ def allowlist_path() -> Path:
 def load_allowlist() -> Dict[str, Any]:
     """Return the parsed allowlist, or an empty skeleton if absent."""
     try:
-        raw = json.loads(allowlist_path().read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        raw = orjson.loads(allowlist_path().read_text())
+    except (FileNotFoundError, orjson.JSONDecodeError, OSError):
         return {"approvals": []}
     if not isinstance(raw, dict):
         return {"approvals": []}
@@ -657,7 +657,7 @@ def save_allowlist(data: Dict[str, Any]) -> None:
         )
         try:
             with os.fdopen(fd, "w") as fh:
-                fh.write(json.dumps(data, indent=2, sort_keys=True))
+                fh.write(orjson.dumps(data, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode('utf-8'))
             atomic_replace(tmp_path, p)
         except Exception:
             try:

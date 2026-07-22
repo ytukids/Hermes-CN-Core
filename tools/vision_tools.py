@@ -28,10 +28,10 @@ Usage:
     )
 """
 
-import base64
+import pybase64 as base64
 import contextlib
 import asyncio
-import json
+import orjson
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
@@ -114,12 +114,12 @@ def _detect_host_cpus() -> int:
 
     Prefers ``os.sched_getaffinity`` (the CPUs this process may actually run
     on — respects container/cpuset pinning) and falls back to
-    ``os.cpu_count()``. Returns at least 1.
+    ``os.process_cpu_count()``. Returns at least 1.
     """
     try:
         return max(1, len(os.sched_getaffinity(0)))  # type: ignore[attr-defined]
     except (AttributeError, OSError):
-        return max(1, os.cpu_count() or 1)
+        return max(1, os.process_cpu_count() or 1)
 
 
 def _resolve_vision_cpu_workers() -> int:
@@ -1294,7 +1294,7 @@ async def vision_analyze_tool(
         _debug.log_call("vision_analyze_tool", debug_call_data)
         _debug.save()
         
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode('utf-8')
         
     except Exception as e:
         error_msg = f"Error analyzing image: {str(e)}"
@@ -1343,7 +1343,7 @@ async def vision_analyze_tool(
         _debug.log_call("vision_analyze_tool", debug_call_data)
         _debug.save()
         
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode('utf-8')
     
     finally:
         # Clean up temporary image file (but NOT local/cached files)
@@ -1774,7 +1774,7 @@ async def video_analyze_tool(
         _debug.log_call("video_analyze_tool", debug_call_data)
         _debug.save()
 
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode('utf-8')
 
     except Exception as e:
         error_msg = f"Error analyzing video: {str(e)}"
@@ -1823,7 +1823,7 @@ async def video_analyze_tool(
         _debug.log_call("video_analyze_tool", debug_call_data)
         _debug.save()
 
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode('utf-8')
 
     finally:
         if should_cleanup and temp_video_path and temp_video_path.exists():

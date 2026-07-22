@@ -4,13 +4,13 @@ Pure utility functions with no AIAgent dependency. Used by ContextCompressor
 and run_agent.py for pre-flight context checks.
 """
 
-import base64
-import hashlib
 import ipaddress
+import orjson
 import json
 import logging
 import os
-import re
+from agent.re_compat import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,7 +49,7 @@ def _resolve_requests_verify() -> bool | str:
 # are preserved so the full model name reaches cache lookups and server queries.
 _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
-    "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "stepfun", "minimax", "minimax-oauth", "minimax-cn", "anthropic", "deepseek", "deepinfra",
+    "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "stepfun", "minimax", "minimax-oauth", "minimax-cn", "anthropic", "deepseek",
     "opencode-zen", "opencode-go", "kilocode", "alibaba", "novita",
     "qwen-oauth",
     "xiaomi",
@@ -60,7 +60,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     # Common aliases
     "google", "google-gemini", "google-ai-studio",
     "glm", "z-ai", "z.ai", "zhipu", "github", "github-copilot",
-    "github-models", "kimi", "moonshot", "kimi-cn", "moonshot-cn", "claude", "deep-seek", "deep-infra",
+    "github-models", "kimi", "moonshot", "kimi-cn", "moonshot-cn", "claude", "deep-seek",
     "ollama",
     "stepfun", "opencode", "zen", "go", "kilo", "dashscope", "aliyun", "qwen",
     "mimo", "xiaomi-mimo",
@@ -149,7 +149,7 @@ def _load_model_metadata_disk_cache() -> Dict[str, Dict[str, Any]]:
     try:
         cache_path = _get_model_metadata_cache_path()
         with cache_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+            data = orjson.loads(f.read())
         if not isinstance(data, dict):
             return {}
         return {
@@ -204,6 +204,142 @@ MINIMUM_CONTEXT_LENGTH = 64_000
 _LOCAL_CTX_PROBE_TTL_SECONDS = 30.0
 _LOCAL_CTX_PROBE_CACHE: Dict[tuple, tuple] = {}
 
+# ---------------------------------------------------------------------------
+# Fast endpoint reachability gate
+#
+# The local-server metadata probes below (detect_local_server_type,
+# _query_local_context_length_uncached, fetch_endpoint_model_metadata) each
+# issue several HTTP GET/POST requests. When the endpoint is DOWN or the URL is
+# a placeholder (e.g. a gateway/test agent constructed against
+# ``http://localhost:9999/v1``), every one of those requests pays the full
+# per-request connect timeout. On hosts where a closed loopback port is
+# *filtered* rather than actively refused (common on Windows, and for any
+# firewalled remote box), a single ``localhost`` connect fans out to ``::1``
+# then ``127.0.0.1`` and blocks ~2s each — so one agent construction could
+# stall 30-60s on nothing. See reports/perf/root-cause-analysis.md hotspots 1-4.
+#
+# The gate does one cheap TCP connect with a short timeout BEFORE the HTTP
+# probing. If the port isn't accepting connections we skip the HTTP round
+# trips entirely and let context-length resolution fall through to cache +
+# hardcoded defaults (exactly what it would have done after the slow probes
+# failed anyway). The verdict is cached briefly, keyed by (host, port):
+#   * reachable   -> 30s TTL (server is up; don't re-probe every construction)
+#   * unreachable -> short TTL so a server that comes up moments later is still
+#     picked up quickly by the reconcile logic, while back-to-back constructions
+#     in one process (gateway per-message agents, warm re-inits) collapse to a
+#     single connect instead of N.
+# ---------------------------------------------------------------------------
+_ENDPOINT_REACHABLE_TIMEOUT_SECONDS = 0.3
+_ENDPOINT_REACHABLE_POS_TTL_SECONDS = 30.0
+_ENDPOINT_REACHABLE_NEG_TTL_SECONDS = 5.0
+_endpoint_reachable_cache: Dict[Tuple[str, int], Tuple[bool, float]] = {}
+_endpoint_reachable_lock = threading.Lock()
+
+
+def _endpoint_host_port(base_url: str) -> Optional[Tuple[str, int]]:
+    """Extract (host, port) from a base URL, defaulting the port by scheme."""
+    normalized = _normalize_base_url(base_url)
+    if not normalized:
+        return None
+    url = normalized if "://" in normalized else f"http://{normalized}"
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = parsed.hostname or ""
+    if not host:
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if (parsed.scheme or "").lower() == "https" else 80
+    return host, port
+
+
+def _probe_endpoint_reachable(base_url: str, timeout: float) -> bool:
+    """One cheap request to decide whether an endpoint accepts connections.
+
+    Returns True on ANY HTTP response (even an error status) and False only on a
+    genuine connection failure (refused / timed out / DNS failure). The probe is
+    routed through the SAME ``build_httpx_client`` the metadata probes use and
+    issues a ``HEAD`` (a verb the probes themselves never use), so:
+
+    * Unit tests that stub ``httpx.Client`` see a mock response → reachable=True
+      → the real probe logic runs against their mock exactly as before, and the
+      ``HEAD`` never collides with their ``.get``/``.post`` call assertions.
+    * A genuinely down/placeholder endpoint fails the connection → reachable=
+      False → the caller skips its multi-request probing and falls through to
+      cache/defaults instead of paying a pile of connect timeouts.
+    """
+    server_url = _normalize_base_url(base_url)
+    if not server_url:
+        return False
+    server_url = server_url.rstrip("/")
+    try:
+        import httpx
+        from agent.httpx_clients import build_httpx_client
+    except Exception:
+        # No usable HTTP stack to check with — fail open so we never suppress a
+        # probe that might otherwise have worked.
+        return True
+    try:
+        with build_httpx_client(timeout=timeout) as client:
+            client.head(server_url)
+        return True
+    except Exception as exc:  # noqa: BLE001 — classify below
+        conn_failures = (
+            getattr(httpx, "ConnectError", ()),
+            getattr(httpx, "ConnectTimeout", ()),
+            getattr(httpx, "TimeoutException", ()),
+            getattr(httpx, "NetworkError", ()),
+        )
+        conn_failures = tuple(c for c in conn_failures if isinstance(c, type))
+        if conn_failures and isinstance(exc, conn_failures):
+            return False
+        # Unexpected error (e.g. a bad URL, an unrelated bug): fail open so the
+        # gate can never REMOVE a probe that would otherwise have run.
+        return True
+
+
+def _endpoint_reachable(base_url: str, timeout: Optional[float] = None) -> bool:
+    """Fast, cached reachability check for a model endpoint.
+
+    Short-circuits the slow multi-request HTTP metadata probes when the endpoint
+    is down/unreachable, so agent construction never stalls tens of seconds on
+    connect timeouts (see reports/perf/root-cause-analysis.md hotspots 1-4). An
+    empty/unparseable URL is unreachable; verdicts are cached per (host, port)
+    — positive 30s, negative 5s — so back-to-back constructions in one process
+    (gateway per-message agents, warm re-inits) collapse to a single probe.
+    """
+    try:
+        hp = _endpoint_host_port(base_url)
+    except Exception:
+        return True
+    if hp is None:
+        return False
+    now = time.monotonic()
+    with _endpoint_reachable_lock:
+        cached = _endpoint_reachable_cache.get(hp)
+        if cached is not None:
+            reachable, ts = cached
+            ttl = _ENDPOINT_REACHABLE_POS_TTL_SECONDS if reachable else _ENDPOINT_REACHABLE_NEG_TTL_SECONDS
+            if (now - ts) < ttl:
+                return reachable
+    to = _ENDPOINT_REACHABLE_TIMEOUT_SECONDS if timeout is None else timeout
+    try:
+        reachable = _probe_endpoint_reachable(base_url, to)
+    except Exception:
+        # Never let a probe of the probe make things worse.
+        return True
+    with _endpoint_reachable_lock:
+        _endpoint_reachable_cache[hp] = (reachable, now)
+    return reachable
+
+
+def _reset_endpoint_reachable_cache() -> None:
+    """Clear the reachability cache (test hook / manual invalidation)."""
+    with _endpoint_reachable_lock:
+        _endpoint_reachable_cache.clear()
+
 # Thin fallback defaults — only broad model family patterns.
 # These fire only when provider is unknown AND models.dev/OpenRouter/Anthropic
 # all miss. Replaced the previous 80+ entry dict.
@@ -215,7 +351,6 @@ DEFAULT_CONTEXT_LENGTHS = {
     # OpenRouter-prefixed models resolve via OpenRouter live API or models.dev.
     "claude-fable-5": 1000000,
     "claude-fable": 1000000,
-    "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
     "claude-opus-4-7": 1000000,
@@ -278,10 +413,8 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Qwen — specific model families before the catch-all.
     # Official docs: https://help.aliyun.com/zh/model-studio/developer-reference/
     "qwen3.6-plus": 1048576,      # 1M context (DashScope/Alibaba & OpenRouter)
-    "qwen3.7-plus": 1048576,      # 1M context (DashScope/Alibaba)
     "qwen3-coder-plus": 1000000,  # 1M context
     "qwen3-coder": 262144,        # 256K context
-    "qwen3-max": 262144,          # 256K context (qwen3-max-2026-01-23 snapshot, Coding Plan)
     "qwen": 131072,
     # MiniMax — M3 is 1M context (max output 512K); M2.x series is 204,800.
     # Keys use substring matching (longest-first), so "minimax-m3" wins over
@@ -321,23 +454,8 @@ DEFAULT_CONTEXT_LENGTHS = {
     "grok-3": 131072,           # grok-3, grok-3-mini, grok-3-fast, grok-3-mini-fast
     "grok-2": 131072,           # grok-2, grok-2-1212, grok-2-latest
     "grok": 131072,             # catch-all (grok-beta, unknown grok-*)
-    # Kimi — K3 ships with a 1 Mi context window (1,048,576; verified against
-    # models.dev and OpenRouter live metadata, matching the endpoint-scoped
-    # override in _endpoint_scoped_context_length). Longest-key-first substring
-    # matching ensures "kimi-k3" resolves to 1M while older/unknown Kimi models
-    # still hit the generic 256K fallback.
-    "kimi-k3": 1_048_576,
+    # Kimi
     "kimi": 262144,
-    # Upstage Solar — api.upstage.ai/v1/models does not return context_length,
-    # so these fallbacks keep token budgeting / compression from probing down
-    # to the 128k default. Ids are matched longest-first, so dated variants
-    # (e.g. solar-pro3-250127) resolve via their family prefix.
-    # Sources: Solar Pro 3 = 128K, Solar Pro 2 = 64K, Solar Mini = 32K,
-    # Solar Open 2 = 256K.
-    "solar-open2": 262144,  # 256K
-    "solar-pro3": 131072,
-    "solar-pro2": 65536,
-    "solar-mini": 32768,
     # Tencent — Hy3 Preview (Hunyuan) with 256K context window.
     # OpenRouter live metadata reports 262144 (256 × 1024); align the
     # static fallback so cache and offline both agree (issue #22268).
@@ -549,47 +667,13 @@ def _is_known_provider_base_url(base_url: str) -> bool:
     return _infer_provider_from_url(base_url) is not None
 
 
-def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
-    """Return metadata confirmed only for the Kimi Coding endpoint.
-
-    Kimi Coding serves K3 under the bare slug ``k3``, but users may also
-    configure or select the public-facing aliases ``kimi-k3`` and
-    ``kimi-k3-cot``. Only canonical ``https://api.kimi.com/coding`` endpoints
-    (legacy Moonshot keys do not serve K3) get the 1 Mi context window.
-    """
-    normalized = _normalize_base_url(base_url)
-    try:
-        parsed = urlparse(normalized)
-        port = parsed.port
-    except ValueError:
-        return None
-    if (
-        parsed.scheme.lower() == "https"
-        and (parsed.hostname or "").lower() == "api.kimi.com"
-        and port in (None, 443)
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.path.rstrip("/") in {"/coding", "/coding/v1"}
-        and not parsed.query
-        and not parsed.fragment
-        and model.strip().lower() in {"k3", "kimi-k3", "kimi-k3-cot"}
-    ):
-        return 1_048_576
-    return None
-
-
 def _skip_persistent_context_cache(base_url: str, provider: str) -> bool:
     """Return True when the on-disk context cache must not short-circuit probing.
 
     LM Studio excludes caching because loaded context is transient — the user
     can reload the model with a different context_length at any time.
-
-    Codex OAuth excludes caching because its context window is account- and
-    entitlement-specific metadata supplied by the authenticated /models
-    endpoint. A fallback value written after a transient probe failure must
-    not prevent a later live probe from observing an updated allocation.
-    """
-    return (provider or "").strip().lower() in {"lmstudio", "openai-codex"}
+   """
+    return provider == "lmstudio"
 
 
 def _maybe_cache_local_context_length(
@@ -733,8 +817,12 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     calls (e.g. every 5-minute metadata refresh) never re-run the waterfall
     and never spray 404s at endpoints the server does not expose.
     """
-    import httpx
-
+    # Fast reachability gate: if the port isn't accepting connections, none of
+    # the four probes below can succeed, so skip them and avoid paying four
+    # connect timeouts for nothing (a placeholder/down endpoint would otherwise
+    # stall agent construction tens of seconds — see _endpoint_reachable).
+    if not _endpoint_reachable(base_url):
+        return None
     normalized = _normalize_base_url(base_url)
 
     # Resolve localhost to IPv4 to avoid 2s IPv6 timeout on Windows dual-stack.
@@ -755,7 +843,9 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
 
     result: Optional[str] = None
     try:
-        with httpx.Client(timeout=2.0, headers=headers) as client:
+        from agent.httpx_clients import build_httpx_client
+
+        with build_httpx_client(timeout=2.0, headers=headers) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
             try:
                 r = client.get(f"{lmstudio_url}/api/v1/models")
@@ -860,24 +950,6 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         if novita_output is not None:
             pricing["completion"] = str(float(novita_output) / 10_000 / 1_000_000)
         return pricing
-
-    # DeepInfra ships pricing under ``metadata.pricing`` with $/MTok values:
-    # ``input_tokens``, ``output_tokens``, ``cache_read_tokens``. Convert to
-    # per-token strings so the generic cost machinery (usage_pricing.py)
-    # consumes them through the same path as OpenRouter / OpenAI.
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None
-    deepinfra_pricing = metadata.get("pricing") if metadata else None
-    if isinstance(deepinfra_pricing, dict) and any(
-        k in deepinfra_pricing for k in ("input_tokens", "output_tokens", "cache_read_tokens")
-    ):
-        result: Dict[str, Any] = {}
-        if deepinfra_pricing.get("input_tokens") is not None:
-            result["prompt"] = str(float(deepinfra_pricing["input_tokens"]) / 1_000_000)
-        if deepinfra_pricing.get("output_tokens") is not None:
-            result["completion"] = str(float(deepinfra_pricing["output_tokens"]) / 1_000_000)
-        if deepinfra_pricing.get("cache_read_tokens") is not None:
-            result["cache_read"] = str(float(deepinfra_pricing["cache_read_tokens"]) / 1_000_000)
-        return result
 
     alias_map = {
         "prompt": ("prompt", "input", "input_cost_per_token", "prompt_token_cost"),
@@ -987,6 +1059,13 @@ def fetch_endpoint_model_metadata(
         cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
         if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
             return cached
+
+    # Fast reachability gate: skip the /models round trips (and, for local
+    # endpoints, the detect_local_server_type probe) when the endpoint is not
+    # accepting connections. Return empty WITHOUT caching so a server that
+    # comes up later is still discovered on the next call.
+    if not _endpoint_reachable(base_url):
+        return {}
 
     candidates = [normalized]
     if normalized.endswith("/v1"):
@@ -1508,8 +1587,6 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     This is the value that should be passed as ``num_ctx`` in Ollama chat
     requests to override the default 2048.
     """
-    import httpx
-
     bare_model = _strip_provider_prefix(model)
     server_url = _localhost_to_ipv4(base_url.rstrip("/"))
     if server_url.endswith("/v1"):
@@ -1525,7 +1602,9 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     headers = _auth_headers(api_key)
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        from agent.httpx_clients import build_httpx_client
+
+        with build_httpx_client(timeout=3.0, headers=headers) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:
                 return None
@@ -1639,6 +1718,13 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
         return cached[0]
 
+    # [CN-fork] Fast reachability gate: a single /api/show POST against a down
+    # endpoint otherwise blocks on the full 5s connect timeout (doubled for
+    # dual-stack localhost); the positive-only TTL cache above never memoizes
+    # that failure. Reachable hosts pass the cheap TCP check and probe normally.
+    if not _endpoint_reachable(base_url):
+        return None
+
     result = _query_ollama_api_show_uncached(model, base_url, api_key=api_key)
     if result:  # positive-only — never memoize a failed probe
         _LOCAL_CTX_PROBE_CACHE[cache_key] = (result, now)
@@ -1656,7 +1742,9 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
     headers = _auth_headers(api_key)
 
     try:
-        with httpx.Client(timeout=5.0, headers=headers) as client:
+        from agent.httpx_clients import build_httpx_client
+
+        with build_httpx_client(timeout=5.0, headers=headers) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": model})
             if resp.status_code != 200:
                 return None
@@ -1761,7 +1849,11 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
 
 def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "") -> Optional[int]:
     """Query a local server for the model's context length."""
-    import httpx
+
+    # Fast reachability gate — an unreachable endpoint has no context length to
+    # report, so skip the probes rather than pay their connect timeouts.
+    if not _endpoint_reachable(base_url):
+        return None
 
     # Strip recognised provider prefix (e.g., "local:model-name" → "model-name").
     # Ollama "model:tag" colons (e.g. "qwen3.5:27b") are intentionally preserved.
@@ -1781,7 +1873,9 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         server_type = None
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        from agent.httpx_clients import build_httpx_client
+
+        with build_httpx_client(timeout=3.0, headers=headers) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
                 resp = client.post(f"{server_url}/api/show", json={"name": model})
@@ -1925,72 +2019,32 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 }
 
 
-_codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
+_codex_oauth_context_cache: Dict[str, int] = {}
+_codex_oauth_context_cache_time: float = 0.0
 _CODEX_OAUTH_CONTEXT_CACHE_TTL = 3600  # 1 hour
 
 
-def _codex_oauth_token_fingerprint(access_token: str) -> str:
-    """Return a non-secret cache key for a Codex OAuth access token."""
-    return hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:16]
+def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
+    """Probe the ChatGPT Codex /models endpoint for per-slug context windows.
 
+    Codex OAuth imposes its own context limits that differ from the direct
+    OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex). The
+    `context_window` field in each model entry is the authoritative source.
 
-def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
-    """Extract ``chatgpt_account_id`` from the Codex OAuth JWT.
-
-    The Codex ``/backend-api/codex/models`` endpoint returns the per-account
-    catalog only when the ``ChatGPT-Account-Id`` header is present; without
-    it, the endpoint returns ``{"models":[]}`` (HTTP 200) and the context
-    probe falls back to the hardcoded defaults — which can be stale or
-    wrong for the active account's plan. Mirrors the same extraction done
-    in ``auxiliary_client.py`` for the request path.
-
-    Returns ``None`` on any parse error rather than raising, so a bad
-    token still surfaces as a normal probe failure instead of crashing
-    the metadata resolver.
+    Returns a ``{slug: context_window}`` dict. Empty on failure.
     """
-    try:
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return None
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-        if not isinstance(claims, dict):
-            return None
-        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-        return acct_id if isinstance(acct_id, str) and acct_id else None
-    except Exception:
-        return None
-
-
-def _fetch_codex_oauth_context_lengths_with_source(
-    access_token: str,
-) -> Tuple[Dict[str, int], bool]:
-    """Fetch Codex catalogue data and report whether it came from HTTP.
-
-    The in-process cache is scoped by token fingerprint because Codex model
-    availability and context windows can vary by account entitlement. The raw
-    token is never retained in the cache key. The boolean is false for a
-    same-token in-process hit, which must not be treated as a fresh provider
-    confirmation when deciding whether to update persistent state.
-    """
-    global _codex_oauth_context_cache
+    global _codex_oauth_context_cache, _codex_oauth_context_cache_time
     now = time.time()
-    cache_key = _codex_oauth_token_fingerprint(access_token)
-    cached = _codex_oauth_context_cache.get(cache_key)
-    if cached is not None:
-        cached_models, cached_at = cached
-        if now - cached_at < _CODEX_OAUTH_CONTEXT_CACHE_TTL:
-            return cached_models, False
-
-    headers = {"Authorization": f"Bearer {access_token}"}
-    acct_id = _extract_chatgpt_account_id(access_token)
-    if acct_id:
-        headers["ChatGPT-Account-Id"] = acct_id
+    if (
+        _codex_oauth_context_cache
+        and now - _codex_oauth_context_cache_time < _CODEX_OAUTH_CONTEXT_CACHE_TTL
+    ):
+        return _codex_oauth_context_cache
 
     try:
         resp = requests.get(
             "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
-            headers=headers,
+            headers={"Authorization": f"Bearer {access_token}"},
             timeout=(5, 10),
             verify=_resolve_requests_verify(),
         )
@@ -1999,11 +2053,11 @@ def _fetch_codex_oauth_context_lengths_with_source(
                 "Codex /models probe returned HTTP %s; falling back to hardcoded defaults",
                 resp.status_code,
             )
-            return {}, False
+            return {}
         data = resp.json()
     except Exception as exc:
         logger.debug("Codex /models probe failed: %s", exc)
-        return {}, False
+        return {}
 
     entries = data.get("models", []) if isinstance(data, dict) else []
     result: Dict[str, int] = {}
@@ -2016,50 +2070,32 @@ def _fetch_codex_oauth_context_lengths_with_source(
             result[slug.strip()] = ctx
 
     if result:
-        _codex_oauth_context_cache[cache_key] = (result, now)
-    return result, True
-
-
-def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
-    """Probe the ChatGPT Codex /models endpoint for per-slug context windows.
-
-    Codex OAuth imposes its own context limits that differ from the direct
-    OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex). The
-    `context_window` field in each model entry is the authoritative source.
-
-    Returns a ``{slug: context_window}`` dict. Empty on failure.
-    """
-    result, _fresh = _fetch_codex_oauth_context_lengths_with_source(access_token)
+        _codex_oauth_context_cache = result
+        _codex_oauth_context_cache_time = now
     return result
 
 
-def _resolve_codex_oauth_context_length_with_source(
+def _resolve_codex_oauth_context_length(
     model: str, access_token: str = ""
-) -> Tuple[Optional[int], str]:
+) -> Optional[int]:
     """Resolve a Codex OAuth model's real context window.
 
     Prefers a live probe of chatgpt.com/backend-api/codex/models (when we
     have a bearer token), then falls back to ``_CODEX_OAUTH_CONTEXT_FALLBACK``.
-
-    Returns ``(context_length, source)`` where source is ``"live"`` for a
-    value returned by a fresh authenticated endpoint probe, ``"memory"`` for
-    a same-token in-process catalogue hit, or ``"fallback"`` for the static
-    conservative table. Only ``"live"`` is eligible for persistent writes.
     """
     model_bare = _strip_provider_prefix(model).strip()
     if not model_bare:
-        return None, ""
+        return None
 
     if access_token:
-        live, fresh_probe = _fetch_codex_oauth_context_lengths_with_source(access_token)
-        live_source = "live" if fresh_probe else "memory"
+        live = _fetch_codex_oauth_context_lengths(access_token)
         if model_bare in live:
-            return live[model_bare], live_source
+            return live[model_bare]
         # Case-insensitive match in case casing drifts
         model_lower = model_bare.lower()
         for slug, ctx in live.items():
             if slug.lower() == model_lower:
-                return ctx, live_source
+                return ctx
 
     # Fallback: longest-key-first substring match over hardcoded defaults.
     model_lower = model_bare.lower()
@@ -2067,19 +2103,9 @@ def _resolve_codex_oauth_context_length_with_source(
         _CODEX_OAUTH_CONTEXT_FALLBACK.items(), key=lambda x: len(x[0]), reverse=True
     ):
         if slug in model_lower:
-            return ctx, "fallback"
+            return ctx
 
-    return None, ""
-
-
-def _resolve_codex_oauth_context_length(
-    model: str, access_token: str = ""
-) -> Optional[int]:
-    """Resolve a Codex OAuth model's context length (compatibility wrapper)."""
-    context_length, _source = _resolve_codex_oauth_context_length_with_source(
-        model, access_token=access_token,
-    )
-    return context_length
+    return None
 
 
 def _resolve_nous_context_length(
@@ -2163,15 +2189,20 @@ def get_model_context_length(
     config_context_length: int | None = None,
     provider: str = "",
     custom_providers: list | None = None,
+    allow_network: bool = True,
 ) -> int:
     """Get the context length for a model.
 
+    ``allow_network=False`` skips the foreign metadata services (models.dev and
+    the OpenRouter live API) so display/hot paths like ``/api/model/info`` never
+    block on them; resolution falls through to cache + hardcoded defaults. The
+    local/own-provider endpoint probes are unaffected. See P-028.
+
     Resolution order:
     0. Explicit config override (model.context_length or custom_providers per-model)
-    0c. Endpoint-scoped metadata for models validated on one multiplexed endpoint
-    1. Persistent cache (previously discovered via probing).  Nous URLs,
-       LM Studio, and Codex OAuth bypass the cache here so their provider
-       metadata can be reconciled against the authoritative live source.
+    1. Persistent cache (previously discovered via probing).  Nous URLs
+       bypass the cache here so step 5b can always reconcile against
+       the authoritative portal /v1/models response.
     1b. AWS Bedrock static table (must precede custom-endpoint probe)
     2. Active endpoint metadata (/models for explicit custom endpoints)
     3. Local server query (for local endpoints)
@@ -2238,46 +2269,33 @@ def get_model_context_length(
         except Exception:
             pass  # fall through to probing
 
-    # Malformed user-provided URLs (for example an unmatched IPv6 bracket)
-    # make urllib.parse raise. Context resolution should treat those as an
-    # unknown endpoint rather than crashing before the inference layer can
-    # report the configuration error itself.
-    if base_url:
-        try:
-            parsed_base_url = urlparse(_normalize_base_url(base_url))
-            _ = parsed_base_url.port
-        except ValueError:
-            base_url = ""
-
     # Normalise provider-prefixed model names (e.g. "local:model-name" →
     # "model-name") so cache lookups and server queries use the bare ID that
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
 
-    # Endpoint-scoped provider metadata. Keep this ahead of the persistent
-    # cache so a value learned for a multiplexed provider's other endpoint
-    # cannot override the endpoint where the model was actually validated.
-    endpoint_context = _endpoint_scoped_context_length(model, base_url)
-    if endpoint_context is not None:
-        return endpoint_context
-
-    is_bedrock_context = provider == "bedrock" or (
-        base_url
-        and base_url_hostname(base_url).startswith("bedrock-runtime.")
-        and base_url_host_matches(base_url, "amazonaws.com")
-    )
-
     # 1. Check persistent cache (model+provider)
     # LM Studio is excluded — its loaded context length is transient (the
     # user can reload the model with a different context_length at any time
     # via /api/v1/models/load), so a stale cached value would mask reloads.
-    # Codex OAuth is excluded because the authenticated /models catalogue is
-    # account-specific and a fallback must never suppress later revalidation.
     if base_url and not _skip_persistent_context_cache(base_url, provider):
         cached = get_cached_context_length(model, base_url)
         if cached is not None:
+            # Invalidate stale Codex OAuth cache entries: pre-PR #14935 builds
+            # resolved gpt-5.x to the direct-API value (e.g. 1.05M) via
+            # models.dev and persisted it. Codex OAuth caps at 272K for every
+            # slug, so any cached Codex entry at or above 400K is a leftover
+            # from the old resolution path. Drop it and fall through to the
+            # live /models probe in step 5 below.
+            if provider == "openai-codex" and cached >= 400_000:
+                logger.info(
+                    "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
+                    "re-resolving via live /models probe",
+                    model, base_url, f"{cached:,}",
+                )
+                _invalidate_cached_context_length(model, base_url)
             # Invalidate stale 32k cache entries for Kimi-family models.
-            if cached <= 32768 and _model_name_suggests_kimi(model):
+            elif cached <= 32768 and _model_name_suggests_kimi(model):
                 logger.info(
                     "Dropping stale Kimi cache entry %s@%s -> %s (OpenRouter underreport); "
                     "re-resolving via hardcoded defaults",
@@ -2324,30 +2342,6 @@ def get_model_context_length(
                     model, base_url,
                 )
                 # Fall through; step 5b reconciles and overwrites if portal responds.
-            # Invalidate stale Bedrock entries seeded before the Claude 4.6+
-            # long-context table was corrected to 1M. The static table is a
-            # FLOOR, not an override: probe-derived cache entries (step 1b)
-            # may legitimately exceed the table (real window read from
-            # Bedrock's length-validation error), so only under-reporting
-            # entries are dropped — never a cached value above the table.
-            elif is_bedrock_context:
-                try:
-                    from agent.bedrock_adapter import get_bedrock_context_length
-                    bedrock_ctx = get_bedrock_context_length(model)
-                    if cached < bedrock_ctx:
-                        logger.info(
-                            "Dropping stale Bedrock cache entry %s@%s -> %s; "
-                            "using static Bedrock table value %s",
-                            model,
-                            base_url,
-                            f"{cached:,}",
-                            f"{bedrock_ctx:,}",
-                        )
-                        _invalidate_cached_context_length(model, base_url)
-                        return bedrock_ctx
-                except ImportError:
-                    pass
-                return cached
             else:
                 if is_local_endpoint(base_url):
                     return _reconcile_local_cached_context_length(
@@ -2358,50 +2352,22 @@ def get_model_context_length(
     # 1b. AWS Bedrock — use static context length table.
     # Bedrock's ListFoundationModels API doesn't expose context window sizes,
     # so we maintain a curated table in bedrock_adapter.py that reflects
-    # Bedrock-hosted model limits (e.g. older Claude 4 at 200K; Claude
-    # Opus/Sonnet 4.6+ at 1M).  This must run BEFORE the custom-endpoint probe at
+    # AWS-imposed limits (e.g. 200K for Claude models vs 1M on the native
+    # Anthropic API).  This must run BEFORE the custom-endpoint probe at
     # step 2 — bedrock-runtime.<region>.amazonaws.com is not in
     # _URL_TO_PROVIDER, so it would otherwise be treated as a custom endpoint,
     # fail the /models probe (Bedrock doesn't expose that shape), and fall
     # back to the 128K default before reaching the original step 4b branch.
-    if is_bedrock_context:
+    if provider == "bedrock" or (
+        base_url
+        and base_url_hostname(base_url).startswith("bedrock-runtime.")
+        and base_url_host_matches(base_url, "amazonaws.com")
+    ):
         try:
-            from agent.bedrock_adapter import (
-                get_bedrock_context_length,
-                resolve_bedrock_region,
-            )
+            from agent.bedrock_adapter import get_bedrock_context_length
+            return get_bedrock_context_length(model)
         except ImportError:
             pass  # boto3 not installed — fall through to generic resolution
-        else:
-            # Bedrock does not expose the context window via any metadata API,
-            # so get_bedrock_context_length() probes the live endpoint (one
-            # fast, pre-inference length rejection) to read the real window.
-            # Cache the probe result per model so we pay that cost once, not
-            # every turn — keyed by base_url when present, else a synthetic
-            # bedrock:// key so display/offline paths share the entry.
-            cache_key_url = base_url or "bedrock://"
-            cached = get_cached_context_length(model, cache_key_url)
-            if cached is not None:
-                return cached
-            # Resolve region from the base_url host first, then the standard
-            # AWS region chain.  An empty region disables probing (table only).
-            region = ""
-            if base_url:
-                _m = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url)
-                if _m:
-                    region = _m.group(1)
-            if not region:
-                try:
-                    region = resolve_bedrock_region()
-                except Exception:
-                    region = ""
-            ctx = get_bedrock_context_length(model, region=region, probe=bool(region))
-            if ctx and region:
-                # Only persist probe-derived values (region present); a pure
-                # table fallback shouldn't poison the cache against a later
-                # successful probe.
-                save_context_length(model, cache_key_url, ctx)
-            return ctx
 
     if provider == "novita" or (base_url and base_url_host_matches(base_url, "api.novita.ai")):
         ctx = _resolve_endpoint_context_length(model, base_url or "https://api.novita.ai/openai/v1", api_key=api_key)
@@ -2516,14 +2482,9 @@ def get_model_context_length(
         # Codex OAuth enforces lower context limits than the direct OpenAI
         # API for the same slug (e.g. gpt-5.5 is 1.05M on the API but 272K
         # on Codex). Authoritative source is Codex's own /models endpoint.
-        codex_ctx, codex_source = _resolve_codex_oauth_context_length_with_source(
-            model, access_token=api_key or "",
-        )
+        codex_ctx = _resolve_codex_oauth_context_length(model, access_token=api_key or "")
         if codex_ctx:
-            # Only a successful authenticated catalogue response is safe to
-            # persist. The static fallback is deliberately runtime-only so a
-            # transient OAuth/network failure cannot poison future probes.
-            if base_url and codex_source == "live":
+            if base_url:
                 save_context_length(model, base_url, codex_ctx)
             return codex_ctx
     if effective_provider == "gmi" and base_url:
@@ -2565,7 +2526,7 @@ def get_model_context_length(
     # effective_provider`), so a fresh slug like claude-fable-5 fell through to
     # the generic "claude": 200K entry and under-reported a 1M window. Mirrors
     # the dedicated Nous/Copilot/GMI branches above.
-    if effective_provider == "openrouter":
+    if allow_network and effective_provider == "openrouter":
         metadata = fetch_model_metadata()
         entry = metadata.get(model)
         if entry:
@@ -2579,7 +2540,9 @@ def get_model_context_length(
 
     if effective_provider:
         from agent.models_dev import lookup_models_dev_context
-        ctx = lookup_models_dev_context(effective_provider, model)
+        ctx = lookup_models_dev_context(
+            effective_provider, model, allow_network=allow_network
+        )
         if ctx:
             # MiniMax M3: models.dev reports 512K but actual context is 1M.
             # Prefer hardcoded catalog over stale probe value.
@@ -2598,7 +2561,7 @@ def get_model_context_length(
     # Only consulted when the provider is unknown (no effective_provider),
     # because OpenRouter data is community-maintained and can be incorrect
     # for models that belong to known providers with curated defaults.
-    if not effective_provider:
+    if allow_network and not effective_provider:
         metadata = fetch_model_metadata()
         if model in metadata:
             or_ctx = metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
@@ -2678,15 +2641,31 @@ def estimate_tokens_rough(text: str) -> int:
     return (len(text) + 3) // 4
 
 
-def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
+# Flat per-image token cost (Anthropic pricing model). Counting a base64
+# screenshot by raw character length would estimate a ~1MB image at ~250K
+# tokens and trigger premature context compression; a flat cost avoids that.
+_IMAGE_TOKEN_COST = 1500
+
+
+def estimate_messages_tokens_rough(
+    messages: List[Dict[str, Any]],
+    estimator: "Optional[IncrementalTokenEstimator]" = None,
+) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
     Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
     image — the Anthropic pricing model — instead of counting raw base64
     character length. Without this, a single ~1MB screenshot would be
     estimated at ~250K tokens and trigger premature context compression.
+
+    Pass an :class:`IncrementalTokenEstimator` as ``estimator`` to reuse
+    per-message work across calls over an append-mostly conversation: the
+    estimate is then O(new messages) instead of O(all messages), and the
+    returned value is byte-for-byte identical to the stateless path (character
+    counts are summed *before* the single ceiling-division, exactly as here).
     """
-    _IMAGE_TOKEN_COST = 1500
+    if estimator is not None:
+        return estimator.estimate(messages)
     total_chars = 0
     image_tokens = 0
     for msg in messages:
@@ -2729,6 +2708,20 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     """
     if not isinstance(msg, dict):
         return len(str(msg))
+    # Fast path: the shadow dict only ever differs from ``msg`` when a base64
+    # image needs stripping — i.e. when ``_anthropic_content_blocks`` is present
+    # or ``content`` is a list / a ``_multimodal`` dict. In every other case
+    # (scalar/str content, no stashed blocks) the shadow is a shallow copy of
+    # ``msg`` with identical key order, so ``str(shadow) == str(msg)``. Skip the
+    # per-key rebuild and stringify ``msg`` directly — identical result, one
+    # fewer dict allocation per message on the hot pre-flight path.
+    content = msg.get("content")
+    if (
+        "_anthropic_content_blocks" not in msg
+        and not isinstance(content, list)
+        and not (isinstance(content, dict) and content.get("_multimodal"))
+    ):
+        return len(str(msg))
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
         if k == "_anthropic_content_blocks":
@@ -2754,11 +2747,71 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     return len(str(shadow))
 
 
+class IncrementalTokenEstimator:
+    """O(delta) rough token estimator for an append-mostly message list.
+
+    ``estimate_messages_tokens_rough`` re-stringifies every message on every
+    call.  On a long-lived conversation the per-turn pre-flight gate re-scans
+    the whole history even though only the last couple of messages are new —
+    an O(n) pass per turn, O(n²) across a session.
+
+    This estimator memoises each message's ``(chars, image_tokens)``
+    contribution keyed on the message object's identity, so re-estimating a
+    conversation that grew by a few messages only pays for the new ones.  A
+    strong reference to each still-present message is kept alongside its cached
+    contribution: it pins ``id()`` (guarding against identity reuse after GC)
+    and is revalidated with an ``is`` check on every hit.  Entries for messages
+    that dropped out of the list are discarded each call, so the cache tracks
+    the live conversation and never grows unbounded.
+
+    The result is byte-for-byte identical to the stateless function: character
+    counts are summed *before* the single ceiling-division, the same rounding
+    the stateless path uses.  It is intended only for the *rough* pre-flight
+    estimate — if a cached message is mutated in place the estimate drifts by a
+    handful of characters, which is immaterial to a ~4-chars/token gate.
+    """
+
+    __slots__ = ("_cache",)
+
+    def __init__(self) -> None:
+        # id(msg) -> (msg, chars, image_tokens)
+        self._cache: Dict[int, Any] = {}
+
+    def estimate(self, messages: List[Dict[str, Any]]) -> int:
+        """Return the rough token estimate for ``messages`` (cache-accelerated)."""
+        if not messages:
+            self._cache = {}
+            return 0
+        cache = self._cache
+        fresh: Dict[int, Any] = {}
+        total_chars = 0
+        image_tokens = 0
+        for msg in messages:
+            key = id(msg)
+            entry = cache.get(key)
+            if entry is not None and entry[0] is msg:
+                chars = entry[1]
+                imgs = entry[2]
+            else:
+                chars = _estimate_message_chars(msg)
+                imgs = _count_image_tokens(msg, _IMAGE_TOKEN_COST)
+            fresh[key] = (msg, chars, imgs)
+            total_chars += chars
+            image_tokens += imgs
+        self._cache = fresh
+        return ((total_chars + 3) // 4) + image_tokens
+
+    def invalidate(self) -> None:
+        """Drop all cached contributions (e.g. after a full history rebuild)."""
+        self._cache = {}
+
+
 def estimate_request_tokens_rough(
     messages: List[Dict[str, Any]],
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    estimator: "Optional[IncrementalTokenEstimator]" = None,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -2772,7 +2825,7 @@ def estimate_request_tokens_rough(
     if system_prompt:
         total += (len(system_prompt) + 3) // 4
     if messages:
-        total += estimate_messages_tokens_rough(messages)
+        total += estimate_messages_tokens_rough(messages, estimator=estimator)
     if tools:
         total += _estimate_tools_tokens_rough(tools)
     return total

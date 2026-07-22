@@ -2,6 +2,7 @@
 
 import base64
 import json
+import orjson
 import logging
 import os
 from pathlib import Path
@@ -180,7 +181,7 @@ class TestHandleVisionAnalyze:
         with patch(
             "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
         ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
+            mock_tool.return_value = orjson.dumps({"result": "ok"}).decode('utf-8')
             result = _handle_vision_analyze(
                 {
                     "image_url": "https://example.com/img.png",
@@ -204,7 +205,7 @@ class TestHandleVisionAnalyze:
                 return_value=False,
             ),
         ):
-            mock_tool.return_value = json.dumps({"result": "ok"})
+            mock_tool.return_value = orjson.dumps({"result": "ok"}).decode('utf-8')
             await _handle_vision_analyze(
                 {
                     "image_url": "https://example.com/img.png",
@@ -229,7 +230,7 @@ class TestHandleVisionAnalyze:
             ),
             patch.dict(os.environ, {"AUXILIARY_VISION_MODEL": "custom/model-v1"}),
         ):
-            mock_tool.return_value = json.dumps({"result": "ok"})
+            mock_tool.return_value = orjson.dumps({"result": "ok"}).decode('utf-8')
             await _handle_vision_analyze(
                 {"image_url": "https://example.com/img.png", "question": "test"}
             )
@@ -252,7 +253,7 @@ class TestHandleVisionAnalyze:
         ):
             # Ensure AUXILIARY_VISION_MODEL is not set
             os.environ.pop("AUXILIARY_VISION_MODEL", None)
-            mock_tool.return_value = json.dumps({"result": "ok"})
+            mock_tool.return_value = orjson.dumps({"result": "ok"}).decode('utf-8')
             await _handle_vision_analyze(
                 {"image_url": "https://example.com/img.png", "question": "test"}
             )
@@ -317,7 +318,7 @@ class TestHandleVisionAnalyze:
         with patch(
             "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
         ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
+            mock_tool.return_value = orjson.dumps({"result": "ok"}).decode('utf-8')
             result = _handle_vision_analyze({})
             assert isinstance(result, Awaitable)
             result.close()
@@ -372,7 +373,7 @@ class TestErrorLoggingExcInfo:
             result = await vision_analyze_tool(
                 "https://example.com/img.jpg", "describe this", "test/model"
             )
-            result_data = json.loads(result)
+            result_data = orjson.loads(result)
             # Error response uses "success": False, not an "error" key
             assert result_data["success"] is False
 
@@ -446,7 +447,7 @@ class TestVisionConfig:
                 return_value=mock_response,
             ) as mock_llm,
         ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
+            result = orjson.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
 
         assert result["success"] is True
         assert mock_llm.await_args.kwargs["temperature"] == 1.0
@@ -474,7 +475,7 @@ class TestVisionConfig:
                 return_value=mock_response,
             ) as mock_llm,
         ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
+            result = orjson.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
 
         assert result["success"] is True
         assert mock_llm.await_args.kwargs["temperature"] == 0.1
@@ -488,7 +489,7 @@ class TestVisionSafetyGuards:
         secret.write_text("TOP-SECRET=1\n", encoding="utf-8")
 
         with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
-            result = json.loads(await vision_analyze_tool(str(secret), "extract text"))
+            result = orjson.loads(await vision_analyze_tool(str(secret), "extract text"))
 
         assert result["success"] is False
         # The unified resolver's magic-byte sniff rejects non-images.
@@ -541,7 +542,7 @@ class TestVisionSafetyGuards:
             patch("tools.url_safety.is_safe_url", return_value=True),
             patch("tools.vision_tools._download_image", new_callable=AsyncMock) as mock_download,
         ):
-            result = json.loads(await vision_analyze_tool("https://blocked.test/cat.png", "describe"))
+            result = orjson.loads(await vision_analyze_tool("https://blocked.test/cat.png", "describe"))
 
         assert result["success"] is False
         assert "Blocked by website policy" in result["error"]
@@ -659,7 +660,7 @@ class TestTildeExpansion:
             result = await vision_analyze_tool(
                 "~/test_image.png", "describe this", "test/model"
             )
-            data = json.loads(result)
+            data = orjson.loads(result)
             assert data["success"] is True
             assert data["analysis"] == "A test image"
 
@@ -674,7 +675,7 @@ class TestTildeExpansion:
         result = await vision_analyze_tool(
             "~/nonexistent.png", "describe this", "test/model"
         )
-        data = json.loads(result)
+        data = orjson.loads(result)
         assert data["success"] is False
 
 
@@ -711,7 +712,7 @@ class TestFileUriSupport:
             result = await vision_analyze_tool(
                 f"file://{img}", "describe this", "test/model"
             )
-            data = json.loads(result)
+            data = orjson.loads(result)
             assert data["success"] is True
 
     @pytest.mark.asyncio
@@ -720,7 +721,7 @@ class TestFileUriSupport:
         result = await vision_analyze_tool(
             f"file://{tmp_path}/nonexistent.png", "describe this", "test/model"
         )
-        data = json.loads(result)
+        data = orjson.loads(result)
         assert data["success"] is False
 
 
@@ -741,7 +742,7 @@ class TestBase64SizeLimit:
         # Patch the hard limit to a small value so the test runs fast.
         with patch("tools.vision_tools._MAX_BASE64_BYTES", 1000), \
              patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
-            result = json.loads(await vision_analyze_tool(str(img), "describe this"))
+            result = orjson.loads(await vision_analyze_tool(str(img), "describe this"))
 
         assert result["success"] is False
         assert "too large" in result["error"].lower()
@@ -765,7 +766,7 @@ class TestBase64SizeLimit:
                 return_value=mock_response,
             ),
         ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
+            result = orjson.loads(await vision_analyze_tool(str(img), "describe this", "test/model"))
 
         assert result["success"] is True
 
@@ -800,7 +801,7 @@ class TestErrorClassification:
                 side_effect=api_error,
             ),
         ):
-            result = json.loads(await vision_analyze_tool(str(img), "describe", "test/model"))
+            result = orjson.loads(await vision_analyze_tool(str(img), "describe", "test/model"))
 
         assert result["success"] is False
         assert "rejected the image" in result["analysis"].lower()
@@ -924,7 +925,7 @@ class TestResizeImageForVision:
                                            max_base64_bytes=50_000)
         assert result.startswith("data:image/")
         # Decode and check aspect ratio is roughly preserved
-        import base64
+        import pybase64 as base64
         header, b64data = result.split(",", 1)
         raw = base64.b64decode(b64data)
         from io import BytesIO
@@ -953,7 +954,7 @@ class TestResizeImageForVision:
         result = _resize_image_for_vision(path, mime_type="image/png",
                                            max_base64_bytes=50_000)
         assert result.startswith("data:image/")
-        import base64
+        import pybase64 as base64
         from io import BytesIO
         header, b64data = result.split(",", 1)
         raw = base64.b64decode(b64data)
@@ -1293,7 +1294,7 @@ class TestVisionCpuBurstCap:
                 await asyncio.sleep(0.02)
             finally:
                 calls_inflight -= 1
-            return json.dumps({"ok": True})
+            return orjson.dumps({"ok": True}).decode('utf-8')
 
         with (
             patch.object(vt, "_vision_cpu_executor",

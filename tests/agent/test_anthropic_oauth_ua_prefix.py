@@ -14,8 +14,7 @@ Two DIFFERENT Anthropic endpoints impose OPPOSITE User-Agent requirements:
 """
 
 from __future__ import annotations
-
-import re
+from agent.re_compat import re
 from unittest.mock import MagicMock, patch
 
 import pytest

@@ -1160,17 +1160,6 @@ export interface Translations {
     failedUpdate: (name: string) => string
     failedSave: (name: string) => string
     failedClear: (key: string) => string
-    conflictTitle: string
-    conflictServiceBody: string
-    conflictPortBody: string
-    conflictHelpService: string[]
-    conflictHelpPort: string[]
-    conflictTakeoverUnavailable: string
-    forceTakeover: string
-    takingOver: string
-    howToStopOthers: string
-    takeoverStarted: string
-    takeoverFailed: string
     fieldCopy: Record<string, { label?: string; help?: string; placeholder?: string }>
     platformIntro: Record<string, string>
   }
