@@ -40,24 +40,21 @@ from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
 def _sign(secret: bytes, sub: str, kind: str, ttl: int) -> str:
-    import base64
+    import pybase64 as base64
     import hashlib
     import hmac
-    import json
+    import orjson
 
-    raw = json.dumps(
-        {"sub": sub, "kind": kind, "exp": int(time.time()) + ttl},
-        separators=(",", ":"),
-    ).encode()
+    raw = orjson.dumps({"sub": sub, "kind": kind, "exp": int(time.time()) + ttl}).decode('utf-8').encode()
     sig = hmac.new(secret, raw, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(raw + sig).decode()
 
 
 def _unsign(secret: bytes, token: str):
-    import base64
+    import pybase64 as base64
     import hashlib
     import hmac
-    import json
+    import orjson
 
     try:
         blob = base64.urlsafe_b64decode(token.encode())
@@ -66,7 +63,7 @@ def _unsign(secret: bytes, token: str):
             sig, hmac.new(secret, raw, hashlib.sha256).digest()
         ):
             return None
-        return json.loads(raw)
+        return orjson.loads(raw)
     except Exception:
         return None
 
@@ -197,6 +194,24 @@ class TestProviderListFlag:
         assert resp.status_code == 200
         prov = {p["name"]: p for p in resp.json()["providers"]}
         assert prov["testpw"]["supports_password"] is True
+
+    def test_password_provider_html_redirects_to_login_form(self, gated_app):
+        resp = gated_app.get("/", follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/login?next=%2F"
+
+        login = gated_app.get(resp.headers["location"])
+        assert login.status_code == 200
+        assert '<form class="provider-form" data-provider="testpw"' in login.text
+        assert "/auth/password-login" in login.text
+
+    def test_password_provider_auth_login_redirects_to_login_form(self, gated_app):
+        resp = gated_app.get(
+            "/auth/login?provider=testpw&next=%2F",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/login?next=%2F"
 
     def test_oauth_provider_reports_false(self):
         clear_providers()

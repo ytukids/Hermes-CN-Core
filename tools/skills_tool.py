@@ -66,12 +66,13 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
-import json
+import orjson
 import logging
+import time
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
-import re
+from agent.re_compat import re
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -86,12 +87,76 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Per-session skill discovery cache.  _find_all_skills() re-reads every
+# SKILL.md on every call; with hundreds of skills this is wasteful.
+# Cache validation (mirrors hermes_cli/profiles.py::_count_skills, d5eee133e):
+#   - signature = per-dir max mtime of the dir AND its immediate children
+#     (one scandir per dir; catches skill add/remove inside categories,
+#     which does NOT bump the root dir's mtime), plus the disabled-set
+#     (config-driven — changes with no filesystem mtime bump at all)
+#   - a short TTL bounds staleness from in-place SKILL.md edits, which
+#     bump only the file's mtime, invisible to any directory signature.
+# skip_disabled True/False are cached separately.
+_SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_list)}
+_SKILLS_CACHE_TTL_SECONDS = 30.0
+_SKILLS_CACHE_KEY_DISABLED = "with_disabled"
+_SKILLS_CACHE_KEY_FILTERED = "filtered"
+
+
+def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+    """Cheap change-signature for the skill scan inputs.
+
+    O(#dirs + #categories) stat calls, not a recursive walk. Includes the
+    platform the scan's ``skill_matches_platform`` filter will use (read
+    from ``agent.skill_utils``'s ``sys`` so test patches of that module
+    are honored) — the scan result is platform-dependent.
+    """
+    from agent import skill_utils as _skill_utils
+
+    platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
+    sig = []
+    for d in dirs_to_scan:
+        try:
+            m = d.stat().st_mtime
+        except OSError:
+            continue
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            em = entry.stat(follow_symlinks=False).st_mtime
+                            if em > m:
+                                m = em
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        sig.append((str(d), m))
+    return (tuple(sig), frozenset(disabled), platform)
+
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
 # This is the single source of truth -- agent edits, hub installs, and bundled
 # skills all coexist here without polluting the git repo.
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
+_SKILLS_DIR_AT_IMPORT = SKILLS_DIR
+
+
+def _skills_dir() -> Path:
+    """Return the active profile's skills directory at call time.
+
+    Some long-lived runtimes import this module before the active profile has
+    set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
+    external patchers, but when it has not been patched, resolve from the live
+    profile-scoped HERMES_HOME on every call.
+    """
+    configured = Path(SKILLS_DIR)
+    if configured != _SKILLS_DIR_AT_IMPORT:
+        return configured
+    return get_hermes_home() / "skills"
+
 
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
@@ -149,6 +214,8 @@ def load_env() -> Dict[str, str]:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
+                if line.startswith("export "):
+                    line = line[7:]
                 key, _, value = line.partition("=")
                 env_vars[key.strip()] = value.strip().strip("\"'")
     return env_vars
@@ -499,9 +566,9 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
     Also works for external skill dirs configured via skills.external_dirs.
     """
-    # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
+    # Try the active profile skills dir first (respects monkeypatching in tests),
     # then fall back to external dirs from config.
-    dirs_to_check = [SKILLS_DIR]
+    dirs_to_check = [_skills_dir()]
     try:
         from agent.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
@@ -620,26 +687,55 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     Returns:
         List of skill metadata dicts (name, description, category).
+
+    Results are cached per-session; the cache is invalidated when the scan
+    signature changes (dir/category mtimes or the disabled-set) and expires
+    after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+
+    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+
+    # Load disabled set once (not per-skill). Part of the cache signature:
+    # disabling a skill is a config change with no filesystem mtime bump.
+    disabled = set() if skip_disabled else _get_disabled_skill_names()
+
+    # Collect directories to scan — same resolution as the scan loop below
+    # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
+    # SKILLS_DIR can be stale in long-lived runtimes).
+    dirs_to_scan: list = []
+    active_skills_dir = _skills_dir()
+    if active_skills_dir.exists():
+        dirs_to_scan.append(active_skills_dir)
+    dirs_to_scan.extend(get_external_skills_dirs())
+
+    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    now = time.monotonic()
+
+    cached = _SKILLS_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and cached[0] == signature
+        and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS
+    ):
+        # Per-call shallow copies: callers mutate the returned dicts
+        # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
+        # out the cached objects would poison the cache for everyone else.
+        return [dict(s) for s in cached[2]]
 
     skills = []
     seen_names: set = set()
 
-    # Load disabled set once (not per-skill)
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    # Load the bundled-skill manifest once for origin classification
+    # (_skill_origin distinguishes bundled vs external skills).
     try:
         from tools.skills_sync import _read_manifest
         bundled_names = set(_read_manifest())
     except Exception:
         bundled_names = set()
 
-    # Scan local dir first, then external dirs (local takes precedence)
-    dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
-    dirs_to_scan.extend(get_external_skills_dirs())
-
+    # Scan local dir first, then external dirs (local takes precedence) —
+    # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
@@ -695,7 +791,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 )
                 continue
 
-    return skills
+    # Store in cache keyed by the scan signature computed BEFORE the scan
+    # (a write racing the scan changes the signature, so the next call
+    # re-scans rather than serving the torn result past the TTL). Same
+    # shallow-copy contract as the hit path — the caller may mutate.
+    _SKILLS_CACHE[cache_key] = (signature, now, skills)
+    return [dict(s) for s in skills]
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -718,31 +819,26 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
-        if not SKILLS_DIR.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-            return json.dumps(
-                {
+        active_skills_dir = _skills_dir()
+        if not active_skills_dir.exists():
+            active_skills_dir.mkdir(parents=True, exist_ok=True)
+            return orjson.dumps({
                     "success": True,
                     "skills": [],
                     "categories": [],
                     "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         # Find all skills
         all_skills = _find_all_skills()
 
         if not all_skills:
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": True,
                     "skills": [],
                     "categories": [],
                     "message": "No skills found in skills/ directory.",
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         # Filter by category if specified
         if category:
@@ -756,16 +852,13 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             {s.get("category") for s in all_skills if s.get("category")}
         )
 
-        return json.dumps(
-            {
+        return orjson.dumps({
                 "success": True,
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
                 "hint": "Use skill_view(name) to see full content, tags, and linked files",
-            },
-            ensure_ascii=False,
-        )
+            }).decode('utf-8')
 
     except Exception as e:
         return tool_error(str(e), success=False)
@@ -786,24 +879,18 @@ def _serve_plugin_skill(
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
 
     if namespace in _get_disabled_plugins():
-        return json.dumps(
-            {
+        return orjson.dumps({
                 "success": False,
                 "error": (
                     f"Plugin '{namespace}' is disabled. "
                     f"Re-enable with: hermes plugins enable {namespace}"
                 ),
-            },
-            ensure_ascii=False,
-        )
+            }).decode('utf-8')
 
     try:
         content = skill_md.read_text(encoding="utf-8")
     except Exception as e:
-        return json.dumps(
-            {"success": False, "error": f"Failed to read skill '{namespace}:{bare}': {e}"},
-            ensure_ascii=False,
-        )
+        return orjson.dumps({"success": False, "error": f"Failed to read skill '{namespace}:{bare}': {e}"}).decode('utf-8')
 
     parsed_frontmatter: Dict[str, Any] = {}
     try:
@@ -812,14 +899,11 @@ def _serve_plugin_skill(
         pass
 
     if not skill_matches_platform(parsed_frontmatter):
-        return json.dumps(
-            {
+        return orjson.dumps({
                 "success": False,
                 "error": f"Skill '{namespace}:{bare}' is not supported on this platform.",
                 "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
-            },
-            ensure_ascii=False,
-        )
+            }).decode('utf-8')
 
     # Injection scan — log but still serve (matches local-skill behaviour)
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
@@ -865,17 +949,14 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
-    return json.dumps(
-        {
+    return orjson.dumps({
             "success": True,
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
-        },
-        ensure_ascii=False,
-    )
+        }).decode('utf-8')
 
 
 def skill_view(
@@ -906,14 +987,11 @@ def skill_view(
         # search-dir join that builds direct_path below.
         lookup_error = _skill_lookup_path_error(name)
         if lookup_error:
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": False,
                     "error": lookup_error,
                     "hint": "Use a skill name or relative path within the skills directory.",
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
@@ -925,16 +1003,13 @@ def skill_view(
 
             namespace, bare = parse_qualified_name(name)
             if not is_valid_namespace(namespace):
-                return json.dumps(
-                    {
+                return orjson.dumps({
                         "success": False,
                         "error": (
                             f"Invalid namespace '{namespace}' in '{name}'. "
                             f"Namespaces must match [a-zA-Z0-9_-]+."
                         ),
-                    },
-                    ensure_ascii=False,
-                )
+                    }).decode('utf-8')
 
             discover_plugins()  # idempotent
             pm = get_plugin_manager()
@@ -944,8 +1019,7 @@ def skill_view(
                 if not plugin_skill_md.exists():
                     # Stale registry entry — file deleted out of band
                     pm.remove_plugin_skill(name)
-                    return json.dumps(
-                        {
+                    return orjson.dumps({
                             "success": False,
                             "error": (
                                 f"Skill '{name}' file no longer exists at "
@@ -953,9 +1027,7 @@ def skill_view(
                                 f"been cleaned up — try again after the "
                                 f"plugin is reloaded."
                             ),
-                        },
-                        ensure_ascii=False,
-                    )
+                        }).decode('utf-8')
                 return _serve_plugin_skill(
                     plugin_skill_md,
                     namespace,
@@ -967,15 +1039,12 @@ def skill_view(
             # Plugin exists but this specific skill is missing?
             available = pm.list_plugin_skills(namespace)
             if available:
-                return json.dumps(
-                    {
+                return orjson.dumps({
                         "success": False,
                         "error": f"Skill '{bare}' not found in plugin '{namespace}'.",
                         "available_skills": [f"{namespace}:{s}" for s in available],
                         "hint": f"The '{namespace}' plugin provides {len(available)} skill(s).",
-                    },
-                    ensure_ascii=False,
-                )
+                    }).decode('utf-8')
             # Plugin itself not found — fall through to flat-tree scan.
             # Categorized local skills also use `category:skill` in config and
             # gateway prompts, so preserve that form and translate it to the
@@ -990,29 +1059,24 @@ def skill_view(
         if local_category_name:
             lookup_error = _skill_lookup_path_error(local_category_name)
             if lookup_error:
-                return json.dumps(
-                    {
+                return orjson.dumps({
                         "success": False,
                         "error": lookup_error,
                         "hint": "Use a skill name or relative path within the skills directory.",
-                    },
-                    ensure_ascii=False,
-                )
+                    }).decode('utf-8')
 
         # Build list of all skill directories to search
         all_dirs = []
-        if SKILLS_DIR.exists():
-            all_dirs.append(SKILLS_DIR)
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
 
         if not all_dirs:
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": False,
                     "error": "Skills directory does not exist yet. It will be created on first install.",
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         skill_dir = None
         skill_md = None
@@ -1099,13 +1163,15 @@ def skill_view(
                     _record(None, found_md)
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
+            # POSIX-style separators in the surfaced paths — the hint below
+            # tells the user to pass 'category/skill-name', and the lookup
+            # accepts forward slashes on every platform.
+            paths = [smd.as_posix() for _, smd in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
                 name, len(candidates), "; ".join(paths),
             )
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": False,
                     "error": (
                         f"Ambiguous skill name '{name}': {len(candidates)} skills "
@@ -1118,41 +1184,33 @@ def skill_view(
                         "(e.g., 'category/skill-name'), or rename one of the "
                         "colliding skills so each name is unique."
                     ),
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         if candidates:
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": False,
                     "error": f"Skill '{name}' not found.",
                     "available_skills": available,
                     "hint": "Use skills_list to see all available skills",
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         # Read the file once — reused for platform check and main content below
         try:
             content = skill_md.read_text(encoding="utf-8")
         except Exception as e:
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": False,
                     "error": f"Failed to read skill '{name}': {e}",
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
         _outside_skills_dir = True
-        _trusted_dirs = [SKILLS_DIR.resolve()]
+        _trusted_dirs = [active_skills_dir.resolve()]
         try:
             _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
         except Exception:
@@ -1185,28 +1243,22 @@ def skill_view(
             parsed_frontmatter = {}
 
         if not skill_matches_platform(parsed_frontmatter):
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": False,
                     "error": f"Skill '{name}' is not supported on this platform.",
                     "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
         if _is_skill_disabled(resolved_name):
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": False,
                     "error": (
                         f"Skill '{resolved_name}' is disabled. "
                         "Enable it with `hermes skills` or inspect the files directly on disk."
                     ),
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
@@ -1214,28 +1266,22 @@ def skill_view(
 
             # Security: Prevent path traversal attacks
             if has_traversal_component(file_path):
-                return json.dumps(
-                    {
+                return orjson.dumps({
                         "success": False,
                         "error": "Path traversal ('..') is not allowed.",
                         "hint": "Use a relative path within the skill directory",
-                    },
-                    ensure_ascii=False,
-                )
+                    }).decode('utf-8')
 
             target_file = skill_dir / file_path
 
             # Security: Verify resolved path is still within skill directory
             traversal_error = validate_within_dir(target_file, skill_dir)
             if traversal_error:
-                return json.dumps(
-                    {
+                return orjson.dumps({
                         "success": False,
                         "error": traversal_error,
                         "hint": "Use a relative path within the skill directory",
-                    },
-                    ensure_ascii=False,
-                )
+                    }).decode('utf-8')
             if not target_file.exists():
                 # List available files in the skill directory, organized by type
                 available_files = {
@@ -1272,42 +1318,44 @@ def skill_view(
                 # Remove empty categories
                 available_files = {k: v for k, v in available_files.items() if v}
 
-                return json.dumps(
-                    {
+                return orjson.dumps({
                         "success": False,
                         "error": f"File '{file_path}' not found in skill '{name}'.",
                         "available_files": available_files,
                         "hint": "Use one of the available file paths listed above",
-                    },
-                    ensure_ascii=False,
-                )
+                    }).decode('utf-8')
 
             # Read the file content
             try:
                 content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
-                return json.dumps(
-                    {
+                return orjson.dumps({
                         "success": True,
                         "name": name,
                         "file": file_path,
                         "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
                         "is_binary": True,
-                    },
-                    ensure_ascii=False,
+                    }).decode('utf-8')
+
+            try:
+                from tools.skill_manager_tool import mark_background_review_skill_read
+
+                mark_background_review_skill_read(target_file)
+            except Exception:
+                logger.debug(
+                    "Could not record background-review skill read for %s",
+                    target_file,
+                    exc_info=True,
                 )
 
-            return json.dumps(
-                {
+            return orjson.dumps({
                     "success": True,
                     "name": name,
                     "file": file_path,
                     "content": content,
                     "file_type": target_file.suffix,
-                },
-                ensure_ascii=False,
-            )
+                }).decode('utf-8')
 
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
@@ -1381,10 +1429,12 @@ def skill_view(
             linked_files["scripts"] = script_files
 
         try:
-            rel_path = str(skill_md.relative_to(SKILLS_DIR))
+            # POSIX-style separators: the returned path is a skill identifier
+            # (skill_view accepts forward slashes on every platform).
+            rel_path = skill_md.relative_to(active_skills_dir).as_posix()
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
-            rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
+            rel_path = skill_md.relative_to(skill_md.parent.parent).as_posix() if skill_md.parent.parent else skill_md.name
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
@@ -1501,6 +1551,17 @@ def skill_view(
         if capture_result["gateway_setup_hint"]:
             result["gateway_setup_hint"] = capture_result["gateway_setup_hint"]
 
+        try:
+            from tools.skill_manager_tool import mark_background_review_skill_read
+
+            mark_background_review_skill_read(skill_md)
+        except Exception:
+            logger.debug(
+                "Could not record background-review skill read for %s",
+                skill_md,
+                exc_info=True,
+            )
+
         if setup_needed:
             missing_items = [
                 f"env ${env_name}" for env_name in remaining_missing_required_envs
@@ -1523,7 +1584,7 @@ def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
-        return json.dumps(result, ensure_ascii=False)
+        return orjson.dumps(result).decode('utf-8')
 
     except Exception as e:
         return tool_error(str(e), success=False)
@@ -1538,7 +1599,7 @@ if __name__ == "__main__":
 
     # Test listing skills
     print("\n📋 Listing all skills:")
-    result = json.loads(skills_list())
+    result = orjson.loads(skills_list())
     if result["success"]:
         print(
             f"Found {result['count']} skills in {len(result.get('categories', []))} categories"
@@ -1553,7 +1614,7 @@ if __name__ == "__main__":
 
     # Test viewing a skill
     print("\n📖 Viewing skill 'axolotl':")
-    result = json.loads(skill_view("axolotl"))
+    result = orjson.loads(skill_view("axolotl"))
     if result["success"]:
         print(f"Name: {result['name']}")
         print(f"Description: {result.get('description', 'N/A')[:100]}...")
@@ -1565,7 +1626,7 @@ if __name__ == "__main__":
 
     # Test viewing a reference file
     print("\n📄 Viewing reference file 'axolotl/references/dataset-formats.md':")
-    result = json.loads(skill_view("axolotl", "references/dataset-formats.md"))
+    result = orjson.loads(skill_view("axolotl", "references/dataset-formats.md"))
     if result["success"]:
         print(f"File: {result['file']}")
         print(f"Content length: {len(result['content'])} chars")
@@ -1630,7 +1691,7 @@ def _skill_view_with_bump(args, **kw):
         name, file_path=args.get("file_path"), task_id=kw.get("task_id")
     )
     try:
-        parsed = json.loads(result)
+        parsed = orjson.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.

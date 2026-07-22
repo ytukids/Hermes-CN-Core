@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
+import orjson
 import sys
 from typing import Any
 
@@ -71,7 +71,7 @@ def node_command(args: argparse.Namespace) -> int:
         print(f"[meet-node] display_name={server.display_name}")
         print(f"[meet-node] listening on ws://{args.host}:{args.port}")
         print(f"[meet-node] token (copy to gateway): {token}")
-        print(f"[meet-node] approve with:")
+        print("[meet-node] approve with:")
         print(f"             hermes meet node approve <name> ws://<host>:{args.port} {token}")
         try:
             asyncio.run(server.serve())
@@ -112,9 +112,9 @@ def node_command(args: argparse.Namespace) -> int:
         try:
             result = client.ping()
         except Exception as exc:  # noqa: BLE001 — surface any connection error
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(orjson.dumps({"ok": False, "error": str(exc)}).decode('utf-8'))
             return 1
-        print(json.dumps({"ok": True, "node": args.name, **_coerce_dict(result)}))
+        print(orjson.dumps({"ok": True, "node": args.name, **_coerce_dict(result)}).decode('utf-8'))
         return 0
 
     print(f"unknown node command: {cmd!r}", file=sys.stderr)

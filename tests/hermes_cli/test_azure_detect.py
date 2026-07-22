@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import orjson
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,17 +32,17 @@ class _FakeHTTPResponse:
 
 
 def _openai_models_body(*ids: str) -> bytes:
-    return json.dumps({
+    return orjson.dumps({
         "object": "list",
         "data": [{"id": i, "object": "model"} for i in ids],
-    }).encode()
+    })
 
 
 def _anthropic_error_body(msg: str = "model not found") -> bytes:
-    return json.dumps({
+    return orjson.dumps({
         "type": "error",
         "error": {"type": "invalid_request_error", "message": msg},
-    }).encode()
+    })
 
 
 # ----------------------------------------------------------------------
@@ -104,7 +104,7 @@ def test_detect_openai_models_probe_success():
     """/models probe returning a model list → chat_completions."""
     def _fake_get(url, api_key, timeout=6.0, **kwargs):
         assert "key-abc" == api_key
-        return 200, json.loads(_openai_models_body("gpt-5.4", "claude-opus-4-6"))
+        return 200, orjson.loads(_openai_models_body("gpt-5.4", "claude-opus-4-6"))
 
     with patch.object(azure_detect, "_http_get_json", side_effect=_fake_get):
         result = azure_detect.detect(
@@ -168,7 +168,7 @@ def test_probe_openai_models_tries_multiple_api_versions():
         calls.append(url)
         if "api-version" not in url:
             return 404, None
-        return 200, json.loads(_openai_models_body("gpt-4.1"))
+        return 200, orjson.loads(_openai_models_body("gpt-4.1"))
 
     with patch.object(azure_detect, "_http_get_json", side_effect=_fake_get):
         ok, models = azure_detect._probe_openai_models(
@@ -188,7 +188,7 @@ def test_probe_openai_models_tries_multiple_api_versions():
 def test_http_get_json_on_urlerror_returns_zero_none():
     """Network failure returns (0, None), never raises."""
     import urllib.error
-    with patch("hermes_cli.azure_detect.urllib_request.urlopen",
+    with patch("hermes_cli.azure_detect.open_credentialed_url",
                side_effect=urllib.error.URLError("dns fail")):
         status, body = azure_detect._http_get_json("https://bad.example/", "k")
     assert status == 0
@@ -199,7 +199,7 @@ def test_http_get_json_on_http_error_returns_code_none():
     """HTTP 4xx/5xx returns (code, None)."""
     import urllib.error
     err = urllib.error.HTTPError("https://x/", 403, "Forbidden", {}, None)
-    with patch("hermes_cli.azure_detect.urllib_request.urlopen", side_effect=err):
+    with patch("hermes_cli.azure_detect.open_credentialed_url", side_effect=err):
         status, body = azure_detect._http_get_json("https://x/", "k")
     assert status == 403
     assert body is None

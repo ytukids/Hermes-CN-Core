@@ -16,7 +16,7 @@ passes, the architecture holds. If it fails, we have a real bug to fix
 before anyone runs this in anger.
 """
 
-import json
+import orjson
 import multiprocessing as mp
 import os
 import random
@@ -113,7 +113,7 @@ def worker_loop(worker_id: int, hermes_home: str, result_file: str) -> None:
             conn.close()
 
     with open(result_file, "w") as f:
-        json.dump(events, f)
+        f.write(orjson.dumps(events).decode('utf-8'))
 
 
 def main():
@@ -164,7 +164,7 @@ def main():
             print(f"  WORKER {i} produced no result file — died?")
             continue
         with open(f) as fh:
-            events = json.load(fh)
+            events = orjson.loads(fh.read())
         all_events.extend(events)
 
     # ============ INVARIANT CHECKS ============
@@ -278,7 +278,7 @@ def main():
     print(f"Lost claim races:  {total_lost_races}  (expected contention; not a bug)")
     print(f"Elapsed:           {elapsed:.2f}s")
     print(f"Throughput:        {NUM_TASKS/elapsed:.1f} tasks/sec")
-    print(f"Per-worker completions:")
+    print("Per-worker completions:")
     for w in sorted(per_worker.keys()):
         print(f"  worker-{w}: {per_worker[w]}")
 

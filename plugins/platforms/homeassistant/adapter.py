@@ -13,7 +13,7 @@ Requires:
 """
 
 import asyncio
-import json
+import orjson
 import logging
 import os
 import time
@@ -40,12 +40,14 @@ logger = logging.getLogger(__name__)
 
 
 def check_ha_requirements() -> bool:
-    """Check if Home Assistant dependencies are available and configured."""
-    if not AIOHTTP_AVAILABLE:
-        return False
-    if not os.getenv("HASS_TOKEN"):
-        return False
-    return True
+    """Check if Home Assistant runtime dependencies are available."""
+    return AIOHTTP_AVAILABLE
+
+
+def validate_ha_config(config: PlatformConfig) -> bool:
+    """Return True when Home Assistant has enough credential config to connect."""
+    token = (getattr(config, "token", None) or os.getenv("HASS_TOKEN", "")).strip()
+    return bool(token)
 
 
 class HomeAssistantAdapter(BasePlatformAdapter):
@@ -251,10 +253,10 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         async for ws_msg in self._ws:
             if ws_msg.type == aiohttp.WSMsgType.TEXT:
                 try:
-                    data = json.loads(ws_msg.data)
+                    data = orjson.loads(ws_msg.data)
                     if data.get("type") == "event":
                         await self._handle_ha_event(data.get("event", {}))
-                except json.JSONDecodeError:
+                except orjson.JSONDecodeError:
                     logger.debug("Invalid JSON from HA WS: %s", ws_msg.data[:200])
             elif ws_msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
                 break
@@ -560,6 +562,7 @@ def register(ctx) -> None:
         label="Home Assistant",
         adapter_factory=_build_adapter,
         check_fn=check_ha_requirements,
+        validate_config=validate_ha_config,
         is_connected=_is_connected,
         required_env=["HASS_TOKEN"],
         install_hint="pip install aiohttp",

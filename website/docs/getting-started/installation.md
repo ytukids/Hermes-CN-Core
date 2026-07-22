@@ -68,6 +68,7 @@ hermes model          # Choose your LLM provider and model
 hermes tools          # Configure which tools are enabled
 hermes gateway setup  # Set up messaging platforms
 hermes config set     # Set individual config values
+hermes config get     # Inspect individual config values
 hermes setup          # Or run the full setup wizard to configure everything at once
 ```
 
@@ -88,7 +89,7 @@ That logs you in, sets Nous as your provider, and turns on the Tool Gateway in o
 **Installer:** On non-Windows platforms, the only prerequisite is **Git**. On Linux, also make sure `curl` and `xz-utils` are available (the installer downloads Node.js as a `.tar.xz` archive). The desktop app additionally requires `g++` (or `build-essential` on Debian/Ubuntu) to compile native modules. The installer automatically handles everything else:
 
 - **uv** (fast Python package manager)
-- **Python 3.11** (via uv, no sudo needed)
+- **Python 3.14** (via uv, no sudo needed)
 - **Node.js v22** (for browser automation and WhatsApp bridge)
 - **ripgrep** (fast file search)
 - **ffmpeg** (audio format conversion for TTS)

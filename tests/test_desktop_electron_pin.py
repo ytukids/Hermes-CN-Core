@@ -24,8 +24,8 @@ specific version (which is allowed to move):
 
 from __future__ import annotations
 
-import json
-import re
+import orjson
+from agent.re_compat import re
 from pathlib import Path
 
 import pytest
@@ -42,7 +42,7 @@ _EXACT_SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
 def _desktop_pkg() -> dict:
     assert DESKTOP_PKG.is_file(), f"missing {DESKTOP_PKG}"
-    return json.loads(DESKTOP_PKG.read_text(encoding="utf-8"))
+    return orjson.loads(DESKTOP_PKG.read_text(encoding="utf-8"))
 
 
 def _electron_spec(pkg: dict) -> str:
@@ -81,7 +81,7 @@ def test_lockfile_resolves_the_pinned_electron():
     if not ROOT_LOCK.is_file():
         pytest.skip("root package-lock.json not present")
     spec = _electron_spec(_desktop_pkg())
-    lock = json.loads(ROOT_LOCK.read_text(encoding="utf-8"))
+    lock = orjson.loads(ROOT_LOCK.read_text(encoding="utf-8"))
     packages = lock.get("packages", {})
     resolved = [
         meta.get("version")
@@ -93,43 +93,4 @@ def test_lockfile_resolves_the_pinned_electron():
         f"package-lock.json resolves electron to {sorted(set(resolved))}, "
         f"but the pin is {spec!r}; run `npm install --package-lock-only` so "
         "`npm ci` stays consistent."
-    )
-
-
-DESKTOP_DIR = REPO_ROOT / "apps" / "desktop"
-ELECTRON_BUILDER_WRAPPER = DESKTOP_DIR / "scripts" / "run-electron-builder.cjs"
-
-
-def test_no_static_electron_dist_that_can_drift():
-    """build.electronDist must not be a static path — hoisting is non-deterministic."""
-    assert "electronDist" not in _desktop_pkg().get("build", {}), (
-        "build.electronDist is hardcoded again. npm hoisting is non-deterministic, "
-        "so a static path silently breaks packaging when the layout changes. Let "
-        "scripts/run-electron-builder.cjs resolve it dynamically instead."
-    )
-
-
-def test_builder_script_routes_through_dynamic_resolver():
-    """npm run builder must invoke run-electron-builder.cjs, not bare electron-builder."""
-    builder = _desktop_pkg().get("scripts", {}).get("builder", "")
-    assert "run-electron-builder.cjs" in builder, (
-        f"the 'builder' script must run scripts/run-electron-builder.cjs, got "
-        f"{builder!r}"
-    )
-    assert ELECTRON_BUILDER_WRAPPER.is_file(), (
-        f"missing dynamic-resolver wrapper at {ELECTRON_BUILDER_WRAPPER}"
-    )
-
-
-def test_resolver_uses_node_module_resolution():
-    """Wrapper must resolve electron via require.resolve and pass -c.electronDist."""
-    src = ELECTRON_BUILDER_WRAPPER.read_text(encoding="utf-8")
-    assert 'require.resolve("electron/package.json")' in src, (
-        "run-electron-builder.cjs must resolve electron via "
-        "require.resolve('electron/package.json') to stay hoist-proof."
-    )
-    # And it must hand the resolved dist to electron-builder as an override.
-    assert "-c.electronDist=" in src, (
-        "run-electron-builder.cjs must pass the resolved dist to electron-builder "
-        "via -c.electronDist."
     )

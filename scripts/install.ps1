@@ -49,7 +49,7 @@ param(
     #   * Hermes-Setup.exe (the signed Tauri bootstrap installer) passes
     #     -IncludeDesktop so a user who installed via the GUI ends up
     #     with a launchable desktop binary.
-    #   * The Electron desktop's own bootstrap-runner.cjs runs install.ps1
+    #   * The Electron desktop's own bootstrap-runner.ts runs install.ps1
     #     from inside an already-launched Hermes.exe; if THAT recursively
     #     built apps/desktop it would try to overwrite the live Hermes.exe
     #     on disk and fail. The recursive path omits the flag.
@@ -138,7 +138,7 @@ foreach ($tmpVar in @('TEMP', 'TMP')) {
 
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
-$PythonVersion = "3.11"
+$PythonVersion = "3.14"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
 # interpreters, so this list also matches a pre-existing system Python.  Single
@@ -150,6 +150,23 @@ $NodeVersion = "22"
 # manifest schema, stage-name set semantics, or stdout JSON shape.  Adding a
 # new stage does NOT bump this -- drivers iterate the manifest dynamically.
 $InstallStageProtocolVersion = 1
+
+# Hermes-managed external tools directory.  We keep known-good copies here so
+# broken system shims/symlinks on PATH cannot brick the installer or runtime.
+$script:ManagedToolsDir = Join-Path $HermesHome "tools"
+
+# Hermes-managed ripgrep binary.
+$script:ManagedRg = Join-Path $script:ManagedToolsDir "rg.exe"
+
+# Hermes-managed rtk (reasoning toolkit) binary.  Used to collapse repeated
+# command output lines, reducing token consumption.
+$script:ManagedRtk = Join-Path $script:ManagedToolsDir "rtk.exe"
+
+# Hermes-managed Coreutils directory.  Used on Windows to provide POSIX CLI tools
+# (cat, cp, mv, ls, sort, wc, whoami, id, ...) that are commonly referenced in
+# shell scripts and skills.  Managed by install_coreutils.py.
+$script:ManagedCoreutilsDir = Join-Path $script:ManagedToolsDir "coreutils"
+$script:ManagedCat          = Join-Path $script:ManagedCoreutilsDir "bin\cat.exe"
 
 # ============================================================================
 # Helper functions
@@ -443,7 +460,7 @@ function Get-PowerShellHostExe {
 }
 
 function Install-Uv {
-    # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there —
+    # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
     # no PATH probing, no conda guards, no multi-location resolution chains.
     # The runtime update path (hermes_cli/managed_uv.py) looks in the same
     # place, so install.ps1 and `hermes update` stay in sync.
@@ -502,13 +519,33 @@ function Sync-EnvPath {
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
 }
 
+# npm lifecycle scripts on Windows spawn ``cmd.exe /d /s /c node <script>``.
+# PowerShell can resolve ``node`` via Get-Command while the child cmd process
+# still sees a PATH without node.exe's directory (nvm4w shims, App Paths
+# aliases, stale cross-process PATH).  Prepend the resolved node.exe parent
+# directory so postinstall hooks (electron-winstaller, native modules, etc.)
+# can find ``node``.  Regression for #48130.
+function Ensure-NodeExeOnPath {
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $nodeCmd) { return $false }
+
+    $nodeExeDir = Split-Path $nodeCmd.Source -Parent
+    if (-not $nodeExeDir) { return $false }
+
+    $pathParts = $env:Path -split ";"
+    if ($pathParts -notcontains $nodeExeDir) {
+        $env:Path = "$nodeExeDir;$env:Path"
+    }
+    return $true
+}
+
 # Re-discover uv without re-installing it.  Cross-process stage drivers
 # (the desktop GUI's onboarding wizard, CI step-runners) invoke each stage
 # in a fresh powershell process, so $script:UvCmd set by Install-Uv in a
 # prior process is not visible here.  Later stages (Test-Python,
 # Install-Venv, Install-Dependencies, Install-PlatformSdks) call this
 # at the top to populate $script:UvCmd from the managed location.
-# Throws if uv is not findable — the caller's stage then surfaces a
+# Throws if uv is not findable -- the caller's stage then surfaces a
 # clean error via the stage-driver's try/catch.
 function Resolve-UvCmd {
     # Already resolved (default invocation path: Install-Uv ran earlier
@@ -524,7 +561,7 @@ function Resolve-UvCmd {
         # Stale; fall through to re-discover.
     }
 
-    # Check the managed location first — this is where Install-Uv puts it.
+    # Check the managed location first -- this is where Install-Uv puts it.
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
     if (Test-Path $managedUv) {
         $script:UvCmd = $managedUv
@@ -679,38 +716,168 @@ function Test-Python {
     }
 
     Write-Err "Failed to install Python $PythonVersion"
-    Write-Info "Install Python 3.11 manually, then re-run this script:"
+    Write-Info "Install Python 3.14 manually, then re-run this script:"
     Write-Info "  https://www.python.org/downloads/"
-    Write-Info "  Or: winget install Python.Python.3.11"
+    Write-Info "  Or: winget install Python.Python.3.14"
     return $false
+}
+
+$script:GitInstallFailureReason = $null
+$script:GitBashPath = $null
+$script:GitBashProbeOutput = $null
+
+function Test-GitBashCompatibility {
+    <#
+    .SYNOPSIS
+    Verify that Git Bash can launch external MSYS programs, not just evaluate
+    shell builtins. Mandatory ASLR can allow bash.exe itself to start while
+    every child linked to msys-2.0.dll fails during fork/spawn.
+    #>
+    param([Parameter(Mandatory = $true)][string]$BashPath)
+
+    $script:GitBashProbeOutput = $null
+    if (-not (Test-Path -LiteralPath $BashPath)) {
+        $script:GitBashProbeOutput = "bash.exe was not found at $BashPath"
+        return $false
+    }
+
+    $process = New-Object System.Diagnostics.Process
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $BashPath
+        $startInfo.Arguments = '--noprofile --norc -c "/usr/bin/true; /usr/bin/cat --version >/dev/null"'
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process.StartInfo = $startInfo
+
+        if (-not $process.Start()) {
+            $script:GitBashProbeOutput = "bash.exe did not start"
+            return $false
+        }
+        if (-not $process.WaitForExit(15000)) {
+            try { $process.Kill() } catch { }
+            $script:GitBashProbeOutput = "Git Bash compatibility probe timed out"
+            return $false
+        }
+
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $script:GitBashProbeOutput = ("$stdout`n$stderr").Trim()
+        return ($process.ExitCode -eq 0)
+    } catch {
+        $script:GitBashProbeOutput = $_.Exception.Message
+        return $false
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Test-MandatoryAslrEnabled {
+    <# Return true only when Windows reports system-wide ForceRelocateImages=ON. #>
+    try {
+        $cmd = Get-Command Get-ProcessMitigation -ErrorAction SilentlyContinue
+        if (-not $cmd) { return $false }
+        $mitigations = & $cmd -System
+        $value = $mitigations.Aslr.ForceRelocateImages
+        return ($null -ne $value -and $value.ToString().ToUpperInvariant() -eq "ON")
+    } catch {
+        return $false
+    }
+}
+
+function Get-GitRootFromBashPath {
+    param([Parameter(Mandatory = $true)][string]$BashPath)
+
+    $binDir = Split-Path -Path $BashPath -Parent
+    if ((Split-Path -Path $binDir -Leaf) -ine "bin") {
+        return (Split-Path -Path $binDir -Parent)
+    }
+
+    $parent = Split-Path -Path $binDir -Parent
+    if ((Split-Path -Path $parent -Leaf) -ieq "usr") {
+        return (Split-Path -Path $parent -Parent)
+    }
+    return $parent
+}
+
+function New-GitBashAslrFailureReason {
+    param([Parameter(Mandatory = $true)][string]$BashPath)
+
+    $gitRoot = Get-GitRootFromBashPath -BashPath $BashPath
+    $escapedRoot = $gitRoot -replace "'", "''"
+    return @(
+        "Git Bash at $BashPath cannot launch required MSYS child processes because Windows Mandatory ASLR (ForceRelocateImages) is enabled system-wide. Reinstalling Git will not change this policy."
+        "Open PowerShell as Administrator and run:"
+        "`$gitRoot = '$escapedRoot'"
+        'Get-Item "$gitRoot\bin\bash.exe", "$gitRoot\usr\bin\*.exe" -ErrorAction SilentlyContinue | ForEach-Object { Set-ProcessMitigation -Name $_.FullName -Disable ForceRelocateImages }'
+        "Then rerun Hermes setup. If the override is blocked or later re-applied, ask your Windows administrator to allow this per-program exception."
+    ) -join [Environment]::NewLine
 }
 
 function Install-Git {
     <#
     .SYNOPSIS
-    Ensure Git is available on PATH (for cloning, version control, etc.).
+    Ensure Git (and Git Bash) are installed.  Git for Windows bundles bash.exe
+    which Hermes uses to run shell commands.
 
-    Hermes no longer requires Git Bash for shell commands — Windows PowerShell
-    5.1 (powershell.exe) ships with every Windows 10/11 system and is used
-    as the terminal shell.  Git is still useful for repository operations but
-    is not a hard dependency for the terminal tool.
-
-    Priority order:
-      1. Existing ``git`` on PATH — use it as-is (the common fast path).
+    Priority order (deliberately simple -- no winget, no registry, no system
+    package manager):
+      1. Existing ``git`` on PATH -- use it as-is (the common fast path).
       2. Download **PortableGit** from the official git-for-windows GitHub
          release (self-extracting 7z.exe) and unpack it to
-         ``%LOCALAPPDATA%\hermes\git`` — never touches system Git, never
-         requires admin.
+         ``%LOCALAPPDATA%\hermes\git`` -- never touches system Git, never
+         requires admin, works even on locked-down machines and machines
+         with a broken system Git install.
+
+    **Why PortableGit, not MinGit:**  MinGit is the minimal-automation
+    distribution and ships ONLY ``git.exe`` -- no bash, no POSIX utilities.
+    Hermes needs ``bash.exe`` to run shell commands.  PortableGit is the
+    full Git for Windows distribution without the installer UI; it ships
+    ``git.exe`` + ``bash.exe`` + ``sh``, ``awk``, ``sed``, ``grep``, ``curl``,
+    ``ssh``, etc. in ``usr\bin\``.
+
+    We deliberately skip winget because it fails badly when the system Git
+    install is in a half-installed state (partially registered, or uninstall-
+    blocked).  Owning the Hermes copy of Git ourselves is predictable and
+    recoverable: if it ever breaks, ``Remove-Item %LOCALAPPDATA%\hermes\git``
+    and re-running this installer fully recovers.
+
+    After install we locate ``bash.exe`` and persist the path in
+    ``HERMES_GIT_BASH_PATH`` (User scope) so Hermes can find it in a fresh
+    shell without a second PATH refresh.
     #>
+    $script:GitInstallFailureReason = $null
     Write-Info "Checking Git..."
 
     if (Get-Command git -ErrorAction SilentlyContinue) {
         $version = git --version
         Write-Success "Git found ($version)"
-        return $true
+        Set-GitBashEnvVar
+        if ($script:GitBashPath -and (Test-GitBashCompatibility -BashPath $script:GitBashPath)) {
+            Write-Success "Git Bash can launch MSYS programs"
+            return $true
+        }
+
+        if ($script:GitBashPath -and (Test-MandatoryAslrEnabled)) {
+            $script:GitInstallFailureReason = New-GitBashAslrFailureReason -BashPath $script:GitBashPath
+            Write-Err $script:GitInstallFailureReason
+            return $false
+        }
+
+        if ($script:GitBashPath) {
+            $probeDetail = if ($script:GitBashProbeOutput) { ": $script:GitBashProbeOutput" } else { "" }
+            Write-Warn "System Git Bash could not launch required MSYS programs$probeDetail"
+        } else {
+            Write-Warn "Git is on PATH, but its Git Bash installation could not be located."
+        }
+        Write-Info "Trying a Hermes-managed PortableGit install instead..."
     }
 
-    # Download PortableGit into $HermesHome\git.
+    # Download PortableGit into $HermesHome\git.  Always works as long as
+    # we can reach github.com -- no admin, no winget, no reliance on the
+    # user's possibly-broken system Git install.
     Write-Info "Git not found -- downloading PortableGit to $HermesHome\git\ ..."
     Write-Info "(no admin rights required; isolated from any system Git install)"
 
@@ -723,16 +890,25 @@ function Install-Git {
             $assetTag = '64-bit'
             $downloadIsZip = $false
         } else {
+            # PortableGit does not ship 32-bit / arm builds -- fall back to MinGit
+            # 32-bit with a warning that bash-based features will be unavailable.
             $assetTag = '32-bit-mingit'
             $downloadIsZip = $true
         }
 
+        # Pinned git-for-windows release. We deliberately do NOT hit
+        # api.github.com/repos/.../releases/latest here: that endpoint
+        # is rate-limited to 60 requests/hour/IP for unauthenticated
+        # callers, and users behind CGNAT / corporate NAT / dorm WiFi
+        # routinely hit the limit, breaking the installer.
+        # Static github.com/.../releases/download/<tag>/<asset> URLs
+        # are not subject to the API rate limit.
         $gitTag    = "v2.54.0.windows.1"
         $gitVer    = "2.54.0"
         $gitVerTag = "$gitVer.windows.1"
 
         if ($arch -eq "32-bit-mingit") {
-            Write-Warn "32-bit Windows detected -- PortableGit is 64-bit only.  Installing MinGit 32-bit as a last resort."
+            Write-Warn "32-bit Windows detected -- PortableGit is 64-bit only.  Installing MinGit 32-bit as a last resort; bash-dependent Hermes features (terminal tool, agent-browser) will not work on this machine."
             $assetName    = "MinGit-$gitVer-32-bit.zip"
             $downloadIsZip = $true
         } elseif ($arch -eq "arm64") {
@@ -760,6 +936,9 @@ function Install-Git {
         if ($downloadIsZip) {
             Expand-Archive -Path $tmpFile -DestinationPath $gitDir -Force
         } else {
+            # PortableGit is a self-extracting 7z archive.  Invoke it with
+            # `-o<target> -y` (silent) to extract to $gitDir.  No 7z install
+            # required; it's fully self-contained.
             Write-Info "Extracting PortableGit to $gitDir ..."
             $extractProc = Start-Process -FilePath $tmpFile `
                 -ArgumentList "-o`"$gitDir`"", "-y" `
@@ -770,6 +949,8 @@ function Install-Git {
         }
         Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
 
+        # PortableGit layout: cmd\git.exe + bin\bash.exe + usr\bin\ (coreutils)
+        # MinGit layout:      cmd\git.exe + usr\bin\bash.exe (if present)
         $gitExe = "$gitDir\cmd\git.exe"
         if (-not (Test-Path $gitExe)) {
             throw "Git extraction did not produce git.exe at $gitExe"
@@ -778,7 +959,9 @@ function Install-Git {
         # Add to session PATH so the rest of this install run can use git.
         $env:Path = "$gitDir\cmd;$env:Path"
 
-        # Persist to User PATH.
+        # Persist to User PATH so fresh shells see it.  PortableGit needs
+        # cmd\ (for git.exe), bin\ (for bash.exe + core tools), and
+        # usr\bin\ (for perl, ssh, curl, and other POSIX coreutils).
         $newPathEntries = @(
             "$gitDir\cmd",
             "$gitDir\bin",
@@ -799,14 +982,87 @@ function Install-Git {
 
         $version = & $gitExe --version
         Write-Success "Git $version installed to $gitDir (portable, user-scoped)"
+        Set-GitBashEnvVar
+        if (-not $script:GitBashPath) {
+            throw "PortableGit extraction did not produce a usable bash.exe"
+        }
+        if (-not (Test-GitBashCompatibility -BashPath $script:GitBashPath)) {
+            if (Test-MandatoryAslrEnabled) {
+                $script:GitInstallFailureReason = New-GitBashAslrFailureReason -BashPath $script:GitBashPath
+            } else {
+                $probeDetail = if ($script:GitBashProbeOutput) { " Probe output: $script:GitBashProbeOutput" } else { "" }
+                $script:GitInstallFailureReason = "Git Bash at $script:GitBashPath exists but cannot launch required MSYS programs.$probeDetail"
+            }
+            throw $script:GitInstallFailureReason
+        }
+        Write-Success "Git Bash can launch MSYS programs"
         return $true
     } catch {
+        if ($script:GitInstallFailureReason) {
+            Write-Err $script:GitInstallFailureReason
+            return $false
+        }
         Write-Err "Could not install portable Git: $_"
         Write-Info ""
         Write-Info "Fallback: install Git manually from https://git-scm.com/download/win"
-        Write-Info "then re-run this installer."
+        Write-Info "then re-run this installer.  Hermes needs Git Bash on Windows to run"
+        Write-Info "shell commands (same as Claude Code and other coding agents)."
         return $false
     }
+}
+
+function Set-GitBashEnvVar {
+    <#
+    .SYNOPSIS
+    Locate ``bash.exe`` from an already-installed Git and persist the path in
+    ``HERMES_GIT_BASH_PATH`` (User env scope) so Hermes can find it even before
+    PATH propagation completes in a newly-spawned shell.
+    #>
+    $script:GitBashPath = $null
+    $candidates = @()
+
+    # Our own portable Git install is ALWAYS checked first, so a broken
+    # system Git doesn't hijack us.  If the user had a working system Git
+    # we'd have returned early from Install-Git's fast path and never called
+    # this with a system-Git-only installation anyway.
+    #
+    # Layouts:
+    #   PortableGit (our default): $HermesHome\git\bin\bash.exe
+    #   MinGit (32-bit fallback):  $HermesHome\git\usr\bin\bash.exe
+    $candidates += "$HermesHome\git\bin\bash.exe"       # PortableGit layout (primary)
+    $candidates += "$HermesHome\git\usr\bin\bash.exe"   # MinGit / PortableGit usr\bin fallback
+
+    # git.exe on PATH can tell us where the install root is
+    $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+    if ($gitCmd) {
+        $gitExe = $gitCmd.Source
+        # Git for Windows (full installer): <root>\cmd\git.exe + <root>\bin\bash.exe
+        # MinGit:                           <root>\cmd\git.exe + <root>\usr\bin\bash.exe
+        $gitRoot = Split-Path (Split-Path $gitExe -Parent) -Parent
+        $candidates += "$gitRoot\bin\bash.exe"
+        $candidates += "$gitRoot\usr\bin\bash.exe"
+    }
+
+    # Standard system install locations as a final fallback.  Note:
+    # ProgramFiles(x86) can't be referenced via ${env:...} string interpolation
+    # because of the parens -- use [Environment]::GetEnvironmentVariable().
+    $candidates += "${env:ProgramFiles}\Git\bin\bash.exe"
+    $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if ($pf86) { $candidates += "$pf86\Git\bin\bash.exe" }
+    $candidates += "${env:LocalAppData}\Programs\Git\bin\bash.exe"
+
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            [Environment]::SetEnvironmentVariable("HERMES_GIT_BASH_PATH", $candidate, "User")
+            $env:HERMES_GIT_BASH_PATH = $candidate
+            $script:GitBashPath = $candidate
+            Write-Info "Set HERMES_GIT_BASH_PATH=$candidate"
+            return
+        }
+    }
+
+    Write-Warn "Could not locate bash.exe -- Hermes may not find Git Bash."
+    Write-Info "If needed, set HERMES_GIT_BASH_PATH manually to your bash.exe path."
 }
 
 # The desktop build runs Vite ^8, which refuses to start on Node outside
@@ -832,6 +1088,7 @@ function Test-Node {
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $version = node --version
         if (Test-NodeVersionOk $version) {
+            Ensure-NodeExeOnPath | Out-Null
             Write-Success "Node.js $version found"
             $script:HasNode = $true
             return $true
@@ -993,19 +1250,343 @@ function Update-ProcessPathForPackages {
     $env:Path = [string]::Join(';', $ordered)
 }
 
+function Test-Ripgrep {
+    <#
+    .SYNOPSIS
+    Verify that an rg executable is actually runnable.
+
+    Returns $true only if the binary exists and `rg --version` produces output.
+    This catches broken symlinks, missing winget alias targets, and other
+    cases where Get-Command finds a path but the file is not usable.
+    #>
+    param([string]$Path = "")
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $cmd = Get-Command rg -ErrorAction SilentlyContinue
+        if (-not $cmd) { return $false }
+        $Path = $cmd.Path
+    }
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $ver = & $Path --version 2>$null | Select-Object -First 1
+        return [bool]$ver
+    } catch {
+        return $false
+    }
+}
+
+function Test-Ffmpeg {
+    <#
+    .SYNOPSIS
+    Verify that ffmpeg is available and runnable.
+    #>
+    $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $false }
+    if (-not (Test-Path $cmd.Path)) { return $false }
+    try {
+        $ver = & $cmd.Path -version 2>$null | Select-Object -First 1
+        return [bool]$ver
+    } catch {
+        return $false
+    }
+}
+
+function Install-ManagedRipgrep {
+    <#
+    .SYNOPSIS
+    Download a known-good ripgrep binary into $HERMES_HOME\bin\rg.exe.
+
+    Mirrors the existing managed-uv pattern.  The binary is placed at the
+    front of the process PATH and persisted to User PATH so it overrides any
+    broken system shim in this shell and in future shells.
+    #>
+    if ((Test-Path $script:ManagedRg) -and (Test-Ripgrep $script:ManagedRg)) {
+        Write-Success "Managed ripgrep already usable"
+        return
+    }
+
+    New-Item -ItemType Directory -Path $script:ManagedToolsDir -Force | Out-Null
+
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "x86_64-pc-windows-msvc"
+    }
+
+    $rgVersion = "14.1.1"
+    $zipName   = "ripgrep-$rgVersion-$arch.zip"
+    $assetUrl  = "https://github.com/BurntSushi/ripgrep/releases/download/$rgVersion/$zipName"
+    $zipPath   = Join-Path $env:TEMP $zipName
+
+    try {
+        Invoke-WebRequest -Uri $assetUrl -OutFile $zipPath -UseBasicParsing
+        $extractDir = Join-Path $env:TEMP "ripgrep-$rgVersion"
+        if (Test-Path $extractDir) {
+            Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+        $rgSource = Join-Path $extractDir "ripgrep-$rgVersion-$arch\rg.exe"
+        if (-not (Test-Path $rgSource)) {
+            throw "Expected rg.exe at $rgSource but it was not found after extraction"
+        }
+        Copy-Item -Path $rgSource -Destination $script:ManagedRg -Force
+    } finally {
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if (-not (Test-Ripgrep $script:ManagedRg)) {
+        throw "Managed ripgrep installed at $script:ManagedRg but cannot run"
+    }
+    Write-Success "Managed ripgrep installed"
+
+    # Current process: put managed rg first so it overrides any broken shim.
+    Update-ProcessPathForPackages
+    $env:Path = "$($script:ManagedToolsDir);$env:Path"
+
+    # Persist to User PATH so fresh shells also prefer the managed binary.
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $items = if ($userPath) { $userPath -split ";" } else { @() }
+    if ($items -notcontains $script:ManagedToolsDir) {
+        [Environment]::SetEnvironmentVariable(
+            "Path",
+            "$($script:ManagedToolsDir);$userPath",
+            "User"
+        )
+    }
+}
+
+function Test-RtkBinary {
+    <#
+    .SYNOPSIS
+    Verify that rtk.exe is available and runnable.
+    #>
+    param([string]$Path = $script:ManagedRtk)
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $verOutput = & $Path --version 2>&1
+        $exitCode = $LASTEXITCODE
+        $ver = $verOutput | Select-Object -First 1
+        return ($exitCode -eq 0) -and ($ver -match 'rtk')
+    } catch {
+        return $false
+    }
+}
+
+function Install-ManagedRtk {
+    <#
+    .SYNOPSIS
+    Download a known-good rtk binary into $HERMES_HOME\bin\rtk.exe.
+
+    Mirrors the Install-ManagedRipgrep pattern.  The binary is placed at the
+    front of the process PATH and persisted to User PATH so it overrides any
+    broken system shim in this shell and in future shells.
+    #>
+    if ((Test-Path $script:ManagedRtk) -and (Test-RtkBinary $script:ManagedRtk)) {
+        Write-Success "Managed rtk already usable"
+        return
+    }
+
+    New-Item -ItemType Directory -Path $script:ManagedToolsDir -Force | Out-Null
+
+    # Architecture detection (same as ripgrep)
+    if ([Environment]::Is64BitOperatingSystem) {
+        $arch = "x86_64-pc-windows-msvc"
+    } else {
+        $arch = "aarch64-pc-windows-msvc"
+    }
+
+    $rtkVersion = "0.43.0"
+    $zipName   = "rtk-$arch.zip"
+    $assetUrl  = "https://github.com/rtk-ai/rtk/releases/download/v$rtkVersion/$zipName"
+    $zipPath   = Join-Path $env:TEMP $zipName
+    $extractDir = Join-Path $env:TEMP "rtk-$rtkVersion"
+
+		    try {
+		        Invoke-WebRequest -Uri $assetUrl -OutFile $zipPath -UseBasicParsing
+	        if (Test-Path $extractDir) {
+	            Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+	        }
+	        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+	        $rtkSource = Join-Path $extractDir "rtk.exe"
+	        if (-not (Test-Path $rtkSource)) {
+	            Write-Warn "Could not find rtk binary in extracted tarball"
+	            return
+	        }
+	        Copy-Item -Path $rtkSource -Destination $script:ManagedRtk -Force
+	    } catch {
+	        Write-Warn "Failed to download or extract rtk: $_"
+	        return
+	    } finally {
+	        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+	        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+	    }
+	
+	    if (-not (Test-RtkBinary $script:ManagedRtk)) {
+	        Write-Warn "Could not verify installed rtk binary"
+	        return
+	    }
+	    Write-Success "Managed rtk installed"
+	
+	    # Current process: put managed rtk first so it overrides any broken shim.
+	    Update-ProcessPathForPackages
+	    $env:Path = "$($script:ManagedToolsDir);$env:Path"
+	
+	    # Persist to User PATH so fresh shells also prefer the managed binary.
+	    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+	    $items = if ($userPath) { $userPath -split ";" } else { @() }
+	    if ($items -notcontains $script:ManagedToolsDir) {
+	        [Environment]::SetEnvironmentVariable(
+	            "Path",
+	            "$($script:ManagedToolsDir);$userPath",
+	            "User"
+	        )
+	    }
+	}
+
+function Test-Coreutils {
+    <#
+    .SYNOPSIS
+    Verify that Microsoft Coreutils (cat.exe) is available and runnable.
+    
+    Checks the managed install directory first, then falls back to PATH.
+    Returns $true only if the binary exists and runs.
+    #>
+    param([string]$Path = "")
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        # Check managed install first
+        if (Test-Path $script:ManagedCat) {
+            $Path = $script:ManagedCat
+        } else {
+            $cmd = Get-Command cat.exe -ErrorAction SilentlyContinue
+            if (-not $cmd) { return $false }
+            $Path = $cmd.Path
+        }
+    }
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $ver = & $Path --version 2>$null | Select-Object -First 1
+        if ($ver -match "coreutils" -or $ver) { return $true }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+function Install-Coreutils {
+    <#
+    .SYNOPSIS
+    Install Microsoft Coreutils on Windows to provide POSIX CLI tools.
+    
+    Strategy (in priority order):
+      1. WinGet (official Microsoft channel)
+      2. Fallback: invoke scripts/install_coreutils.py (GitHub direct download)
+    
+    Mirrors the Install-ManagedRipgrep pattern but delegates to the Python
+    script for the actual installation since Coreutils is a suite of tools.
+    #>
+    if (Test-Coreutils) {
+        Write-Success "Coreutils already available"
+        return
+    }
+    
+    if ($env:OS -ne "Windows_NT") {
+        Write-Info "Coreutils installation is Windows-only; skipping."
+        return
+    }
+    
+    # Try winget first (most common, official Microsoft channel)
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Info "Installing Coreutils via WinGet..."
+        try {
+            $output = winget install --exact --id Microsoft.Coreutils --source winget --silent `
+                --accept-package-agreements --accept-source-agreements 2>&1
+            $code = $LASTEXITCODE
+            if ($code -eq -1978335189) {
+                # Already-installed/no-upgrade; retry with --force
+                $output = winget install --exact --id Microsoft.Coreutils --source winget --silent --force `
+                    --accept-package-agreements --accept-source-agreements 2>&1
+            }
+        } catch {
+            Write-Warn "WinGet install attempt failed: $_"
+        }
+        Update-ProcessPathForPackages
+        if (Test-Coreutils) {
+            Write-Success "Coreutils installed via WinGet"
+            $script:HasCoreutils = $true
+            return
+        }
+    }
+    
+    # Fallback: use the Python script for managed download
+    $pythonExe = if (Test-Path "$InstallDir\venv\Scripts\python.exe") {
+        "$InstallDir\venv\Scripts\python.exe"
+    } else {
+        Get-Command python -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+    }
+    $coreutilsScript = Join-Path $InstallDir "scripts\install_coreutils.py"
+    if (-not (Test-Path $coreutilsScript)) {
+        # Try relative to the script's own location
+        $coreutilsScript = Join-Path $PSScriptRoot "install_coreutils.py"
+    }
+    if ($pythonExe -and (Test-Path $coreutilsScript)) {
+        Write-Info "Installing Coreutils via managed Python script..."
+        try {
+            $env:HERMES_HOME = $HermesHome
+            # Use relaxed EAP so stderr from the Python script (e.g. progress
+            # messages when not on Windows) doesn't get wrapped as
+            # NativeCommandError and trigger a terminating exception under
+            # $ErrorActionPreference = "Stop".  Check $LASTEXITCODE for real
+            # failures.  Same pattern as Test-Python and Install-Uv.
+            \$prevEAP = \$ErrorActionPreference
+            \$ErrorActionPreference = "Continue"
+            & \$pythonExe \$coreutilsScript --dir \$script:ManagedCoreutilsDir --ensure
+            \$pythonExit = \$LASTEXITCODE
+            \$ErrorActionPreference = \$prevEAP
+            # Refresh process PATH
+            $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
+            # Add managed coreutils dir to PATH if not already there
+            $coreutilsBin = Join-Path $script:ManagedCoreutilsDir "bin"
+            if ((Test-Path $coreutilsBin) -and ($env:Path -notlike "*$coreutilsBin*")) {
+                $env:Path = "$coreutilsBin;$env:Path"
+            }
+            if (Test-Coreutils) {
+                Write-Success "Coreutils installed via managed Python script"
+                $script:HasCoreutils = $true
+                return
+            }
+        } catch {
+            Write-Warn "Managed Coreutils install failed: $_"
+        }
+    }
+    
+    # Still missing: show manual hint
+    if (-not (Test-Coreutils)) {
+        Write-Warn "Coreutils not installed (POSIX CLI tools will be unavailable on Windows)"
+        Write-Info "  Install manually: winget install Microsoft.Coreutils"
+        Write-Info "  Or download from: https://github.com/microsoft/coreutils/releases"
+    }
+}
+
 function Install-SystemPackages {
-    $script:HasRipgrep = $false
-    $script:HasFfmpeg = $false
-    $needRipgrep = $false
-    $needFfmpeg = $false
+    $script:HasRipgrep = Test-Ripgrep
+    $script:HasFfmpeg  = Test-Ffmpeg
+    $script:HasCoreutils = Test-Coreutils
+    $needRipgrep = -not $script:HasRipgrep
+    $needFfmpeg  = -not $script:HasFfmpeg
 
     Write-Info "Checking ripgrep (fast file search)..."
-    if (Get-Command rg -ErrorAction SilentlyContinue) {
+    if ($script:HasRipgrep) {
         $version = rg --version | Select-Object -First 1
         Write-Success "$version found"
-        $script:HasRipgrep = $true
     } else {
-        $needRipgrep = $true
+        Write-Warn "ripgrep missing or broken; installing managed copy..."
+        $badRg = Get-Command rg -ErrorAction SilentlyContinue
+        if ($badRg) {
+            try { Remove-Item $badRg.Path -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Install-ManagedRipgrep
+        $script:HasRipgrep = $true
+        $needRipgrep = $false
     }
 
     Write-Info "Checking ffmpeg (TTS voice messages)..."
@@ -1014,6 +1595,27 @@ function Install-SystemPackages {
         $script:HasFfmpeg = $true
     } else {
         $needFfmpeg = $true
+    }
+
+    # Coreutils (Windows-only POSIX CLI tools)
+    if ($env:OS -eq "Windows_NT") {
+        Write-Info "Checking Microsoft Coreutils (POSIX CLI tools)..."
+        if (-not $script:HasCoreutils) {
+            Install-Coreutils
+        }
+    }
+
+    Write-Info "Checking rtk (CLI proxy, for token-kill)..."
+    $script:HasRtk = Test-RtkBinary
+    if ($script:HasRtk) {
+        Write-Success "rtk found"
+    } else {
+        Write-Warn "rtk missing; installing managed copy..."
+        Install-ManagedRtk
+        $script:HasRtk = Test-RtkBinary
+        if (-not $script:HasRtk) {
+            Write-Warn "rtk not installed (token-kill will be unavailable)"
+        }
     }
 
     if (-not $needRipgrep -and -not $needFfmpeg) { return }
@@ -1274,8 +1876,16 @@ function Install-Repository {
                 } else {
                     git -c windows.appendAtomically=false checkout $Branch
                     if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed (exit $LASTEXITCODE)" }
+                    # Managed installs should follow origin/$Branch exactly. If
+                    # the checkout has diverged (or has local-only commits),
+                    # ff-only pull cannot succeed -- mirror ``hermes update`` and
+                    # reset to the fetched remote so bootstrap/install can recover.
                     git -c windows.appendAtomically=false pull --ff-only origin $Branch
-                    if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit $LASTEXITCODE)" }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
+                        git -c windows.appendAtomically=false reset --hard "origin/$Branch"
+                        if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
+                    }
                 }
 
                 if ($autostashRef) {
@@ -1305,15 +1915,35 @@ function Install-Repository {
 
                     if ($restoreNow) {
                         Write-Info "Restoring local changes..."
-                        git -c windows.appendAtomically=false stash apply $autostashRef
-                        if ($LASTEXITCODE -eq 0) {
+                        $restoreOutput = @(git -c windows.appendAtomically=false stash apply $autostashRef 2>&1)
+                        $restoreExit = $LASTEXITCODE
+                        $conflictedFiles = @(
+                            git -c windows.appendAtomically=false diff --name-only --diff-filter=U 2>$null
+                        ) | Where-Object { $_ -and $_.ToString().Trim() }
+                        if (($restoreExit -eq 0) -and ($conflictedFiles.Count -eq 0)) {
                             git -c windows.appendAtomically=false stash drop $autostashRef 2>$null
                             Write-Warn "Local changes were restored on top of the updated codebase."
                             Write-Warn "Review git diff / git status if Hermes behaves unexpectedly."
                         } else {
-                            Write-Err "Update succeeded, but restoring local changes failed. Your changes are still preserved in git stash."
-                            Write-Info "Resolve manually with: git stash apply $autostashRef"
-                            throw "git stash apply failed after update"
+                            Write-Err "Update pulled new code, but restoring local changes hit conflicts."
+                            foreach ($line in $restoreOutput) {
+                                if ($line -and $line.ToString().Trim()) {
+                                    Write-Host $line
+                                }
+                            }
+                            if ($conflictedFiles.Count -gt 0) {
+                                Write-Host ""
+                                Write-Host "Conflicted files:"
+                                foreach ($file in $conflictedFiles) {
+                                    Write-Host "  - $file"
+                                }
+                            }
+                            Write-Host ""
+                            Write-Info "Your stashed changes are preserved -- nothing is lost."
+                            Write-Info "  Stash ref: $autostashRef"
+                            git -c windows.appendAtomically=false reset --hard HEAD 2>$null | Out-Null
+                            Write-Info "Working tree reset to clean state."
+                            Write-Info "Restore your changes later with: git stash apply $autostashRef"
                         }
                     } else {
                         Write-Info "Skipped restoring local changes."
@@ -1418,11 +2048,54 @@ function Install-Repository {
                     Move-Item $extractedDir.FullName $InstallDir -Force
                     Write-Success "Downloaded and extracted"
 
-                    # Initialize git repo so updates work later
+                    # Initialize git repo so updates work later. A bare
+                    # `git init` leaves NO HEAD -- desktop's write-build-stamp
+                    # then hard-fails with "could not determine git commit"
+                    # (#50823 / #61657). Fetch the requested ref and force-check
+                    # it out (-f) so untracked ZIP files cannot block checkout.
                     Push-Location $InstallDir
                     git -c windows.appendAtomically=false init 2>$null
                     git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
+                    # Pin autocrlf=false BEFORE the checkout below. Git for Windows
+                    # defaults to core.autocrlf=true, which would renormalize the
+                    # repo's LF text files to CRLF in the working tree during
+                    # `checkout -f FETCH_HEAD` -- leaving this freshly-created
+                    # managed checkout dirty vs HEAD and aborting the next
+                    # `hermes update` (see the notes at the shared clone-path
+                    # config below and install.ps1:1461-1469). The later pin on
+                    # the shared path is idempotent and still covers git clones.
+                    git -c windows.appendAtomically=false config core.autocrlf false 2>$null
                     git remote add origin $RepoUrlHttps 2>$null
+                    $fetchRef = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
+                    Write-Info "Fetching $fetchRef so the ZIP checkout has a resolvable HEAD..."
+                    $prevZipEAP = $ErrorActionPreference
+                    $ErrorActionPreference = "Continue"
+                    try {
+                        git -c windows.appendAtomically=false fetch --depth 1 origin $fetchRef 2>&1 | Out-Null
+                        if ($LASTEXITCODE -eq 0) {
+                            if ($Commit -or $Tag) {
+                                git -c windows.appendAtomically=false checkout -f --detach FETCH_HEAD 2>&1 | Out-Null
+                            } else {
+                                git -c windows.appendAtomically=false checkout -f -B $Branch FETCH_HEAD 2>&1 | Out-Null
+                            }
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Success "ZIP checkout pinned to $fetchRef"
+                            } else {
+                                # Checkout blocked, but FETCH_HEAD still has a SHA we can stamp with.
+                                $fetchSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
+                                if ($LASTEXITCODE -eq 0 -and $fetchSha) {
+                                    if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = ("$fetchSha").Trim() }
+                                    Write-Warn "ZIP checkout failed; seeded GITHUB_SHA from FETCH_HEAD for desktop stamp"
+                                } else {
+                                    Write-Warn "ZIP extract succeeded but git checkout failed -- desktop build may need `$env:GITHUB_SHA"
+                                }
+                            }
+                        } else {
+                            Write-Warn "ZIP extract succeeded but git fetch of $fetchRef failed -- desktop build may need `$env:GITHUB_SHA"
+                        }
+                    } finally {
+                        $ErrorActionPreference = $prevZipEAP
+                    }
                     Pop-Location
                     Write-Success "Git repo initialized for future updates"
 
@@ -1506,7 +2179,12 @@ function Install-Venv {
     Write-Info "Creating virtual environment with Python $PythonVersion..."
     
     Push-Location $InstallDir
-    
+
+    # Tasks we disabled below and must re-enable no matter how this stage
+    # exits. Populated only with tasks that were ENABLED before we touched
+    # them, so a task the user deliberately disabled is never re-armed.
+    $gatewayTasksDisabled = @()
+    try {
     if (Test-Path "venv") {
         Write-Info "Virtual environment already exists, recreating..."
         # On Windows, native Python extensions (e.g. _bcrypt.pyd, tornado's
@@ -1518,6 +2196,31 @@ function Install-Venv {
         if ($env:OS -eq "Windows_NT") {
             $myPid = $PID
             Write-Info "Stopping any running hermes processes before recreating venv..."
+            # Disarm the respawner FIRST: the gateway autostart Scheduled Task
+            # relaunches a killed gateway within seconds, and losing that race
+            # re-locks the venv's .pyd files between our kill sweep and
+            # Remove-Item (the July 2026 _brotlicffi.pyd incident). schtasks
+            # /End stops a running task instance; /Change /DISABLE stops it
+            # from re-firing mid-install. (The Startup-folder .vbs fallback is
+            # NOT touched: it only fires at logon, so it cannot respawn a
+            # gateway mid-install.) Re-enabled in the finally below -- including
+            # on failure -- but only for tasks that were enabled to begin with.
+            # Best-effort: a missing task just errors quietly.
+            try {
+                schtasks /Query /FO CSV 2>$null | ConvertFrom-Csv | Where-Object { $_.TaskName -like '*Hermes_Gateway*' } | ForEach-Object {
+                    $tn = $_.TaskName
+                    if ($_.Status -eq 'Disabled') {
+                        Write-Info "  gateway autostart task $tn is already disabled; leaving it that way"
+                        return
+                    }
+                    schtasks /End /TN $tn 2>$null | Out-Null
+                    schtasks /Change /TN $tn /DISABLE 2>$null | Out-Null
+                    $gatewayTasksDisabled += $tn
+                    Write-Info "  disabled gateway autostart task $tn for the duration of the install"
+                }
+            } catch {
+                Write-Warn "Could not enumerate gateway scheduled tasks: $($_.Exception.Message)"
+            }
             # The launcher CLI (hermes.exe) plus its child tree.
             & taskkill /F /T /IM hermes.exe /FI "PID ne $myPid" 2>$null | Out-Null
             # taskkill /IM hermes.exe is NOT enough: the gateway/agent that a
@@ -1536,27 +2239,68 @@ function Install-Venv {
             # ExecutablePath for a process it cannot inspect (a different session)
             # instead of throwing, so an unreadable process is skipped rather than
             # aborting the whole sweep.
+            #
+            # The sweep is a bounded LOOP, not single-shot: supervised processes
+            # (the Desktop app's backend, a watchdog-managed gateway) respawn in
+            # the window between one kill pass and the delete. Each pass re-
+            # enumerates; three consecutive clean passes (or the attempt cap)
+            # ends the loop.
             $venvPrefix = [System.IO.Path]::GetFullPath((Join-Path $InstallDir "venv")).TrimEnd('\') + '\'
-            try {
-                Get-CimInstance Win32_Process -ErrorAction Stop |
-                    Where-Object { $_.ProcessId -ne $myPid -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($venvPrefix, [System.StringComparison]::OrdinalIgnoreCase) } |
-                    ForEach-Object {
-                        Write-Info "  stopping PID $($_.ProcessId) ($($_.Name)) running from venv"
-                        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-                    }
-            } catch {
-                Write-Warn "Could not enumerate venv processes: $($_.Exception.Message)"
+            $cleanPasses = 0
+            for ($sweep = 0; $sweep -lt 10 -and $cleanPasses -lt 3; $sweep++) {
+                $found = 0
+                try {
+                    Get-CimInstance Win32_Process -ErrorAction Stop |
+                        Where-Object { $_.ProcessId -ne $myPid -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($venvPrefix, [System.StringComparison]::OrdinalIgnoreCase) } |
+                        ForEach-Object {
+                            $found++
+                            Write-Info "  stopping PID $($_.ProcessId) ($($_.Name)) running from venv"
+                            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                        }
+                } catch {
+                    Write-Warn "Could not enumerate venv processes: $($_.Exception.Message)"
+                    break
+                }
+                if ($found -eq 0) { $cleanPasses++ } else { $cleanPasses = 0 }
+                Start-Sleep -Milliseconds 400
             }
-            Start-Sleep -Milliseconds 800
         }
-        Remove-Item -Recurse -Force "venv" -ErrorAction SilentlyContinue
-        # A killed process can take a moment to release its file handles, so a
-        # first Remove-Item may still hit a locked .pyd. Retry once after a short
-        # pause before giving up and letting the stage fail loudly.
-        if (Test-Path "venv") {
-            Start-Sleep -Seconds 2
-            Remove-Item -Recurse -Force "venv"
+        # Rename-then-delete: on Windows a directory RENAME succeeds even while
+        # files inside it are mapped as DLLs (only in-place delete/replace of
+        # the mapped file is denied, and only same-volume renames are atomic
+        # moves). Moving the old venv aside means `uv venv` can create a fresh
+        # one immediately even if some straggler still holds a .pyd from the
+        # old tree; the renamed dir is deleted best-effort (now, and by the
+        # cleanup pass below on the NEXT install if a handle outlives this one).
+        $staleName = "venv.stale.{0}" -f (Get-Date -Format "yyyyMMddHHmmss")
+        $renamed = $false
+        try {
+            Rename-Item -Path "venv" -NewName $staleName -ErrorAction Stop
+            $renamed = $true
+        } catch {
+            Write-Warn "Could not rename venv aside ($($_.Exception.Message)); falling back to in-place delete"
         }
+        if ($renamed) {
+            Remove-Item -Recurse -Force $staleName -ErrorAction SilentlyContinue
+            if (Test-Path $staleName) {
+                Write-Warn "Old venv parked at $staleName (a process still holds files in it); it will be cleaned up on the next install"
+            }
+        } else {
+            Remove-Item -Recurse -Force "venv" -ErrorAction SilentlyContinue
+            # A killed process can take a moment to release its file handles, so a
+            # first Remove-Item may still hit a locked .pyd. Retry once after a short
+            # pause before giving up and letting the stage fail loudly.
+            if (Test-Path "venv") {
+                Start-Sleep -Seconds 2
+                Remove-Item -Recurse -Force "venv"
+            }
+        }
+    }
+
+    # Clean up parked venvs from previous installs whose handles have since
+    # been released. Best-effort -- a still-held tree just stays for next time.
+    Get-ChildItem -Directory -Filter "venv.stale.*" -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
     }
     
     # uv creates the venv and pins the Python version in one step.  uv emits
@@ -1570,7 +2314,6 @@ function Install-Venv {
     # ok=true) when the venv was never created.
     $venvExitCode = $LASTEXITCODE
     if ($venvExitCode -ne 0) {
-        Pop-Location
         throw "Failed to create virtual environment (uv venv exited with $venvExitCode)"
     }
 
@@ -1585,9 +2328,23 @@ function Install-Venv {
     if (Test-Path $venvPythonExe) {
         $env:UV_PYTHON = $venvPythonExe
     }
+    } finally {
+        Pop-Location
+        # Re-arm the gateway autostart tasks disabled during the venv teardown
+        # -- in a finally so a failed teardown/creation can never strand the
+        # user's gateway autostart in the disabled state. Same function scope,
+        # so the list survives even under the stage-per-process bootstrap.
+        # Deliberately NOT started here -- dependencies aren't installed yet;
+        # the task fires normally on next logon and `hermes update` / the
+        # gateway resume path handles the immediate restart.
+        if ($gatewayTasksDisabled -and $gatewayTasksDisabled.Count -gt 0) {
+            foreach ($tn in $gatewayTasksDisabled) {
+                schtasks /Change /TN $tn /ENABLE 2>$null | Out-Null
+            }
+            Write-Info "Re-enabled gateway autostart task(s): $($gatewayTasksDisabled -join ', ')"
+        }
+    }
 
-    Pop-Location
-    
     Write-Success "Virtual environment ready (Python $PythonVersion)"
 }
 
@@ -1678,7 +2435,7 @@ function Install-Dependencies {
     $brokenExtras = @()
 
     # Parse [project.optional-dependencies].all from pyproject.toml.
-    # tomllib is stdlib on Python 3.11+ which the bootstrap guarantees.
+    # tomllib is stdlib on Python 3.14+ which the bootstrap guarantees.
     $pythonExeForParse = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
     $allExtras = @()
     if (Test-Path $pythonExeForParse) {
@@ -1815,6 +2572,7 @@ print(','.join(scripts))
     $pythonExe = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
     if (Test-Path $pythonExe) {
         $webOk = $false
+        $webServerSyntaxOk = $false
         # Relax EAP=Stop while running the import probe; see the matching
         # comment on the baseline-imports check above.  Python writes
         # deprecation warnings to stderr and we don't want those wrapped
@@ -1826,6 +2584,10 @@ print(','.join(scripts))
             & $pythonExe -c "import fastapi, uvicorn" 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) { $webOk = $true }
         } catch { }
+        try {
+            & $pythonExe -m py_compile "$InstallDir\hermes_cli\web_server.py" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $webServerSyntaxOk = $true }
+        } catch { }
         $ErrorActionPreference = $prevEAP
         if (-not $webOk) {
             Write-Warn "fastapi/uvicorn not importable -- `hermes dashboard` will not work."
@@ -1836,6 +2598,9 @@ print(','.join(scripts))
             } else {
                 Write-Warn "Could not install [web] extra. Run manually: uv pip install --python `"$pythonExe`" `"fastapi>=0.104,<1`" `"uvicorn[standard]>=0.24,<1`""
             }
+        }
+        if (-not $webServerSyntaxOk) {
+            throw "dashboard backend source failed syntax check: hermes_cli/web_server.py"
         }
     }
     
@@ -1886,13 +2651,13 @@ function Set-PathVariable {
 
 function Write-BootstrapMarker {
     # Writes $InstallDir\.hermes-bootstrap-complete which tells the Hermes
-    # desktop app (apps/desktop/electron/main.cjs) "install.ps1 ran
-    # successfully — DON'T trigger the legacy first-launch bootstrap
+    # desktop app (apps/desktop/electron/main.ts) "install.ps1 ran
+    # successfully -- DON'T trigger the legacy first-launch bootstrap
     # runner."
     #
-    # Schema mirrors what main.cjs's writeBootstrapMarker() / isBootstrap
+    # Schema mirrors what main.ts's writeBootstrapMarker() / isBootstrap
     # Complete() expect. Keep this in lockstep when either side changes:
-    #   apps/desktop/electron/main.cjs lines 1199-1222
+    #   apps/desktop/electron/main.ts lines 1199-1222
     #   BOOTSTRAP_MARKER_SCHEMA_VERSION = 1 (line 187)
     #
     # Pinned commit/branch come from -Commit + -Branch flags (passed by
@@ -1908,7 +2673,7 @@ function Write-BootstrapMarker {
     # Resolve the pinned commit: explicit -Commit wins, otherwise read
     # the checkout's HEAD via git. If git can't run, leave commit empty
     # and the marker will fail desktop validation (pinnedCommit.length
-    # >= 7) — better to be invalid than wrong.
+    # >= 7) -- better to be invalid than wrong.
     $pinnedCommit = $Commit
     if (-not $pinnedCommit) {
         # PS 5.1 doesn't support the ?. null-conditional operator, so
@@ -1923,7 +2688,7 @@ function Write-BootstrapMarker {
                     $pinnedCommit = $resolved.Trim()
                 }
             } catch {
-                # Ignore — pinnedCommit stays empty, marker stays invalid,
+                # Ignore -- pinnedCommit stays empty, marker stays invalid,
                 # desktop falls through to its legacy bootstrap path.
             } finally {
                 Pop-Location
@@ -1942,7 +2707,7 @@ function Write-BootstrapMarker {
         pinnedCommit  = $pinnedCommit
         pinnedBranch  = $pinnedBranch
         completedAt   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-        # desktopVersion field intentionally omitted — only the desktop
+        # desktopVersion field intentionally omitted -- only the desktop
         # app knows its own version, and the marker validator doesn't
         # require it. The desktop fills it in if/when it writes its
         # own marker (e.g. after a future in-app upgrade).
@@ -1951,7 +2716,7 @@ function Write-BootstrapMarker {
 
     # Write WITHOUT a UTF-8 BOM. PowerShell 5.1's `Set-Content -Encoding UTF8`
     # always emits a BOM, and Node's plain JSON.parse rejects the BOM as an
-    # unexpected character — so a BOM'd marker would silently fail the
+    # unexpected character -- so a BOM'd marker would silently fail the
     # desktop's readJson(), make isBootstrapComplete() return null, and the
     # desktop would re-run the legacy bootstrap runner anyway. Defeats the
     # whole point. Use the .NET API directly for BOM-less UTF-8.
@@ -2051,13 +2816,18 @@ function Install-NodeDeps {
         # Cross-process driver mode (Hermes-Setup.exe runs each -Stage NAME
         # in a fresh powershell.exe) means $script:HasNode set by Stage-Node
         # in the previous process isn't visible here. Re-probe rather than
-        # trust the stale global — Stage-Node already ran successfully or
+        # trust the stale global -- Stage-Node already ran successfully or
         # the bootstrap would've aborted, so npm is reachable.
         if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
             Write-Info "Skipping Node.js dependencies (Node not installed)"
             return
         }
     }
+
+    # npm lifecycle scripts need node.exe on the PATH visible to child
+    # cmd.exe processes.  Stage-Node may have run in a prior process, so
+    # re-apply here before any npm install (regression #48130).
+    Ensure-NodeExeOnPath | Out-Null
 
     # Resolve npm explicitly to npm.cmd, NOT npm.ps1.  Node.js on Windows
     # ships BOTH npm.cmd (a batch shim) and npm.ps1 (a PowerShell shim).
@@ -2323,7 +3093,7 @@ function Clear-ElectronBuildCache {
 # Last-resort Electron mirror after GitHub download fails (#47266).
 $script:DesktopElectronFallbackMirror = "https://npmmirror.com/mirrors/electron/"
 
-# Electron package dir — workspace-local nest first, then root hoist.
+# Electron package dir -- workspace-local nest first, then root hoist.
 function Get-ElectronDir {
     param([string]$InstallDir)
     $desktopLocal = Join-Path $InstallDir 'apps\desktop\node_modules\electron'
@@ -2331,7 +3101,7 @@ function Get-ElectronDir {
     return (Join-Path $InstallDir 'node_modules\electron')
 }
 
-# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.cjs).
+# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.mjs).
 function Test-ElectronDist {
     param([string]$InstallDir)
     $electronDir = Get-ElectronDir -InstallDir $InstallDir
@@ -2404,7 +3174,7 @@ function Install-Desktop {
     #
     # The Tauri bootstrap installer's launch_hermes_desktop command
     # resolves apps/desktop/release/win-unpacked/Hermes.exe directly,
-    # so an "unpacked" build (electron-builder --dir) is enough — we
+    # so an "unpacked" build (electron-builder --dir) is enough -- we
     # don't need to produce an NSIS/MSI artifact here.
 
     # Always re-resolve Node here. Stages run in separate PowerShell processes,
@@ -2458,7 +3228,7 @@ function Install-Desktop {
         #
         # The streaming sink in bootstrap.rs's run_install_script
         # captures every stdout/stderr line as it's emitted, so we don't
-        # need a side TEMP log file — the installer's bootstrap log
+        # need a side TEMP log file -- the installer's bootstrap log
         # IS the artifact a support engineer reads.
         #
         # Prefer `npm ci`: it wipes node_modules and reinstalls from the
@@ -2513,7 +3283,7 @@ function Install-Desktop {
     # NOT signing the output. Combined with signAndEditExecutable=false in
     # apps/desktop/package.json's build.win block, electron-builder never
     # invokes signtool and therefore never fetches/extracts winCodeSign
-    # (whose macOS symlinks crash 7-Zip on non-admin Windows — a dead end we
+    # (whose macOS symlinks crash 7-Zip on non-admin Windows -- a dead end we
     # are NOT trying to work around). The Hermes icon + product name are
     # stamped onto Hermes.exe by our own rcedit step (Set-DesktopExeIdentity)
     # AFTER this build, completely decoupled from electron-builder signing.
@@ -2523,6 +3293,41 @@ function Install-Desktop {
     # for some other tool, electron-builder would still try to sign.
     Write-Info "Building desktop app (this takes 1-3 minutes)..."
     $buildLog = "$env:TEMP\hermes-desktop-build-$(Get-Random).log"
+    # Seed GITHUB_SHA for write-build-stamp.mjs. The stamp prefers CI env vars
+    # over `git rev-parse`, so this covers: (1) node can't find git.exe on PATH
+    # even though this PowerShell session can, (2) ZIP/init trees that still
+    # lack a HEAD after a failed post-extract fetch. Without it the desktop
+    # pack dies with "could not determine git commit" (#50823).
+    if (-not $env:GITHUB_SHA) {
+        if ($Commit) {
+            $env:GITHUB_SHA = $Commit
+        } else {
+            Push-Location $InstallDir
+            try {
+                $global:LASTEXITCODE = 0
+                $resolvedSha = & git -c windows.appendAtomically=false rev-parse HEAD 2>$null
+                if ($LASTEXITCODE -ne 0 -or -not $resolvedSha) {
+                    # ZIP path may have FETCH_HEAD after a fetch even when HEAD is unset.
+                    $global:LASTEXITCODE = 0
+                    $resolvedSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
+                }
+                if ($LASTEXITCODE -eq 0 -and $resolvedSha) {
+                    $env:GITHUB_SHA = ("$resolvedSha").Trim()
+                }
+            } catch { } finally {
+                Pop-Location
+            }
+        }
+    }
+    if (-not $env:GITHUB_REF_NAME) {
+        $env:GITHUB_REF_NAME = if ($Branch) { $Branch } else { "main" }
+    }
+    if ($env:GITHUB_SHA) {
+        $shaPreview = if ($env:GITHUB_SHA.Length -ge 12) { $env:GITHUB_SHA.Substring(0, 12) } else { $env:GITHUB_SHA }
+        Write-Info "Desktop build stamp: $shaPreview ($($env:GITHUB_REF_NAME))"
+    } else {
+        Write-Warn "Could not resolve a git commit for the desktop stamp -- write-build-stamp will use its non-git fallback"
+    }
     Push-Location $desktopDir
     $prevEAP = $ErrorActionPreference
     $prevCSCAuto = $env:CSC_IDENTITY_AUTO_DISCOVERY
@@ -2584,7 +3389,7 @@ function Install-Desktop {
         Pop-Location
         throw
     } finally {
-        # Restore env to whatever the caller had — don't leak our
+        # Restore env to whatever the caller had -- don't leak our
         # signing-off override into anything install.ps1 invokes later
         # (Stage-PlatformSdks, etc.).
         $env:CSC_IDENTITY_AUTO_DISCOVERY = $prevCSCAuto
@@ -2614,17 +3419,34 @@ function Install-Desktop {
     }
 
     # 3b. The Hermes icon + identity are stamped onto Hermes.exe by the
-    #     electron-builder `afterPack` hook (apps/desktop/scripts/after-pack.cjs)
-    #     during `npm run pack` above — for every build, so the installer's
+    #     electron-builder `afterPack` hook (apps/desktop/scripts/after-pack.mjs)
+    #     during `npm run pack` above -- for every build, so the installer's
     #     --update rebuild stays branded too. No separate stamp step needed here.
     #     electron-builder's own rcedit step stays disabled (signAndEditExecutable
     #     =false) because enabling it drags in signtool -> winCodeSign -> the
     #     unfixable symlink crash; the afterPack hook runs rcedit directly.
 
+    # 3c. Grant ALL APPLICATION PACKAGES (S-1-15-2-2) RX on the unpacked app
+    #     directory. Chromium's GPU/renderer sandboxes CHECK-fail with
+    #     0x80000003 when this ACE is missing alongside orphan AppContainer
+    #     SIDs under %LOCALAPPDATA% (electron/electron#51761, hermes-agent#38216).
+    #     Best-effort -- never fail an otherwise-good install over ACL repair.
+    try {
+        $appDir = Split-Path -Parent $desktopExe
+        & icacls $appDir /grant "*S-1-15-2-2:(OI)(CI)(RX)" /T /C /Q | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Granted AppContainer read access on $appDir"
+        } else {
+            Write-Warn "icacls AppContainer grant returned exit $LASTEXITCODE for $appDir"
+        }
+    } catch {
+        Write-Warn "Could not grant AppContainer ACL: $($_.Exception.Message)"
+    }
+
     # 4. Create Start Menu + Desktop shortcuts pointing DIRECTLY at the packed
     #    Hermes.exe. We deliberately do NOT point them at `hermes desktop`: that
     #    command rebuilds (npm install + electron-builder) on every launch,
-    #    which would cost minutes each time. The packed exe is the consumer —
+    #    which would cost minutes each time. The packed exe is the consumer --
     #    launching it directly is instant, and updates flow through the
     #    installer's --update path (which rebuilds once, then relaunches).
     New-DesktopShortcuts -TargetExe $desktopExe
@@ -2680,11 +3502,11 @@ function New-DesktopShortcuts {
         # cached bitmap. Critical on the --update path: the exe was re-stamped
         # with the Hermes icon, but without this the shortcut can keep drawing
         # the old Electron icon until the user manually refreshes / reboots.
-        # Best-effort and silent — never fail the install over a cosmetic cache.
+        # Best-effort and silent -- never fail the install over a cosmetic cache.
         try {
             & ie4uinit.exe -show 2>$null
         } catch {
-            # ie4uinit may be absent/renamed on some SKUs — ignore.
+            # ie4uinit may be absent/renamed on some SKUs -- ignore.
         }
     } catch {
         Write-Warn "Skipping shortcut creation: $($_.Exception.Message)"
@@ -2963,6 +3785,12 @@ function Write-Completion {
         Write-Host "  winget install BurntSushi.ripgrep.MSVC" -ForegroundColor Yellow
         Write-Host ""
     }
+    
+    if (-not $HasCoreutils -and ($env:OS -eq "Windows_NT")) {
+        Write-Host "Note: Microsoft Coreutils was not installed. For POSIX CLI tools (cat, cp, mv, ls):" -ForegroundColor Yellow
+        Write-Host "  winget install Microsoft.Coreutils" -ForegroundColor Yellow
+        Write-Host ""
+    }
 }
 
 # ============================================================================
@@ -3043,7 +3871,7 @@ $InstallStages = @(
     @{ Name = "python";           Title = "Verifying Python $PythonVersion";      Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Python" }
     @{ Name = "git";              Title = "Installing Git";                       Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Git" }
     @{ Name = "node";             Title = "Detecting Node.js";                    Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Node" }
-    @{ Name = "system-packages";  Title = "Installing ripgrep and ffmpeg";        Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-SystemPackages" }
+    @{ Name = "system-packages";  Title = "Installing ripgrep, ffmpeg, and Coreutils";        Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-SystemPackages" }
     @{ Name = "repository";       Title = "Cloning Hermes repository";            Category = "install";      NeedsUserInput = $false; Worker = "Stage-Repository" }
     @{ Name = "venv";             Title = "Creating Python virtual environment";  Category = "install";      NeedsUserInput = $false; Worker = "Stage-Venv" }
     @{ Name = "dependencies";     Title = "Installing Python dependencies";       Category = "install";      NeedsUserInput = $false; Worker = "Stage-Dependencies" }
@@ -3079,7 +3907,12 @@ $InstallStages += @(
 # process), and throws cleanly if uv truly isn't installed yet.
 function Stage-Uv               { if (-not (Install-Uv))     { throw "uv installation failed" } }
 function Stage-Python           { Resolve-UvCmd; if (-not (Test-Python))    { throw "Python $PythonVersion not available" } }
-function Stage-Git              { if (-not (Install-Git))    { throw "Git not available and auto-install failed -- install from https://git-scm.com/download/win then re-run" } }
+function Stage-Git              {
+    if (-not (Install-Git)) {
+        if ($script:GitInstallFailureReason) { throw $script:GitInstallFailureReason }
+        throw "Git not available and auto-install failed -- install from https://git-scm.com/download/win then re-run"
+    }
+}
 # Node is optional (browser tools degrade gracefully without it).  Surface
 # failure to the JSON contract as skipped=true / reason rather than ok=true,
 # so a GUI driver consuming the manifest can distinguish "node ready" from
@@ -3193,10 +4026,6 @@ function Invoke-Stage {
 # ============================================================================
 
 function Invoke-AllStages {
-    # Defensive check: powershell.exe ships with every Windows 10/11 system.
-    if (-not (Get-Command powershell.exe -ErrorAction SilentlyContinue)) {
-        throw "Windows PowerShell (powershell.exe) is required but was not found. PowerShell ships with every Windows 10/11 system — check your system PATH."
-    }
     Step-OutOfInstallDir
     foreach ($s in $InstallStages) {
         Invoke-Stage -StageDef $s
@@ -3226,10 +4055,19 @@ function Invoke-EnsureMode {
                 }
             }
             "ripgrep" {
-                Write-Info "ripgrep: install manually on Windows (scoop install ripgrep)"
+                Install-ManagedRipgrep
             }
             "ffmpeg" {
                 Write-Info "ffmpeg: install manually on Windows (scoop install ffmpeg)"
+            }
+            "coreutils" {
+                Install-Coreutils
+            }
+            "rtk" {
+                Install-ManagedRtk
+                if (-not (Test-RtkBinary)) {
+                    Write-Warn "rtk could not be installed (token-kill will be unavailable)"
+                }
             }
             default {
                 Write-Err "Unknown dependency: $dep"

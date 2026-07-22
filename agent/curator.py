@@ -21,10 +21,10 @@ Strict invariants:
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,12 +45,26 @@ def _strip_aux_credential(value: Any) -> Optional[str]:
 
 
 class _ReviewRuntimeBinding(NamedTuple):
-    """Provider/model for the curator review fork plus optional per-slot overrides."""
+    """Provider/model for the curator review fork plus per-slot overrides."""
 
     provider: str
     model: str
     explicit_api_key: Optional[str]
     explicit_base_url: Optional[str]
+    request_overrides: Dict[str, Any]
+
+
+def _merge_request_overrides(
+    runtime_overrides: Any,
+    slot_extra_body: Any,
+) -> Dict[str, Any]:
+    """Merge resolver metadata with task-local request body fields."""
+    merged = dict(runtime_overrides or {})
+    if isinstance(slot_extra_body, dict) and slot_extra_body:
+        extra_body = dict(merged.get("extra_body") or {})
+        extra_body.update(slot_extra_body)
+        merged["extra_body"] = extra_body
+    return merged
 
 
 DEFAULT_INTERVAL_HOURS = 24 * 7  # 7 days
@@ -89,12 +103,12 @@ def load_state() -> Dict[str, Any]:
     if not path.exists():
         return _default_state()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = orjson.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             base = _default_state()
             base.update({k: v for k, v in data.items() if k in base or k.startswith("_")})
             return base
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, orjson.JSONDecodeError) as e:
         logger.debug("Failed to read curator state: %s", e)
     return _default_state()
 
@@ -639,7 +653,7 @@ def _classify_removed_skills(
             args = raw
         elif isinstance(raw, str):
             try:
-                args = json.loads(raw)
+                args = orjson.loads(raw)
             except Exception:
                 # Truncated or malformed — fall back to substring match on
                 # the raw string so we still catch the common case.
@@ -743,7 +757,7 @@ def _parse_structured_summary(
     # Find the YAML fenced block. We look for ```yaml ... ``` specifically
     # rather than any fenced block so we don't accidentally pick up a code
     # sample the model quoted elsewhere.
-    import re
+    from agent.re_compat import re
     match = re.search(
         r"```ya?ml\s*\n(.*?)\n```",
         llm_final,
@@ -832,7 +846,7 @@ def _extract_absorbed_into_declarations(
             args = raw
         elif isinstance(raw, str):
             try:
-                args = json.loads(raw)
+                args = orjson.loads(raw)
             except Exception:
                 continue
         if not isinstance(args, dict):
@@ -1241,7 +1255,7 @@ def _write_run_report(
     # run.json — machine-readable, full fidelity
     try:
         (run_dir / "run.json").write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n",
             encoding="utf-8",
         )
     except Exception as e:
@@ -1259,7 +1273,7 @@ def _write_run_report(
     try:
         if int(cron_rewrites.get("jobs_updated", 0)) > 0:
             (run_dir / "cron_rewrites.json").write_text(
-                json.dumps(cron_rewrites, indent=2, ensure_ascii=False) + "\n",
+                orjson.dumps(cron_rewrites, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n",
                 encoding="utf-8",
             )
     except Exception as e:
@@ -1764,6 +1778,7 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
             _task_model,
             _strip_aux_credential(_cur_task.get("api_key")),
             _strip_aux_credential(_cur_task.get("base_url")),
+            _merge_request_overrides({}, _cur_task.get("extra_body")),
         )
 
     # 2. Legacy curator.auxiliary.{provider,model} (deprecated, pre-unification)
@@ -1781,10 +1796,11 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
             str(_legacy_model),
             _strip_aux_credential(_legacy.get("api_key")),
             _strip_aux_credential(_legacy.get("base_url")),
+            _merge_request_overrides({}, _legacy.get("extra_body")),
         )
 
     # 3. Fall through to the main chat model
-    return _ReviewRuntimeBinding(_main_provider, _main_model, None, None)
+    return _ReviewRuntimeBinding(_main_provider, _main_model, None, None, {})
 
 
 def _resolve_review_model(cfg: Dict[str, Any]) -> tuple[str, str]:
@@ -1850,6 +1866,11 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _base_url = None
     _api_mode = None
     _resolved_provider = None
+    _credential_pool = None
+    _request_overrides: Dict[str, Any] = {}
+    _max_tokens = None
+    _acp_command = None
+    _acp_args = None
     _model_name = ""
     try:
         from hermes_cli.config import load_config
@@ -1867,6 +1888,16 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         _base_url = _rp.get("base_url")
         _api_mode = _rp.get("api_mode")
         _resolved_provider = _rp.get("provider") or _provider
+        _credential_pool = _rp.get("credential_pool")
+        _request_overrides = _merge_request_overrides(
+            _rp.get("request_overrides"),
+            _binding.request_overrides.get("extra_body"),
+        )
+        _max_tokens = _rp.get("max_output_tokens")
+        _acp_command = _rp.get("command")
+        _acp_args = list(_rp.get("args") or [])
+        if isinstance(_rp.get("model"), str) and _rp["model"].strip():
+            _model_name = _rp["model"].strip()
     except Exception as e:
         logger.debug("Curator provider resolution failed: %s", e, exc_info=True)
 
@@ -1875,12 +1906,21 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
 
     review_agent = None
     try:
+        _agent_kwargs: Dict[str, Any] = {}
+        if isinstance(_max_tokens, int):
+            _agent_kwargs["max_tokens"] = _max_tokens
+        if isinstance(_acp_command, str) and _acp_command:
+            _agent_kwargs["acp_command"] = _acp_command
+            _agent_kwargs["acp_args"] = _acp_args or []
         review_agent = AIAgent(
             model=_model_name,
             provider=_resolved_provider,
             api_key=_api_key,
             base_url=_base_url,
             api_mode=_api_mode,
+            credential_pool=_credential_pool,
+            request_overrides=_request_overrides,
+            **_agent_kwargs,
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The

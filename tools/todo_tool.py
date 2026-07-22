@@ -14,7 +14,7 @@ Design:
 - Behavioral guidance lives entirely in the tool schema description
 """
 
-import json
+import orjson
 from typing import Dict, Any, List, Optional
 
 
@@ -30,6 +30,11 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # task description, and active lists are a handful of items, not hundreds.
 MAX_TODO_CONTENT_CHARS = 4000
 MAX_TODO_ITEMS = 256
+# Upper bound on a single todo tool-result payload accepted during history
+# hydration. The gateway/API server replays caller-supplied conversation
+# history to rebuild the store, so an oversized forged result is dropped
+# before it is parsed and re-injected (see AIAgent._hydrate_todo_store).
+MAX_TODO_RESULT_CHARS = 512_000
 _TRUNCATION_MARKER = "… [truncated]"
 
 
@@ -214,8 +219,8 @@ def todo_tool(
         # Guard: LLM sometimes sends todos as a JSON string instead of a list
         if isinstance(todos, str):
             try:
-                todos = json.loads(todos)
-            except (json.JSONDecodeError, TypeError):
+                todos = orjson.loads(todos)
+            except (orjson.JSONDecodeError, TypeError):
                 return tool_error("todos must be a list of objects, got unparseable string")
         if not isinstance(todos, list):
             return tool_error(
@@ -231,7 +236,7 @@ def todo_tool(
     completed = sum(1 for i in items if i["status"] == "completed")
     cancelled = sum(1 for i in items if i["status"] == "cancelled")
 
-    return json.dumps({
+    return orjson.dumps({
         "todos": items,
         "summary": {
             "total": len(items),
@@ -240,7 +245,7 @@ def todo_tool(
             "completed": completed,
             "cancelled": cancelled,
         },
-    }, ensure_ascii=False)
+    }).decode('utf-8')
 
 
 def check_todo_requirements() -> bool:

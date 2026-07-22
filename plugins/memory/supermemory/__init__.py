@@ -6,10 +6,10 @@ explicit memory tools, cleaned turn capture, and session-end conversation ingest
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import threading
 import urllib.error
 import urllib.request
@@ -101,7 +101,7 @@ def _load_supermemory_config(hermes_home: str) -> dict:
     config_path = Path(hermes_home) / "supermemory.json"
     if config_path.exists():
         try:
-            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw = orjson.loads(config_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 config.update({k: v for k, v in raw.items() if v is not None})
         except Exception:
@@ -147,7 +147,7 @@ def _save_supermemory_config(values: dict, hermes_home: str) -> None:
     existing = {}
     if config_path.exists():
         try:
-            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw = orjson.loads(config_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 existing = raw
         except Exception:
@@ -264,6 +264,19 @@ def _is_trivial_message(text: str) -> bool:
 
 class _SupermemoryClient:
     def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid"):
+        # Lazy-install the supermemory SDK on demand. ensure() honors
+        # security.allow_lazy_installs (default true) and, on a sealed Docker
+        # venv, redirects the install to the durable target. On failure we
+        # fall through so the raw import below produces the canonical
+        # ImportError message.
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("memory.supermemory", prompt=False)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
         from supermemory import Supermemory
 
         self._api_key = api_key
@@ -376,7 +389,7 @@ class _SupermemoryClient:
 
         req = urllib.request.Request(
             _CONVERSATIONS_URL,
-            data=json.dumps(payload).encode("utf-8"),
+            data=orjson.dumps(payload),
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
@@ -533,14 +546,14 @@ class SupermemoryMemoryProvider(MemoryProvider):
         return "supermemory"
 
     def is_available(self) -> bool:
-        api_key = os.environ.get("SUPERMEMORY_API_KEY", "")
-        if not api_key:
-            return False
-        try:
-            __import__("supermemory")
-            return True
-        except Exception:
-            return False
+        # Key presence only — no SDK import check. The supermemory SDK is
+        # lazy-installed when the client is first constructed in initialize()
+        # (see _SupermemoryClient.__init__). Gating availability on the SDK
+        # being importable here would be a chicken-and-egg trap: on a sealed
+        # Docker venv the package isn't present until ensure() runs, but
+        # ensure() only runs once the provider is loaded — which this gates.
+        # Mirrors honcho/mem0, which check config only. No network calls.
+        return bool(os.environ.get("SUPERMEMORY_API_KEY", ""))
 
     def get_config_schema(self):
         # Only prompt for the API key during `hermes memory setup`.
@@ -869,7 +882,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 kebab = aliases.get(schema.get("name", ""))
                 if not kebab:
                     continue
-                copy = json.loads(json.dumps(schema))
+                copy = orjson.loads(orjson.dumps(schema).decode('utf-8'))
                 copy["name"] = kebab
                 expanded.append(copy)
             return expanded
@@ -884,7 +897,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         }
         schemas = []
         for base in [STORE_SCHEMA, SEARCH_SCHEMA, FORGET_SCHEMA, PROFILE_SCHEMA]:
-            schema = json.loads(json.dumps(base))  # deep copy
+            schema = orjson.loads(orjson.dumps(base).decode('utf-8'))  # deep copy
             schema["parameters"]["properties"]["container_tag"] = container_param
             schemas.append(schema)
         return with_kebab_aliases(schemas)
@@ -908,7 +921,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             resp: dict[str, Any] = {"saved": True, "id": result.get("id", ""), "preview": preview}
             if tag:
                 resp["container_tag"] = tag
-            return json.dumps(resp)
+            return orjson.dumps(resp).decode('utf-8')
         except Exception as exc:
             return tool_error(f"Failed to store memory: {exc}")
 
@@ -938,7 +951,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             resp: dict[str, Any] = {"results": formatted, "count": len(formatted)}
             if tag:
                 resp["container_tag"] = tag
-            return json.dumps(resp)
+            return orjson.dumps(resp).decode('utf-8')
         except Exception as exc:
             return tool_error(f"Search failed: {exc}")
 
@@ -954,8 +967,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         try:
             if memory_id:
                 self._client.forget_memory(memory_id, container_tag=tag)
-                return json.dumps({"forgotten": True, "id": memory_id})
-            return json.dumps(self._client.forget_by_query(query, container_tag=tag))
+                return orjson.dumps({"forgotten": True, "id": memory_id}).decode('utf-8')
+            return orjson.dumps(self._client.forget_by_query(query, container_tag=tag)).decode('utf-8')
         except Exception as exc:
             return tool_error(f"Forget failed: {exc}")
 
@@ -979,7 +992,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             }
             if tag:
                 resp["container_tag"] = tag
-            return json.dumps(resp)
+            return orjson.dumps(resp).decode('utf-8')
         except Exception as exc:
             return tool_error(f"Profile failed: {exc}")
 

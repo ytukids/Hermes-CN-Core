@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import html
-import json
+import orjson
 import logging
 import os
 from typing import Any, Dict, Optional
@@ -102,6 +102,9 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT = 3978
+# Bot Framework activities are JSON payloads well under 1 MiB; an explicit
+# aiohttp client_max_size keeps oversized/chunked request bodies bounded.
+_MAX_BODY_BYTES = 1_048_576
 _WEBHOOK_PATH = "/api/messages"
 
 
@@ -374,7 +377,7 @@ class _AiohttpBridgeAdapter:
             if resp_body is not None:
                 return web.Response(
                     status=status,
-                    body=json.dumps(resp_body),
+                    body=orjson.dumps(resp_body).decode('utf-8'),
                     content_type="application/json",
                 )
             return web.Response(status=status)
@@ -467,7 +470,7 @@ _ALLOWED_TEAMS_SERVICE_HOSTS = frozenset({
 # combine digits, colons, hyphens, dots, '@', and the ``thread.skype`` /
 # ``thread.tacv2`` suffixes; reject anything outside this set so a hostile
 # value cannot path-traverse out of ``/v3/conversations/<id>/activities``.
-import re as _re_teams
+from agent.re_compat import re as _re_teams
 _TEAMS_CONV_ID_RE = _re_teams.compile(r"^[A-Za-z0-9:@\-_.]+$")
 
 
@@ -738,8 +741,12 @@ class TeamsAdapter(BasePlatformAdapter):
             return False
 
         try:
-            # Set up aiohttp app first — the bridge adapter wires SDK routes into it
-            aiohttp_app = web.Application()
+            # Set up aiohttp app first — the bridge adapter wires SDK routes into it.
+            # client_max_size: Bot Framework activities are JSON (caps out well
+            # under 1 MiB); an explicit cap keeps oversized/chunked bodies from
+            # being buffered unbounded on a 0.0.0.0 bind (same pattern as
+            # webhook.py / raft, #58536/#58902).
+            aiohttp_app = web.Application(client_max_size=_MAX_BODY_BYTES)
             aiohttp_app.router.add_get("/health", lambda _: web.Response(text="ok"))
 
             self._app = App(
@@ -850,7 +857,7 @@ class TeamsAdapter(BasePlatformAdapter):
             text = activity.text
         # Strip <at>BotName</at> HTML tags that Teams prepends for @mentions
         if "<at>" in text:
-            import re
+            from agent.re_compat import re
             text = re.sub(r"<at>[^<]*</at>\s*", "", text).strip()
 
         # Determine chat type from conversation
@@ -1091,6 +1098,9 @@ class TeamsAdapter(BasePlatformAdapter):
         session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         """Send an Adaptive Card approval prompt with Allow/Deny buttons."""
         if not self._app:
@@ -1104,39 +1114,34 @@ class TeamsAdapter(BasePlatformAdapter):
             "desc": description,
         }
 
-        card = (
-            AdaptiveCard()
-            .with_version("1.4")
-            .with_body([
-                TextBlock(text="⚠️ Command Approval Required", wrap=True, weight="Bolder"),
-                TextBlock(text=f"```\n{cmd_preview}\n```", wrap=True),
-                TextBlock(text=f"Reason: {description}", wrap=True, isSubtle=True),
-            ])
-            .with_actions([
-                ExecuteAction(
-                    title="Allow Once",
-                    verb="hermes_approve",
-                    data={**btn_data_base, "hermes_action": "approve_once"},
-                    style="positive",
-                ),
-                ExecuteAction(
-                    title="Allow Session",
-                    verb="hermes_approve",
-                    data={**btn_data_base, "hermes_action": "approve_session"},
-                ),
-                ExecuteAction(
-                    title="Always Allow",
-                    verb="hermes_approve",
+        actions = [ExecuteAction(
+            title="Allow Once", verb="hermes_approve",
+            data={**btn_data_base, "hermes_action": "approve_once"}, style="positive",
+        )]
+        if not smart_denied and allow_session:
+            actions.append(ExecuteAction(
+                title="Allow Session", verb="hermes_approve",
+                data={**btn_data_base, "hermes_action": "approve_session"},
+            ))
+            if allow_permanent:
+                actions.append(ExecuteAction(
+                    title="Always Allow", verb="hermes_approve",
                     data={**btn_data_base, "hermes_action": "approve_always"},
-                ),
-                ExecuteAction(
-                    title="Deny",
-                    verb="hermes_approve",
-                    data={**btn_data_base, "hermes_action": "deny"},
-                    style="destructive",
-                ),
-            ])
-        )
+                ))
+        actions.append(ExecuteAction(
+            title="Deny", verb="hermes_approve",
+            data={**btn_data_base, "hermes_action": "deny"}, style="destructive",
+        ))
+        body = [
+            TextBlock(text="⚠️ Command Approval Required", wrap=True, weight="Bolder"),
+            TextBlock(text=f"```\n{cmd_preview}\n```", wrap=True),
+            TextBlock(text=f"Reason: {description}", wrap=True, isSubtle=True),
+        ]
+        if smart_denied:
+            body.append(TextBlock(
+                text="Smart DENY: owner override applies to this one operation only.", wrap=True
+            ))
+        card = AdaptiveCard().with_version("1.4").with_body(body).with_actions(actions)
 
         try:
             result = await self._send_card(chat_id, card)
@@ -1210,7 +1215,7 @@ class TeamsAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Teams app not initialized")
 
         try:
-            import base64
+            import pybase64 as base64
             import mimetypes
             from microsoft_teams.api import Attachment, MessageActivityInput
 

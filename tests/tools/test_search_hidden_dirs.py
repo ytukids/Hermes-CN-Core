@@ -12,10 +12,12 @@ on which backend was available.
 Fix: _search_files (find) and _search_with_grep both now exclude hidden
 directories, matching ripgrep's default behavior.
 """
-
+import shutil
 import subprocess
+import sys
 
 import pytest
+from hermes_cli.dep_ensure import _find_rg
 
 
 @pytest.fixture
@@ -41,6 +43,10 @@ def searchable_tree(tmp_path):
     return tmp_path / "skills"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX find only",
+)
 class TestFindExcludesHiddenDirs:
     """_search_files uses find, which should exclude hidden directories."""
 
@@ -71,6 +77,10 @@ class TestFindExcludesHiddenDirs:
         assert "SKILL.md" in result.stdout
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX grep only",
+)
 class TestGrepExcludesHiddenDirs:
     """_search_with_grep should exclude hidden directories."""
 
@@ -97,7 +107,7 @@ class TestRipgrepAlreadyExcludesHidden:
     """Verify ripgrep's default behavior is to skip hidden directories."""
 
     @pytest.mark.skipif(
-        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        _find_rg() is None,
         reason="ripgrep not installed",
     )
     def test_rg_skips_hub_by_default(self, searchable_tree):
@@ -110,7 +120,7 @@ class TestRipgrepAlreadyExcludesHidden:
         assert "catalog.json" not in result.stdout
 
     @pytest.mark.skipif(
-        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        _find_rg() is None,
         reason="ripgrep not installed",
     )
     def test_rg_finds_visible_content(self, searchable_tree):

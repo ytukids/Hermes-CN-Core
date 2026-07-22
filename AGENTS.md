@@ -506,7 +506,7 @@ The dashboard embeds the real `hermes --tui` — **not** a rewrite.  See `hermes
 
 ### Electron Desktop Chat App (`apps/desktop/`)
 
-A **separate** chat surface from both the classic CLI and the dashboard's embedded TUI. It is an Electron + React + nanostore renderer (`@assistant-ui/react`) that talks to a `tui_gateway` backend over JSON-RPC (`requestGateway(method, params)`). It does NOT embed `hermes --tui` — it has its own composer, transcript, and slash-command pipeline. Route desktop bugs to the `hermes-desktop-app-work` skill, not `hermes-dashboard-work`.
+A **separate** chat surface from both the classic CLI and the dashboard's embedded TUI. It is an Electron + React + nanostore renderer (`@assistant-ui/react`) that talks to a `tui_gateway` backend over JSON-RPC (`requestGateway(method, params)`). The WebSocket/JSON-RPC transport lives in the framework-agnostic `apps/shared` package (`@hermes/shared` — `JsonRpcGatewayClient` + WS URL helpers), which the web dashboard (`web/`) also consumes; **desktop has no build/runtime dependency on the dashboard frontend** — it spawns a headless `hermes serve` backend server (the same gateway `dashboard` serves, minus the browser UI entirely: `serve` sets `headless_backend=True`, so `cmd_dashboard` skips `_build_web_ui` AND exports `HERMES_SERVE_HEADLESS=1` so `mount_spa()` disables the SPA even if a stray `web_dist/` exists — only the JSON-RPC/WS/API surface is reachable). `dashboard` and `serve` share `cmd_dashboard`/`start_server` but are independent surfaces — neither launches the other. The one exception is a backward-compat *fallback*: `serve` is newer, so the desktop spawn (`electron/backend-command.cjs` + `backendSupportsServe()` in `main.cjs`) detects whether the resolved runtime registers `serve` and, only when it does not (an older managed install / PATH `hermes` the app hasn't updated yet), rewrites the argv to the legacy `dashboard --no-open`. Without that, a new app against an un-upgraded runtime would crash on an unknown subcommand and brick every mid-upgrade user. It does NOT embed `hermes --tui` — it has its own composer, transcript, and slash-command pipeline. Route desktop bugs to the `hermes-desktop-app-work` skill, not `hermes-dashboard-work`.
 
 **Slash commands in the desktop app are curated client-side, then dispatched to the backend.** The pipeline:
 
@@ -1315,7 +1315,7 @@ subprocess, orchestrated by `scripts/run_tests_parallel.py`. This means
 module-level dicts/sets and ContextVars from one file cannot leak into the
 next — the historic `_reset_module_state` autouse fixture is gone.
 
-Implementation notes:
+### Why the wrapper
 
 - Each file is a separate `python -m pytest <file>` process — there is no
   xdist and no in-tree pytest plugin. Parallelism is `--jobs` (default
@@ -1324,7 +1324,7 @@ Implementation notes:
   fan-out amortizes it across cores while staying flake-free.
 - `--file-timeout` (default 140s per file, env `HERMES_TEST_FILE_TIMEOUT`)
   SIGKILLs an overrunning file and surfaces it as a failure report.
-- CI shards the suite with `--slice N/6`.
+- CI shards the suite with `--slice N/8`.
 
 ### Why the wrapper (and why the old "just call pytest" doesn't work)
 

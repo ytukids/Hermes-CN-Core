@@ -17,8 +17,8 @@ OpenAI-compat layer entirely.
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
+import pybase64 as base64
+import orjson
 import logging
 import time
 import uuid
@@ -27,9 +27,17 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
 
+from agent.bounded_response import read_streaming_error_body
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
+
+try:
+    import hermes_cli as _hermes_cli
+
+    _HERMES_VERSION = str(_hermes_cli.__version__)
+except Exception:
+    _HERMES_VERSION = "0.0.0"
 
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -98,7 +106,10 @@ def probe_gemini_tier(
                 url,
                 params={"key": key},
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Client": f"hermes-agent/{_HERMES_VERSION}",
+                },
             )
     except Exception as exc:
         logger.debug("probe_gemini_tier: network error: %s", exc)
@@ -246,8 +257,8 @@ def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     fn = tool_call.get("function") or {}
     args_raw = fn.get("arguments", "")
     try:
-        args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw else {}
-    except json.JSONDecodeError:
+        args = orjson.loads(args_raw) if isinstance(args_raw, str) and args_raw else {}
+    except orjson.JSONDecodeError:
         args = {"_raw": args_raw}
     if not isinstance(args, dict):
         args = {"_value": args}
@@ -278,8 +289,8 @@ def _translate_tool_result_to_gemini(
     )
     content = _coerce_content_to_text(message.get("content"))
     try:
-        parsed = json.loads(content) if content.strip().startswith(("{", "[")) else None
-    except json.JSONDecodeError:
+        parsed = orjson.loads(content) if content.strip().startswith(("{", "[")) else None
+    except orjson.JSONDecodeError:
         parsed = None
     response = parsed if isinstance(parsed, dict) else {"output": content}
     return {
@@ -336,6 +347,22 @@ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[st
 
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
+
+    # Gemini's generateContent requires strict user/model alternation;
+    # consecutive same-role contents are rejected with HTTP 400 "Please ensure
+    # that multiturn requests alternate between user and model". The loop above
+    # emits one content per source message, so parallel tool calls (N tool
+    # results become N user functionResponse contents), back-to-back user turns,
+    # or merged assistant turns would each violate that. Merge adjacent
+    # same-role contents by concatenating their parts. For parallel calls this
+    # also produces the grouped multi-functionResponse turn Gemini expects.
+    merged_contents: List[Dict[str, Any]] = []
+    for content in contents:
+        if merged_contents and merged_contents[-1]["role"] == content["role"]:
+            merged_contents[-1]["parts"].extend(content["parts"])
+        else:
+            merged_contents.append(content)
+    contents = merged_contents
 
     system_instruction = None
     joined_system = "\n".join(part for part in system_text_parts if part).strip()
@@ -525,7 +552,7 @@ def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespa
         fc = part.get("functionCall")
         if isinstance(fc, dict) and fc.get("name"):
             try:
-                args_str = json.dumps(fc.get("args") or {}, ensure_ascii=False)
+                args_str = orjson.dumps(fc.get("args") or {}).decode('utf-8')
             except (TypeError, ValueError):
                 args_str = "{}"
             tool_call = SimpleNamespace(
@@ -636,8 +663,8 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
             if data == "[DONE]":
                 return
             try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
+                payload = orjson.loads(data)
+            except orjson.JSONDecodeError:
                 logger.debug("Non-JSON Gemini SSE line: %s", data[:200])
                 continue
             if isinstance(payload, dict):
@@ -664,18 +691,15 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
         if isinstance(fc, dict) and fc.get("name"):
             name = str(fc["name"])
             try:
-                args_str = json.dumps(fc.get("args") or {}, ensure_ascii=False, sort_keys=True)
+                args_str = orjson.dumps(fc.get("args") or {}, option=orjson.OPT_SORT_KEYS).decode('utf-8')
             except (TypeError, ValueError):
                 args_str = "{}"
             thought_signature = part.get("thoughtSignature") if isinstance(part.get("thoughtSignature"), str) else ""
-            call_key = json.dumps(
-                {
+            call_key = orjson.dumps({
                     "part_index": part_index,
                     "name": name,
                     "thought_signature": thought_signature,
-                },
-                sort_keys=True,
-            )
+                }, option=orjson.OPT_SORT_KEYS).decode('utf-8')
             slot = tool_call_indices.get(call_key)
             if slot is None:
                 slot = {
@@ -726,17 +750,20 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
     return chunks
 
 
-def gemini_http_error(response: httpx.Response) -> GeminiAPIError:
+def gemini_http_error(
+    response: httpx.Response, *, body_text: Optional[str] = None
+) -> GeminiAPIError:
     status = response.status_code
-    body_text = ""
     body_json: Dict[str, Any] = {}
-    try:
-        body_text = response.text
-    except Exception:
-        body_text = ""
+    if body_text is None:
+        try:
+            body_text = response.text
+        except Exception:
+            body_text = ""
+    body_text = body_text or ""
     if body_text:
         try:
-            parsed = json.loads(body_text)
+            parsed = orjson.loads(body_text)
             if isinstance(parsed, dict):
                 body_json = parsed
         except (ValueError, TypeError):
@@ -881,7 +908,11 @@ class GeminiNativeClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "x-goog-api-key": self.api_key,
-            "User-Agent": "hermes-agent (gemini-native)",
+            # Include Hermes client context following Gemini's partner
+            # integration guidance.
+            # See https://ai.google.dev/gemini-api/docs/partner-integration
+            "User-Agent": f"hermes-agent/{_HERMES_VERSION} (gemini-native)",
+            "X-Goog-Api-Client": f"hermes-agent/{_HERMES_VERSION}",
         }
         headers.update(self._default_headers)
         return headers
@@ -952,8 +983,8 @@ class GeminiNativeClient:
             try:
                 with self._http.stream("POST", url, json=request, headers=stream_headers, timeout=timeout) as response:
                     if response.status_code != 200:
-                        response.read()
-                        raise gemini_http_error(response)
+                        body_text = read_streaming_error_body(response)
+                        raise gemini_http_error(response, body_text=body_text)
                     tool_call_indices: Dict[str, Dict[str, Any]] = {}
                     for event in _iter_sse_events(response):
                         for chunk in translate_stream_event(event, model, tool_call_indices):

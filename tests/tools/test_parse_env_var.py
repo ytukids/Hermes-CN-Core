@@ -1,6 +1,7 @@
 """Tests for _parse_env_var and _get_env_config env-var validation."""
 
 import importlib
+import orjson
 import json
 from unittest.mock import patch
 
@@ -44,7 +45,7 @@ class TestParseEnvVar:
         with patch.object(_tt_mod, "_DockerEnvironment", return_value=fake_env) as mock_docker:
             result = _tt_mod._create_environment(
                 "docker",
-                image="python:3.11",
+                image="python:3.14",
                 cwd="/root",
                 timeout=180,
                 container_config={"docker_forward_env": ["GITHUB_TOKEN"]},

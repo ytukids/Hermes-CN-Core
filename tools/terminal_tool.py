@@ -34,14 +34,17 @@ Usage:
 import functools
 import importlib.util
 import json
+import orjson
+import json
 import logging
 import os
 import platform
-import re
+from agent.re_compat import re
 import time
 import threading
 import atexit
 import shutil
+import uuid
 import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -60,6 +63,15 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 
 
+# ---------------------------------------------------------------------------
+# PowerShell / pwsh console init — prepended to every PowerShell command so
+# the shell always emits UTF-8 and Ctrl+C is forwarded to the child process
+# rather than killing the shell itself.
+# ---------------------------------------------------------------------------
+_PWSH_CONSOLE_INIT = (
+    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+    "$OutputEncoding=[System.Text.Encoding]::UTF8;"
+)
 
 
 # # Custom Singularity Environment with more space
@@ -980,11 +992,12 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 def _detect_shell_for_description() -> str:
     """Detect shell type for description purposes.
 
-    Returns ``"powershell"`` or ``"bash"``.
+    Returns ``"pwsh"``, ``"powershell"``, or ``"bash"``.
 
-    On Windows, always returns ``"powershell"`` (Windows PowerShell 5.1
-    ships with every Windows 10/11 system). On non-Windows, returns
-    ``"bash"``.
+    On Windows, probes for PowerShell 7 (pwsh) first; if found returns
+    ``"pwsh"``, otherwise returns ``"powershell"`` (Windows PowerShell
+    5.1, which ships with every Windows 10/11 system).
+    On non-Windows, returns ``"bash"``.
 
     Cached via ``@lru_cache`` so repeated calls are essentially free.
     """
@@ -996,7 +1009,15 @@ def _detect_shell_for_description() -> str:
     if shell_type == "bash":
         return "powershell"  # _resolve_shell() in local.py will raise RuntimeError
 
-    # Windows: always powershell
+    # Probe for pwsh (PowerShell 7)
+    try:
+        from tools.environments.local import _find_pwsh
+        if _find_pwsh():
+            return "pwsh"
+    except Exception:
+        pass
+
+    # Fallback to Windows PowerShell 5.1
     return "powershell"
 
 
@@ -1009,7 +1030,9 @@ def _build_dynamic_terminal_description() -> dict:
     """
     shell_type = _detect_shell_for_description()
 
-    if shell_type == "powershell":
+    if shell_type == "pwsh":
+        platform_env = "Execute powershell commands in a PowerShell 7 (pwsh) environment"
+    elif shell_type == "powershell":
         platform_env = "Execute powershell commands on a Windows PowerShell environment"
     else:
         platform_env = "Execute shell commands on a Linux environment"
@@ -1021,12 +1044,12 @@ def _build_dynamic_terminal_description() -> dict:
     )
 
     # ------------------------------------------------------------------
-    # For PowerShell, also adapt Linux/bash-specific command references
-    # so the agent sees cmdlets it might actually be tempted to misuse.
-    # The core guidance ("use agent tools instead of shell commands")
-    # stays the same; only the example commands change.
-    # ------------------------------------------------------------------
-    if shell_type == "powershell":
+    # For PowerShell (both pwsh and powershell.exe), also adapt
+    # Linux/bash-specific command references so the agent sees cmdlets it
+    # might actually be tempted to misuse. The core guidance ("use agent
+    # tools instead of shell commands") stays the same; only the example
+    # commands change.
+    if shell_type in ("powershell", "pwsh"):
         new_description = new_description.replace(
             "Do NOT use cat/head/tail to read files",
             "Do NOT use Get-Content/cat/type to read files",
@@ -1259,7 +1282,7 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
     raw = os.getenv(name, default)
     try:
         return converter(raw)
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, orjson.JSONDecodeError):
         raise ValueError(
             f"Invalid value for {name}: {raw!r} (expected {type_label}). "
             f"Check ~/.hermes/.env or environment variables."
@@ -1289,6 +1312,22 @@ _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
 
 
+def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
+    """Return True when *cwd* is a tilde path that the remote SSH shell must
+    expand itself, so the Hermes host/container must NOT ``expanduser`` it.
+
+    SSH ``cwd`` is interpreted by the *remote* shell (``cd ~`` / ``cd ~/x``
+    over ``ssh ... bash -c``). Expanding ``~`` locally would rewrite it to the
+    Hermes host HOME (often ``/opt/data`` under Docker) and inject a
+    nonexistent path into the remote session. Only ``~`` / ``~/...`` on the
+    ``ssh`` backend qualify; absolute remote paths still pass through
+    unchanged, and every other backend keeps expanding locally.
+    """
+    if (backend or "").strip().lower() != "ssh":
+        return False
+    return cwd == "~" or cwd.startswith("~/")
+
+
 def _is_unusable_container_cwd(cwd: str) -> bool:
     """Return True if *cwd* is a host/relative path that won't work as the
     working directory inside a container sandbox.
@@ -1313,7 +1352,7 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
-    default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
+    default_image = "nikolaik/python-nodejs:python3.14-nodejs20"
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
@@ -1359,14 +1398,18 @@ def _get_env_config() -> Dict[str, Any]:
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
     cwd = os.getenv("TERMINAL_CWD", default_cwd)
-    if cwd:
+    if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
-        candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+        expanded = os.path.expanduser(docker_cwd_source)
+        candidate = os.path.abspath(expanded)
+        # Check raw source value FIRST (before abspath changes drive letters on Windows)
+        # so POSIX-style /Users/... paths are recognized on all platforms.
         if (
-            any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
+            any(docker_cwd_source.startswith(p) for p in _HOST_CWD_PREFIXES)
+            or any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
         ):
             host_cwd = candidate
@@ -1414,6 +1457,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
+        "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         # Cross-process container reuse (issue #20561).  The docs claim
         # "ONE long-lived container shared across sessions" — this toggle
@@ -1474,6 +1518,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_forward_env = cc.get("docker_forward_env", [])
     docker_env = cc.get("docker_env", {})
     docker_extra_args = cc.get("docker_extra_args", [])
+    docker_network = cc.get("docker_network", True)
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1496,6 +1541,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
+            network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
         )
@@ -2070,6 +2116,8 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    token_kill: bool = True,
+    max_lines: Optional[int] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2085,6 +2133,8 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        token_kill: When True (default), known commands are rewritten to use the rtk binary which collapses repeated output lines to save tokens. Set False to preserve raw command output.
+        max_lines: Maximum number of output lines to return. When set, keeps the first floor(max_lines/2) and last ceil(max_lines/2)-1 lines with an omitted-lines marker between them. When unset, all lines are returned (subject to the byte cap).
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -2101,6 +2151,12 @@ def terminal_tool(
         
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
+        
+        # With token_kill disabled
+        >>> result = terminal_tool(command="git log", token_kill=False)
+        
+        # With max_lines limit
+        >>> result = terminal_tool(command="dmesg", max_lines=100)
     """
     try:
         if not isinstance(command, str):
@@ -2108,12 +2164,12 @@ def terminal_tool(
                 "Rejected invalid terminal command value: %s",
                 type(command).__name__,
             )
-            return json.dumps({
+            return orjson.dumps({
                 "output": "",
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
-            }, ensure_ascii=False)
+            }).decode('utf-8')
 
         # Get configuration
         config = _get_env_config()
@@ -2171,25 +2227,25 @@ def terminal_tool(
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-            return json.dumps({
+            return orjson.dumps({
                 "error": (
                     f"Foreground timeout {timeout}s exceeds the maximum of "
                     f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
                     f"notify_on_complete=true for long-running commands."
                 ),
-            }, ensure_ascii=False)
+            }).decode('utf-8')
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
         if not background:
             guidance = _foreground_background_guidance(command)
             if guidance:
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": guidance,
                     "status": "error",
-                }, ensure_ascii=False)
+                }).decode('utf-8')
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2263,6 +2319,7 @@ def terminal_tool(
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                                 "docker_extra_args": config.get("docker_extra_args", []),
+                                "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
                             }
@@ -2285,12 +2342,12 @@ def terminal_tool(
                             host_cwd=config.get("host_cwd"),
                         )
                     except ImportError as e:
-                        return json.dumps({
+                        return orjson.dumps({
                             "output": "",
                             "exit_code": -1,
                             "error": f"Terminal tool disabled: environment creation failed ({e})",
                             "status": "disabled"
-                        }, ensure_ascii=False)
+                        }).decode('utf-8')
 
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
@@ -2308,7 +2365,7 @@ def terminal_tool(
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from hermes_cli.cron import _contains_gateway_lifecycle_command
             if _contains_gateway_lifecycle_command(command):
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": 1,
                     "error": (
@@ -2319,11 +2376,16 @@ def terminal_tool(
                         "the running gateway."
                     ),
                     "status": "error",
-                }, ensure_ascii=False)
+                }).decode('utf-8')
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
+        # True when the user explicitly approved this run (or pre-confirmed via
+        # force).  Drives the clean-interrupt-slate clear before env.execute so
+        # an approved command can't be SIGINT-killed by a bit that landed during
+        # the approval-wait (see clear_current_thread_interrupt).
+        _approved_run = bool(force)
         if not force:
             approval = _check_all_guards(
                 command, env_type,
@@ -2332,7 +2394,7 @@ def terminal_tool(
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
-                    return json.dumps({
+                    return orjson.dumps({
                         "output": "",
                         "exit_code": -1,
                         "error": "",
@@ -2341,23 +2403,24 @@ def terminal_tool(
                         "command": approval.get("command", command),
                         "description": approval.get("description", "command flagged"),
                         "pattern_key": approval.get("pattern_key", ""),
-                    }, ensure_ascii=False)
+                    }).decode('utf-8')
                 # Command was blocked
                 desc = approval.get("description", "command flagged")
                 fallback_msg = (
                     f"Command denied: {desc}. "
                     "Use the approval prompt to allow it, or rephrase the command."
                 )
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": approval.get("message", fallback_msg),
                     "status": "blocked"
-                }, ensure_ascii=False)
+                }).decode('utf-8')
             # Track whether approval was explicitly granted by the user
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command required approval ({desc}) and was approved by the user."
+                _approved_run = True
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
@@ -2368,12 +2431,12 @@ def terminal_tool(
             if workdir_error:
                 logger.warning("Blocked dangerous workdir: %s (command: %s)",
                                workdir[:200], _safe_command_preview(command))
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": workdir_error,
                     "status": "blocked"
-                }, ensure_ascii=False)
+                }).decode('utf-8')
 
         # Prepare command for execution
         pty_disabled_reason = None
@@ -2415,6 +2478,13 @@ def terminal_tool(
             )
             try:
                 if env_type == "local":
+                    cwd_file = None
+                    if hasattr(env, "get_temp_dir"):
+                        try:
+                            temp_dir = env.get_temp_dir().rstrip("/") or "/"
+                            cwd_file = f"{temp_dir}/hermes-bg-cwd-{uuid.uuid4().hex[:12]}.txt"
+                        except Exception:
+                            pass
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
@@ -2422,6 +2492,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        cwd_file=cwd_file,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2439,6 +2510,9 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                # Background spawns detached and returns exit_code 0 immediately;
+                # it never inline-polls is_interrupted(), so the stale-bit kill
+                # cannot occur here and this note never co-occurs with rc=130.
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
@@ -2639,20 +2713,30 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
-                return json.dumps(result_data, ensure_ascii=False)
+                return orjson.dumps(result_data).decode('utf-8')
             except Exception as e:
-                return json.dumps({
+                return orjson.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": f"Failed to start background process: {str(e)}"
-                }, ensure_ascii=False)
+                }).decode('utf-8')
         else:
             # Run foreground command with retry logic
             max_retries = 3
             retry_count = 0
             result = None
             command_cwd = None
-            
+
+            # Clean interrupt slate for an approved command, ONCE before the
+            # retry loop: drop a stale bit that landed on this thread during the
+            # approval-wait so it can't SIGINT the just-approved run.  Do NOT
+            # re-clear inside the loop -- a genuine interrupt arriving during the
+            # backoff sleep between retries must survive and abort the command
+            # (caught by the next attempt's _wait_for_process poll loop -> 130).
+            if _approved_run:
+                from tools.interrupt import clear_current_thread_interrupt
+                clear_current_thread_interrupt()
+
             while retry_count <= max_retries:
                 try:
                     command_cwd = _resolve_command_cwd(
@@ -2664,15 +2748,27 @@ def terminal_tool(
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    # Apply token_kill command rewriting before execution
+                    exec_command = command
+                    rtk_rewritten = False
+                    if token_kill:
+                        from tools.rtk_provision import _rtk_available
+                        if _rtk_available():
+                            from tools.terminal_command_rewrite import _maybe_rewrite_shell_command_with_rtk
+                            exec_command, rtk_rewritten = _maybe_rewrite_shell_command_with_rtk(
+                                command, token_kill=True
+                            )
+                            if rtk_rewritten:
+                                logger.info("Rewrote command with rtk: %r -> %r", command, exec_command)
+                    result = env.execute(exec_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
-                        return json.dumps({
+                        return orjson.dumps({
                             "output": "",
                             "exit_code": 124,
                             "error": f"Command timed out after {effective_timeout} seconds"
-                        }, ensure_ascii=False)
+                        }).decode('utf-8')
                     
                     # Retry on transient errors
                     if retry_count < max_retries:
@@ -2685,11 +2781,11 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
+                    return orjson.dumps({
                         "output": "",
                         "exit_code": -1,
                         "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
-                    }, ensure_ascii=False)
+                    }).decode('utf-8')
                 
                 # Got a result
                 break
@@ -2734,8 +2830,29 @@ def terminal_tool(
                         break
             except Exception:
                 pass
-            
-            # Truncate output if too long, keeping both head and tail
+
+            # ── New post-processing pipeline ──
+            from tools.terminal_post_process import (
+                _token_filter_output,
+                filter_output,
+            )
+
+            # Stage 1: Raw output filtering (ANSI + line ending normalization)
+            output = filter_output(output)
+
+            # Stage 2: Token filter pipeline (dedup + line truncation + original save)
+            post_result = _token_filter_output(
+                output,
+                token_kill=token_kill,
+                rtk_rewritten=rtk_rewritten,
+                max_lines=max_lines,
+            )
+            output = post_result.output
+
+            # Stage 3: Byte-cap truncation, keeping both head and tail. This is
+            # the hard output-size contract (head 40% / tail 60%) — dedup and
+            # max_lines above reduce tokens but do NOT bound bytes, and the
+            # transform_terminal_output hook may have just expanded the output.
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
             if len(output) > MAX_OUTPUT_CHARS:
@@ -2747,11 +2864,6 @@ def terminal_tool(
                     f"out of {len(output)} total] ...\n\n"
                 )
                 output = output[:head_chars] + truncated_notice + output[-tail_chars:]
-
-            # Strip ANSI escape sequences so the model never sees terminal
-            # formatting — prevents it from copying escapes into file writes.
-            from tools.ansi_strip import strip_ansi
-            output = strip_ansi(output)
 
             # Redact secrets from command output. For source/config dumps
             # (MAX_TOKENS=100, "apiKey": "x" fixtures, postgresql:// f-string
@@ -2773,6 +2885,7 @@ def terminal_tool(
                 "output": output,
                 "exit_code": returncode,
                 "error": None,
+                "command": exec_command,
             }
             try:
                 from agent.verification_evidence import record_terminal_result
@@ -2794,7 +2907,19 @@ def terminal_tool(
             except Exception:
                 logger.debug("verification evidence recording failed", exc_info=True)
             if approval_note:
-                result_dict["approval"] = approval_note
+                # Treat rc=130 as an interrupt only when the executor's marker is
+                # present.  A command can legitimately exit 130 on its own
+                # (e.g. `bash -c 'exit 130'`); _wait_for_process returns the
+                # child's natural returncode there with no marker, and that must
+                # NOT be relabelled as a user interrupt in the audit note.
+                if returncode == 130 and "[Command interrupted]" in output:
+                    # Approved command was interrupted mid-run by a genuine Stop.
+                    # Keep the audit trail but never imply success: the bare
+                    # "...approved by the user." note must not co-occur with the
+                    # interrupt exit code (satisfies the 3-part-signature DONE).
+                    result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
+                else:
+                    result_dict["approval"] = approval_note
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
             if result.get("pwsh_warnings"):
@@ -2804,19 +2929,19 @@ def terminal_tool(
             if sudo_cache_cleared:
                 result_dict["sudo_cache_cleared"] = True
 
-            return json.dumps(result_dict, ensure_ascii=False)
+            return orjson.dumps(result_dict).decode('utf-8')
 
     except Exception as e:
         import traceback
         tb_str = traceback.format_exc()
         logger.error("terminal_tool exception:\n%s", tb_str)
-        return json.dumps({
+        return orjson.dumps({
             "output": "",
             "exit_code": -1,
             "error": f"Failed to execute command: {str(e)}",
             "traceback": tb_str,
             "status": "error"
-        }, ensure_ascii=False)
+        }).decode('utf-8')
 
 
 def check_terminal_requirements() -> bool:
@@ -2834,13 +2959,19 @@ def check_terminal_requirements() -> bool:
             if not docker:
                 logger.error("Docker executable not found in PATH or common install locations")
                 return False
-            result = subprocess.run([docker, "version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+            _dk = {}
+            if sys.platform == "win32":
+                _dk["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            result = subprocess.run([docker, "version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL, **_dk)  # windows-footgun: ok — creationflags in _dk
             return result.returncode == 0
 
         elif env_type == "singularity":
             executable = shutil.which("apptainer") or shutil.which("singularity")
             if executable:
-                result = subprocess.run([executable, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+                _tk = {}
+                if sys.platform == "win32":
+                    _tk["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                result = subprocess.run([executable, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL, **_tk)  # windows-footgun: ok — creationflags in _tk
                 return result.returncode == 0
             return False
 
@@ -2959,7 +3090,7 @@ if __name__ == "__main__":
     print("  result = terminal_tool(command='python server.py', background=True)")
 
     print("\nEnvironment Variables:")
-    default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
+    default_img = "nikolaik/python-nodejs:python3.14-nodejs20"
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
@@ -3019,6 +3150,16 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
+            },
+            "token_kill": {
+                "type": "boolean",
+                "description": "When true (default), known commands are rewritten to use the rtk binary which collapses repeated lines to save tokens. Set false to preserve raw command output.",
+                "default": True
+            },
+            "max_lines": {
+                "type": "integer",
+                "description": "Maximum number of output lines to return. When set, keeps the first floor(max_lines/2) and last ceil(max_lines/2)-1 lines with an omitted-lines marker between them. When unset, all lines are returned (subject to the byte cap).",
+                "minimum": 10
             }
         },
         "required": ["command"]
@@ -3037,6 +3178,8 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        token_kill=args.get("token_kill", True),
+        max_lines=args.get("max_lines"),
     )
 
 

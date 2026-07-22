@@ -1,6 +1,6 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
-import base64
+import pybase64 as base64
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -302,7 +302,29 @@ class TestSignalHelpers:
         from gateway.platforms.signal import check_signal_requirements
         monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
         monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
-        assert check_signal_requirements() is False
+        assert check_signal_requirements() is True
+
+    def test_validate_signal_config_accepts_platform_values(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
+        monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
+        from gateway.platforms.signal import validate_signal_config
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "http_url": "http://localhost:8080",
+                "account": "+155****4567",
+            },
+        )
+        assert validate_signal_config(config) is True
+
+    def test_validate_signal_config_rejects_missing_account(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
+        monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
+        from gateway.platforms.signal import validate_signal_config
+
+        config = PlatformConfig(enabled=True, extra={"http_url": "http://localhost:8080"})
+        assert validate_signal_config(config) is False
 
 
 # ---------------------------------------------------------------------------

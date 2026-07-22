@@ -15,7 +15,7 @@ to a no-op / ``None`` so it can never break a send or an inbound message.
 
 from __future__ import annotations
 
-import json
+import orjson
 import os
 import time
 from typing import Optional
@@ -25,8 +25,11 @@ _MAX_TEXT_CHARS = 2000
 
 
 def _store_path() -> str:
-    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return os.path.join(home, "state", "rich_sent_index.json")
+    # Resolve via get_hermes_home() so the active profile override is honored.
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    return os.path.join(str(home), "state", "rich_sent_index.json")
 
 
 def _key(chat_id, message_id) -> str:
@@ -42,7 +45,7 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+                data = orjson.loads(fh.read())
             if not isinstance(data, dict):
                 data = {}
         except (FileNotFoundError, ValueError):
@@ -59,7 +62,7 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
                 data.pop(k, None)
         tmp = f"{path}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
+            fh.write(orjson.dumps(data).decode('utf-8'))
         os.replace(tmp, path)  # atomic; tolerates concurrent writers racing
     except Exception:
         return
@@ -71,7 +74,7 @@ def lookup(chat_id, message_id) -> Optional[str]:
         return None
     try:
         with open(_store_path(), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+            data = orjson.loads(fh.read())
         entry = data.get(_key(chat_id, message_id))
         if isinstance(entry, dict):
             return entry.get("t") or None

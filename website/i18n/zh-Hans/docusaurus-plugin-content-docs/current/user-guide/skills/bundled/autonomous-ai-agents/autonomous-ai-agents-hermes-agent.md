@@ -275,7 +275,7 @@ hermes uninstall            Uninstall Hermes
 /config              Show config (CLI)
 /model [name]        Show or change model
 /personality [name]  Set personality
-/reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|show|hide)
+/reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|max|ultra|show|hide)
 /verbose             Cycle: off → new → all → verbose
 /voice [on|off|tts]  Voice mode
 /yolo                Toggle approval bypass
@@ -481,10 +481,10 @@ hermes config set privacy.redact_pii false   # 禁用（默认）
 
 ### 命令审批提示
 
-默认情况下（`approvals.mode: manual`），Hermes 在运行被标记为破坏性的 shell 命令（`rm -rf`、`git reset --hard` 等）之前会提示用户。模式如下：
+默认情况下（`approvals.mode: smart`），Hermes 会让辅助 LLM 评估被标记为破坏性的 shell 命令（`rm -rf`、`git reset --hard` 等）。模式如下：
 
-- `manual` — 始终提示（默认）
-- `smart` — 使用辅助 LLM 自动批准低风险命令，对高风险命令提示
+- `smart` — 低风险命令仅批准一次，高风险命令拒绝，不确定时提示（默认）
+- `manual` — 始终提示
 - `off` — 跳过所有审批提示（等同于 `--yolo`）
 
 ```bash
@@ -633,7 +633,7 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 同步子 agent 生成——父 agent 等待子 agent 的摘要后再继续自身循环。隔离的上下文和终端会话。
 
-- **单个：** `delegate_task(goal, context, toolsets)`。
+- **单个：** `delegate_task(goal, context)`。
 - **批量：** `delegate_task(tasks=[{goal, ...}, ...])` 并行运行子任务，上限由 `delegation.max_concurrent_children`（默认 3）控制。
 - **角色：** `leaf`（默认；不能再委派）vs `orchestrator`（可以生成自己的 worker，受 `delegation.max_spawn_depth` 限制）。
 - **非持久化。** 如果父 agent 被中断，子 agent 会被取消。对于必须在当前轮次之后继续的工作，使用 `cronjob` 或 `terminal(background=True, notify_on_complete=True)`。
@@ -677,7 +677,7 @@ agent 创建的 skill 的后台维护。跟踪使用情况，将闲置 skill 标
 
 ## Windows 特有问题
 
-Hermes 在 Windows 上原生运行（PowerShell、cmd、Windows Terminal、git-bash mintty、VS Code 集成终端）。大多数功能开箱即用，但 Win32 和 POSIX 之间有一些差异曾给我们带来麻烦——遇到新问题时请在此记录，以免下一个人（或下一个会话）重新踩坑。
+Hermes 在 Windows 上原生运行。默认用于执行命令的 shell 是 **PowerShell**（优先使用 pwsh 7.x，自动回退到 Windows PowerShell 5.1）。Git Bash（git-bash mintty）在明确配置（config.yaml 中设置 `terminal.shell: bash`）且已预装 Git for Windows 时可用作可选 shell。大多数功能开箱即用，但 Win32 和 POSIX 之间有一些差异曾给我们带来麻烦——遇到新问题时请在此记录，以免下一个人（或下一个会话）重新踩坑。
 
 ### 输入/键绑定
 
@@ -697,7 +697,7 @@ mintty / git-bash 行为相同（Alt+Enter 全屏），除非你在选项 → �
 
 ### 测试/贡献
 
-**`scripts/run_tests.sh` 在 Windows 上无法直接使用** — 它查找 POSIX venv 布局（`.venv/bin/activate`）。Hermes 安装的 venv 位于 `venv/Scripts/`，也没有 pip 或 pytest（为减小安装体积而精简）。解决方案：将 `pytest + pytest-xdist + pyyaml` 安装到系统 Python 3.11 用户站点，然后设置 `PYTHONPATH` 直接调用 pytest：
+**`scripts/run_tests.sh` 在 Windows 上无法直接使用** — 它查找 POSIX venv 布局（`.venv/bin/activate`）。Hermes 安装的 venv 位于 `venv/Scripts/`，也没有 pip 或 pytest（为减小安装体积而精简）。解决方案：将 `pytest + pytest-xdist + pyyaml` 安装到系统 Python 3.14 用户站点，然后设置 `PYTHONPATH` 直接调用 pytest：
 
 ```bash
 "/c/Program Files/Python311/python" -m pip install --user pytest pytest-xdist pyyaml
@@ -890,7 +890,7 @@ python -m pytest tests/tools/ -q            # 特定区域
 - 推送任何变更前运行完整套件
 - 使用 `-o 'addopts='` 清除任何内置的 pytest 标志
 
-**Windows 贡献者：** `scripts/run_tests.sh` 目前查找 POSIX venv（`.venv/bin/activate` / `venv/bin/activate`），在 Windows 上会报错，因为布局是 `venv/Scripts/activate` + `python.exe`。Hermes 安装的 venv 位于 `venv/Scripts/`，也没有 `pip` 或 `pytest`——为终端用户安装体积而精简。解决方案：将 pytest + pytest-xdist + pyyaml 安装到系统 Python 3.11 用户站点（`/c/Program Files/Python311/python -m pip install --user pytest pytest-xdist pyyaml`），然后直接运行测试：
+**Windows 贡献者：** `scripts/run_tests.sh` 目前查找 POSIX venv（`.venv/bin/activate` / `venv/bin/activate`），在 Windows 上会报错，因为布局是 `venv/Scripts/activate` + `python.exe`。Hermes 安装的 venv 位于 `venv/Scripts/`，也没有 `pip` 或 `pytest`——为终端用户安装体积而精简。解决方案：将 pytest + pytest-xdist + pyyaml 安装到系统 Python 3.14 用户站点（`/c/Program Files/Python314/python -m pip install --user pytest pytest-xdist pyyaml`），然后直接运行测试：
 
 ```bash
 export PYTHONPATH="$(pwd)"

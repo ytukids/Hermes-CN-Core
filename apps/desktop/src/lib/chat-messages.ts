@@ -2,6 +2,7 @@ import type { ThreadMessageLike } from '@assistant-ui/react'
 
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
 import { mediaDisplayLabel, mediaMarkdownHref } from '@/lib/media'
+import { normalize } from '@/lib/text'
 import { parseTodos } from '@/lib/todos'
 import type { SessionMessage, UsageStats } from '@/types/hermes'
 
@@ -45,13 +46,18 @@ export type GatewayEventPayload = {
   reasoning_effort?: string
   service_tier?: string
   fast?: boolean
+  approval_mode?: string
   yolo?: boolean
   running?: boolean
   cwd?: string
   branch?: string
   credential_warning?: string
+  install_warning?: string
   personality?: string
   usage?: Partial<UsageStats>
+  // agent.terminal.output — live chunk for a read-only agent terminal tab
+  process_id?: string
+  chunk?: string
   // clarify.request
   request_id?: string
   question?: string
@@ -61,6 +67,7 @@ export type GatewayEventPayload = {
   description?: string
   // False when a tirith content-security warning forbids a permanent allow.
   allow_permanent?: boolean
+  smart_denied?: boolean
   // secret.request (skill credential capture)
   env_var?: string
   prompt?: string
@@ -72,10 +79,17 @@ export type GatewayEventPayload = {
   // session.title (live auto-title push) — stored session id + generated title
   session_id?: string
   title?: string
+  // session.info — the stored (durable) session id for this runtime session.
+  // Lets the desktop app map runtime→stored for background sessions it hasn't
+  // opened, so the sidebar working indicator updates without opening the chat.
+  stored_session_id?: string
   // moa.reference / moa.aggregating (Mixture of Agents per-model relay)
   label?: string
   index?: number
   aggregator?: string
+  // message.complete — signals the final text was already previewed via
+  // interim_assistant_callback, so the UI can settle instead of duplicating.
+  response_previewed?: boolean
 }
 
 export function textPart(text: string): ChatMessagePart {
@@ -123,6 +137,46 @@ export function chatMessageText(message: ChatMessage): string {
     .filter((part): part is Extract<ChatMessagePart, { type: 'text' }> => part.type === 'text')
     .map(part => part.text)
     .join('')
+}
+
+const normalizeWs = (value: string) => value.replace(/\s+/g, ' ').trim()
+
+/**
+ * Merge the final assistant text into a message's parts.
+ *
+ * - Removes all existing `text` parts (they were streamed deltas, now superseded
+ *   by the authoritative final response).
+ * - Keeps `reasoning` parts, but drops one that the final text fully covers
+ *   (reasoning ⊆ final) — the final restates it. A short final ("Done.") must
+ *   NOT swallow a longer reasoning block that merely starts with it (#61447).
+ * - Keeps all other part types (tool-call, image, etc.).
+ * - Appends the final text as a new text part.
+ */
+export function mergeFinalAssistantText(parts: ChatMessagePart[], finalText: string): ChatMessagePart[] {
+  const dedupeReference = normalizeWs(finalText)
+
+  const kept = parts.filter(part => {
+    if (part.type === 'text') {
+      // Sealed text parts were already finalized into their own bubbles —
+      // this filter only runs on the LAST streaming bubble, so there are no
+      // sealed parts here. All text parts are streamed deltas that get
+      // replaced by the authoritative final text.
+      return false
+    }
+
+    if (part.type !== 'reasoning' || !dedupeReference) {
+      return true
+    }
+
+    // Reasoning is a restatement only when the final FULLY covers it.
+    // The reverse direction is not considered — a short final must not
+    // swallow a longer reasoning block (#61447).
+    const r = normalizeWs(part.text)
+
+    return !(r && dedupeReference.startsWith(r))
+  })
+
+  return finalText ? [...kept, assistantTextPart(finalText)] : kept
 }
 
 const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
@@ -282,7 +336,7 @@ function firstStringField(record: Record<string, unknown>, keys: readonly string
 }
 
 function normalizeToolMatchValue(value: string): string {
-  return value.trim().toLowerCase()
+  return normalize(value)
 }
 
 function collectToolMatchValues(query: string, context: string, preview: string): string[] {
@@ -578,37 +632,10 @@ function toolPartFromStoredCall(call: unknown, fallbackIndex: number): ChatMessa
   }
 }
 
-function applyStoredToolResult(
-  messages: ChatMessage[],
-  toolMessage: SessionMessage,
-  toolCallIndex?: Map<string, { mi: number; pi: number }>
-): boolean {
+function applyStoredToolResult(messages: ChatMessage[], toolMessage: SessionMessage): boolean {
   const toolCallId = toolMessage.tool_call_id || undefined
   const toolName = toolMessage.tool_name || toolMessage.name || 'tool'
   const content = toolMessage.content || toolMessage.text || toolMessage.context || toolMessage.name
-
-  // Fast O(1) path: tool-call ids are unique, so an index of where each
-  // tool-call part lives in `messages` resolves the result without the reverse
-  // scan below. That scan ran once per tool row over the whole transcript,
-  // making toChatMessages O(N^2) on long sessions (a desktop ANR contributor,
-  // issue #19). Falls through to the scan on a miss, or when the tool row has
-  // no id (legacy/orphaned rows resolved by tool-name) — preserving behavior.
-  if (toolCallId && toolCallIndex) {
-    const loc = toolCallIndex.get(toolCallId)
-
-    if (loc) {
-      const message = messages[loc.mi]
-      const existing = message?.parts[loc.pi]
-
-      if (message?.role === 'assistant' && existing?.type === 'tool-call' && existing.toolCallId === toolCallId) {
-        const parts = [...message.parts]
-        parts[loc.pi] = { ...existing, result: parseStoredToolResult(content), isError: false } as ChatMessagePart
-        messages[loc.mi] = { ...message, parts }
-
-        return true
-      }
-    }
-  }
 
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i]
@@ -726,30 +753,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   let pendingToolTimestamp: number | undefined
   let activeAssistantIndex: null | number = null
 
-  // Index of where each tool-call part lives in `result`, keyed by its unique
-  // toolCallId, so applyStoredToolResult resolves a stored tool result in O(1)
-  // instead of reverse-scanning the whole transcript per tool row (O(N^2),
-  // issue #19). Updated incrementally as tool-call parts are appended to
-  // `result`; positions are stable because results are filled in place and
-  // parts are only ever appended (never reordered/inserted before existing).
-  const toolCallIndex = new Map<string, { mi: number; pi: number }>()
-
-  const indexToolCallsFrom = (mi: number, fromPartIndex = 0) => {
-    const msg = result[mi]
-
-    if (!msg || msg.role !== 'assistant') {
-      return
-    }
-
-    for (let pi = fromPartIndex; pi < msg.parts.length; pi += 1) {
-      const part = msg.parts[pi]
-
-      if (part.type === 'tool-call' && part.toolCallId) {
-        toolCallIndex.set(part.toolCallId, { mi, pi })
-      }
-    }
-  }
-
   const clearPendingTools = () => {
     pendingToolParts = []
     pendingToolTimestamp = undefined
@@ -768,10 +771,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       return false
     }
 
-    const startIndex = active.parts.length
     active.parts = [...active.parts, ...parts]
     active.timestamp = timestamp ?? active.timestamp
-    indexToolCallsFrom(activeAssistantIndex, startIndex)
 
     return true
   }
@@ -789,7 +790,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         timestamp: pendingToolTimestamp
       })
       activeAssistantIndex = result.length - 1
-      indexToolCallsFrom(activeAssistantIndex, 0)
     }
 
     clearPendingTools()
@@ -805,7 +805,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         return
       }
 
-      if (applyStoredToolResult(result, message, toolCallIndex)) {
+      if (applyStoredToolResult(result, message)) {
         return
       }
 
@@ -873,10 +873,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       const activeHasToolCall = Boolean(activeAssistant?.parts.some(part => part.type === 'tool-call'))
 
       if (activeAssistant && (currentHasToolCall || activeHasToolCall)) {
-        const startIndex = activeAssistant.parts.length
         activeAssistant.parts = [...activeAssistant.parts, ...parts]
         activeAssistant.timestamp = message.timestamp ?? activeAssistant.timestamp
-        indexToolCallsFrom(activeAssistantIndex ?? -1, startIndex)
 
         return
       }
@@ -890,7 +888,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       parts,
       timestamp: message.timestamp
     })
-    indexToolCallsFrom(result.length - 1, 0)
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null
   })

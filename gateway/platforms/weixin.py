@@ -13,13 +13,13 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import json
+import pybase64 as base64
+import xxhash
+import orjson
 import logging
 import mimetypes
 import os
-import re
+from agent.re_compat import re
 import secrets
 import struct
 import tempfile
@@ -68,6 +68,7 @@ from gateway.platforms.base import (
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
+from agent.secret_scope import get_secret
 
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
@@ -168,7 +169,7 @@ def _safe_id(value: Optional[str], keep: int = 8) -> str:
 
 
 def _json_dumps(payload: Dict[str, Any]) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return orjson.dumps(payload).decode('utf-8')
 
 
 def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
@@ -260,7 +261,7 @@ def load_weixin_account(hermes_home: str, account_id: str) -> Optional[Dict[str,
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return orjson.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -283,7 +284,7 @@ class ContextTokenStore:
         if not path.exists():
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = orjson.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             logger.warning("weixin: failed to restore context tokens for %s: %s", _safe_id(account_id), exc)
             return
@@ -386,7 +387,7 @@ async def _api_post(
             raw = await response.text()
             if not response.ok:
                 raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-            return json.loads(raw)
+            return orjson.loads(raw)
     return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
 
 
@@ -410,7 +411,7 @@ async def _api_get(
             raw = await response.text()
             if not response.ok:
                 raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
-            return json.loads(raw)
+            return orjson.loads(raw)
     return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
 
 
@@ -990,7 +991,7 @@ def _load_sync_buf(hermes_home: str, account_id: str) -> str:
     if not path.exists():
         return ""
     try:
-        return json.loads(path.read_text(encoding="utf-8")).get("get_updates_buf", "")
+        return orjson.loads(path.read_text(encoding="utf-8")).get("get_updates_buf", "")
     except Exception:
         return ""
 
@@ -1159,11 +1160,11 @@ class WeixinAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
 
-        self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-        self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
-        self._base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
+        self._account_id = str(extra.get("account_id") or get_secret("WEIXIN_ACCOUNT_ID", "")).strip()
+        self._token = str(config.token or extra.get("token") or get_secret("WEIXIN_TOKEN", "")).strip()
+        self._base_url = str(extra.get("base_url") or get_secret("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
         self._cdn_base_url = str(
-            extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
+            extra.get("cdn_base_url") or get_secret("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
         ).strip().rstrip("/")
         self._send_chunk_delay_seconds = float(
             extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "1.5")
@@ -1193,7 +1194,7 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "pairing")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
         if allow_from is None:
@@ -1416,7 +1417,7 @@ class WeixinAdapter(BasePlatformAdapter):
         item_list = message.get("item_list") or []
         text = _extract_text(item_list)
         if text:
-            content_key = f"content:{sender_id}:{hashlib.md5(text.encode()).hexdigest()}"
+            content_key = f"content:{sender_id}:{xxhash.xxh64(text.encode()).hexdigest()}"
             if self._dedup.is_duplicate(content_key):
                 logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, sender_id)
                 return
@@ -1427,7 +1428,9 @@ class WeixinAdapter(BasePlatformAdapter):
                 return
             if self._group_policy == "allowlist" and effective_chat_id not in self._group_allow_from:
                 return
-        elif not self._is_dm_allowed(sender_id):
+            if self._group_policy == "pairing":
+                return
+        elif not self._is_dm_intake_allowed(sender_id):
             return
 
         context_token = str(message.get("context_token") or "").strip()
@@ -1470,12 +1473,30 @@ class WeixinAdapter(BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
+    def _open_dm_opted_in(self) -> bool:
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+            return True
+        return os.getenv("WEIXIN_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
             return sender_id in self._allow_from
-        return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
+
+    def _is_dm_intake_allowed(self, sender_id: str) -> bool:
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return sender_id in self._allow_from
+        if self._dm_policy == "pairing":
+            return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -1495,6 +1516,7 @@ class WeixinAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=event.source.profile,
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -2094,7 +2116,7 @@ class WeixinAdapter(BasePlatformAdapter):
         filekey = secrets.token_hex(16)
         aes_key = secrets.token_bytes(16)
         rawsize = len(plaintext)
-        rawfilemd5 = hashlib.md5(plaintext).hexdigest()
+        rawfilemd5 = xxhash.xxh64(plaintext).hexdigest()
         upload_response = await _get_upload_url(
             self._send_session,
             base_url=self._base_url,
@@ -2271,10 +2293,10 @@ async def send_weixin_direct(
 
     This bypasses the long-poll adapter lifecycle and uses the raw API directly.
     """
-    account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-    base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
-    cdn_base_url = str(extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
-    resolved_token = str(token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
+    account_id = str(extra.get("account_id") or get_secret("WEIXIN_ACCOUNT_ID", "")).strip()
+    base_url = str(extra.get("base_url") or get_secret("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
+    cdn_base_url = str(extra.get("cdn_base_url") or get_secret("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
+    resolved_token = str(token or extra.get("token") or get_secret("WEIXIN_TOKEN", "")).strip()
     if not resolved_token:
         return {"error": "Weixin token missing. Configure WEIXIN_TOKEN or platforms.weixin.token."}
     if not account_id:

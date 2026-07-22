@@ -1,11 +1,14 @@
 """Tests for the ``hermes prompt-size`` diagnostic (issue #34667)."""
 
-import json
+import orjson
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli.prompt_size import (
     _SKILLS_BLOCK_RE,
+    _build_inspection_agent,
     compute_prompt_breakdown,
     render_breakdown,
 )
@@ -70,6 +73,56 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
     assert data["system_prompt"]["bytes"] > 0
 
 
+def test_inspection_agent_uses_resolved_platform_toolsets(monkeypatch):
+    """Inspection must match real CLI tool resolution, including disables."""
+    captured = {}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    cfg = {
+        "model": {"default": "test/model"},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(AIAgent=FakeAIAgent),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda passed_cfg, platform: {"terminal", "file"},
+    )
+
+    _build_inspection_agent("cli")
+
+    assert captured["model"] == "test/model"
+    assert captured["platform"] == "cli"
+    assert captured["enabled_toolsets"] == ["file", "terminal"]
+    assert captured["disabled_toolsets"] == ["memory"]
+
+
+def test_blank_slate_prompt_size_counts_only_minimal_tools(isolated_home):
+    """Blank Slate prompt-size should report file + terminal schemas only."""
+    from hermes_cli.config import save_config
+    from hermes_cli.setup import (
+        _blank_slate_minimal_toolsets,
+        _blank_slate_minimize_config,
+    )
+
+    cfg = {"model": {"default": "MiniMax-M2.7"}}
+    _blank_slate_minimal_toolsets(cfg)
+    _blank_slate_minimize_config(cfg)
+    save_config(cfg)
+
+    data = compute_prompt_breakdown("cli")
+
+    assert data["tools"]["count"] == 6
+
+
 def test_skills_index_reflects_installed_skills(isolated_home):
     """Installing a skill makes the skills-index block non-empty.
 
@@ -115,4 +168,4 @@ def test_render_breakdown_is_plain_text(isolated_home):
 def test_json_serializable(isolated_home):
     data = compute_prompt_breakdown("cli")
     # Round-trips cleanly for ``--json`` output.
-    assert json.loads(json.dumps(data)) == json.loads(json.dumps(data))
+    assert orjson.loads(orjson.dumps(data).decode('utf-8')) == orjson.loads(orjson.dumps(data).decode('utf-8'))

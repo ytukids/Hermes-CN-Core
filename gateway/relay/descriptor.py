@@ -30,7 +30,7 @@ the per-instance capability methods on ``BasePlatformAdapter``):
 
 from __future__ import annotations
 
-import json
+import orjson
 from dataclasses import asdict, dataclass
 
 # Bump additively (never reinterpret an existing field) during the experimental
@@ -58,10 +58,16 @@ class CapabilityDescriptor:
     emoji: str = "\U0001f50c"  # 🔌 default (matches PlatformEntry default)
     platform_hint: str = ""
     pii_safe: bool = False
+    # Whether the connector can supply surrounding channel/group CONTEXT for an
+    # addressed turn (Model A pull / Model B buffer, per platform). Optional +
+    # defaults False so an older connector that never sends it is treated as
+    # "no context" — additive within contract_version 1. from_json filters
+    # unknown keys, so a connector sending this to an older gateway is safe too.
+    supports_context: bool = False
 
     def to_json(self) -> str:
         """Serialize to a compact, stable JSON string for the handshake frame."""
-        return json.dumps(asdict(self), sort_keys=True, ensure_ascii=False)
+        return orjson.dumps(asdict(self), option=orjson.OPT_SORT_KEYS).decode('utf-8')
 
     @classmethod
     def from_json(cls, data: str) -> "CapabilityDescriptor":
@@ -71,9 +77,22 @@ class CapabilityDescriptor:
         fields this gateway does not know yet); missing optional keys fall back
         to dataclass defaults.
         """
-        raw = json.loads(data)
+        raw = orjson.loads(data)
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         filtered = {k: v for k, v in raw.items() if k in known}
+        # Normalize the chunking bound at the trust boundary. A connector may
+        # advertise max_message_length 0 ("no limit"), and a buggy/hostile one
+        # may send 0 or a negative; either is a degenerate value that would flow
+        # straight into the adapter's MAX_MESSAGE_LENGTH and truncate_message().
+        # Map it to the documented 4096 default (docs/relay-connector-contract.md;
+        # mirrors from_platform_entry's `or 4096`) so from_json never yields a
+        # descriptor that can't chunk a real message.
+        if "max_message_length" in filtered:
+            try:
+                if int(filtered["max_message_length"]) <= 0:
+                    filtered["max_message_length"] = 4096
+            except (TypeError, ValueError):
+                filtered["max_message_length"] = 4096
         return cls(**filtered)
 
     @classmethod

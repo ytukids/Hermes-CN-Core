@@ -23,6 +23,8 @@ import os
 from collections import Counter
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from tools.ansi_strip import sanitize_display_text
+
 # How many recent user/assistant turns we consider "recent activity".
 _RECENT_TURN_WINDOW = 20
 
@@ -88,9 +90,9 @@ def _tool_call_name_and_args(tool_call: Any) -> Tuple[str, Mapping[str, Any]]:
         return name, raw_args
     if isinstance(raw_args, str) and raw_args:
         try:
-            import json
+            import orjson
 
-            parsed = json.loads(raw_args)
+            parsed = orjson.loads(raw_args)
             if isinstance(parsed, Mapping):
                 return name, parsed
         except Exception:
@@ -229,6 +231,10 @@ def _summarise_tool_activity(
 
 
 def _truncate(text: str, limit: int) -> str:
+    # Stored history is untrusted for display — remove escape sequences and
+    # control chars so a recap line can't clear the screen / retitle the
+    # window when echoed to a terminal (openai/codex#31494 bug class).
+    text = sanitize_display_text(text)
     text = " ".join(text.split())  # collapse newlines for a compact one-liner
     if len(text) <= limit:
         return text

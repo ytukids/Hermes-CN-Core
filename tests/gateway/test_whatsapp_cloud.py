@@ -12,12 +12,27 @@ exercised with synthetic ``Request`` objects.
 
 from __future__ import annotations
 
-import json
+import asyncio
+import orjson
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform
+
+
+@pytest.fixture(autouse=True)
+def _whatsapp_open_optin(monkeypatch):
+    """Opt into WhatsApp allow-all for the file's dispatch-mechanics tests.
+
+    The adapter now fails closed on ``dm_policy: open`` unless
+    ``WHATSAPP_ALLOW_ALL_USERS`` / ``GATEWAY_ALLOW_ALL_USERS`` is set
+    (SECURITY.md 2.6). These tests set ``_dm_policy = "open"`` as a stand-in
+    for "process this DM" while exercising unrelated dispatch mechanics, so
+    grant the opt-in here. Tests that specifically assert the gate override
+    this within their own body.
+    """
+    monkeypatch.setenv("WHATSAPP_ALLOW_ALL_USERS", "true")
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +110,18 @@ def _make_adapter(**overrides):
     return adapter
 
 
+@pytest.fixture
+def authorized_interactive_env(monkeypatch):
+    """``dm_policy: open`` requires an explicit allow-all opt-in on main."""
+    monkeypatch.setenv("WHATSAPP_ALLOW_ALL_USERS", "true")
+
+
 def _mock_httpx_response(status_code: int, json_body: dict):
     """Build an httpx-Response-like mock the adapter's ``send`` will accept."""
     resp = MagicMock()
     resp.status_code = status_code
     resp.json = MagicMock(return_value=json_body)
-    resp.text = json.dumps(json_body)
+    resp.text = orjson.dumps(json_body).decode('utf-8')
     return resp
 
 
@@ -333,6 +354,22 @@ class TestWebhookVerify:
         assert response.status == 403
 
     @pytest.mark.asyncio
+    async def test_verify_rejects_non_ascii_token_without_raising(self):
+        """A non-ASCII verify_token (raw query param) must be rejected with
+        403, not crash the handler: hmac.compare_digest raises TypeError on a
+        str containing non-ASCII characters."""
+        adapter = _make_adapter(verify_token="shared-secret-123")
+        request = _verify_request({
+            "hub.mode": "subscribe",
+            "hub.verify_token": "ské-not-the-secret",
+            "hub.challenge": "abc-12345",
+        })
+
+        response = await adapter._handle_verify(request)
+
+        assert response.status == 403
+
+    @pytest.mark.asyncio
     async def test_verify_rejects_wrong_mode(self):
         adapter = _make_adapter(verify_token="shared-secret-123")
         request = _verify_request({
@@ -391,10 +428,22 @@ def _sign(secret: str, body: bytes) -> str:
     return f"sha256={digest}"
 
 
+class _FakeRequestContent:
+    def __init__(self, body: bytes):
+        self.body = body
+        self.read_sizes: list[int] = []
+
+    async def readexactly(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        if len(self.body) < size:
+            raise asyncio.IncompleteReadError(self.body, size)
+        return self.body[:size]
+
+
 def _post_request(body: bytes, headers: dict | None = None):
     """Build a minimal aiohttp.web.Request stub for POST tests."""
     request = MagicMock()
-    request.read = AsyncMock(return_value=body)
+    request.content = _FakeRequestContent(body)
     request.headers = headers or {}
     return request
 
@@ -525,20 +574,23 @@ class TestWebhookSignature:
     @pytest.mark.asyncio
     async def test_oversize_body_rejected_before_signature(self):
         """3MB cap per Meta — refuse without computing HMAC over giant junk."""
+        from gateway.platforms.whatsapp_cloud import WEBHOOK_MAX_BODY_BYTES
+
         adapter = _make_adapter(app_secret="key")
         adapter._dispatch_payload = AsyncMock()
-        body = b"x" * (4 * 1024 * 1024)
+        body = b"x" * (WEBHOOK_MAX_BODY_BYTES + 2)
         request = _post_request(body, {"X-Hub-Signature-256": "sha256=ignored"})
 
         response = await adapter._handle_webhook(request)
         assert response.status == 413
+        assert request.content.read_sizes == [WEBHOOK_MAX_BODY_BYTES + 1]
         adapter._dispatch_payload.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unreadable_body_rejected(self):
         adapter = _make_adapter(app_secret="key")
         request = MagicMock()
-        request.read = AsyncMock(side_effect=RuntimeError("read failed"))
+        request.content.readexactly = AsyncMock(side_effect=RuntimeError("read failed"))
         request.headers = {}
 
         response = await adapter._handle_webhook(request)
@@ -552,7 +604,7 @@ class TestWebhookReplay:
     async def test_duplicate_wamid_not_redispatched(self):
         adapter = _make_adapter(app_secret="key")
         adapter.handle_message = AsyncMock()
-        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        body = orjson.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD)
         sig = _sign("key", body)
 
         # First delivery
@@ -598,7 +650,7 @@ class TestWebhookDispatch:
             captured.append(event)
 
         adapter.handle_message = _capture
-        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        body = orjson.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD)
         sig = _sign("key", body)
         request = _post_request(body, {"X-Hub-Signature-256": sig})
 
@@ -621,7 +673,7 @@ class TestWebhookDispatch:
         adapter = _make_adapter(app_secret="key")
         adapter._dm_policy = "disabled"  # block all DMs
         adapter.handle_message = AsyncMock()
-        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        body = orjson.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD)
         sig = _sign("key", body)
 
         response = await adapter._handle_webhook(
@@ -639,7 +691,7 @@ class TestWebhookDispatch:
         retries don't multiply the bug into a 7-day storm."""
         adapter = _make_adapter(app_secret="key")
         adapter.handle_message = AsyncMock(side_effect=RuntimeError("boom"))
-        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        body = orjson.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD)
         sig = _sign("key", body)
 
         response = await adapter._handle_webhook(
@@ -666,7 +718,7 @@ class TestWebhookDispatch:
                 }
             ],
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = orjson.dumps(payload)
         sig = _sign("key", body)
 
         response = await adapter._handle_webhook(
@@ -680,7 +732,7 @@ class TestWebhookDispatch:
         adapter = _make_adapter(app_secret="key")
         adapter.handle_message = AsyncMock()
         payload = {"object": "page", "entry": []}
-        body = json.dumps(payload).encode("utf-8")
+        body = orjson.dumps(payload)
         sig = _sign("key", body)
 
         response = await adapter._handle_webhook(
@@ -733,7 +785,7 @@ class TestWebhookDispatch:
                 }
             ],
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = orjson.dumps(payload)
         sig = _sign("key", body)
 
         response = await adapter._handle_webhook(
@@ -754,12 +806,12 @@ class TestWebhookDispatch:
 
         adapter.handle_message = _capture
 
-        payload_with_ctx = json.loads(
-            json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD)
+        payload_with_ctx = orjson.loads(
+            orjson.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).decode('utf-8')
         )  # deep copy
         msg = payload_with_ctx["entry"][0]["changes"][0]["value"]["messages"][0]
         msg["context"] = {"id": "wamid.our_outbound", "from": "15551797781"}
-        body = json.dumps(payload_with_ctx).encode("utf-8")
+        body = orjson.dumps(payload_with_ctx)
         sig = _sign("key", body)
 
         await adapter._handle_webhook(
@@ -797,7 +849,7 @@ class TestHealth:
         response = await adapter._handle_health(request)
 
         # web.json_response stores the dict on .text as JSON
-        body = json.loads(response.text)
+        body = orjson.loads(response.text)
         assert body["status"] == "ok"
         assert body["platform"] == "whatsapp_cloud"
         assert body["phone_number_id"] == "555"
@@ -817,7 +869,7 @@ class TestHealth:
         request = MagicMock()
 
         response = await adapter._handle_health(request)
-        body = json.loads(response.text)
+        body = orjson.loads(response.text)
         assert body["verify_token_configured"] is False
         assert body["app_secret_configured"] is False
 
@@ -879,7 +931,7 @@ def _mock_upload_response(media_id: str = "media_abc123"):
     resp = MagicMock()
     resp.status_code = 200
     resp.json = MagicMock(return_value={"id": media_id})
-    resp.text = json.dumps({"id": media_id})
+    resp.text = orjson.dumps({"id": media_id}).decode('utf-8')
     return resp
 
 
@@ -888,7 +940,7 @@ def _mock_message_response(wamid: str = "wamid.outbound1"):
     resp = MagicMock()
     resp.status_code = 200
     resp.json = MagicMock(return_value={"messages": [{"id": wamid}]})
-    resp.text = json.dumps({"messages": [{"id": wamid}]})
+    resp.text = orjson.dumps({"messages": [{"id": wamid}]}).decode('utf-8')
     return resp
 
 
@@ -1358,7 +1410,7 @@ class TestInboundMediaDispatch:
                 }],
             }],
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = orjson.dumps(payload)
         sig = _sign("key", body)
 
         with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
@@ -1426,7 +1478,7 @@ class TestInboundMediaDispatch:
                 }],
             }],
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = orjson.dumps(payload)
         sig = _sign("key", body)
 
         with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
@@ -1479,7 +1531,7 @@ class TestInboundMediaDispatch:
                 }],
             }],
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = orjson.dumps(payload)
         sig = _sign("key", body)
 
         with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
@@ -1760,6 +1812,7 @@ class TestSendSlashConfirmButtons:
         assert adapter._slash_confirm_state["cf-9"] == "sess-sc-1"
 
 
+@pytest.mark.usefixtures("authorized_interactive_env")
 class TestDispatchInteractiveReplyClarify:
     """Inbound side: button-tap → clarify resolver."""
 
@@ -1900,6 +1953,7 @@ class TestDispatchInteractiveReplyClarify:
         assert handled is False
 
 
+@pytest.mark.usefixtures("authorized_interactive_env")
 class TestDispatchInteractiveReplyApproval:
     """Inbound side: approval-tap → resolve_gateway_approval."""
 
@@ -1965,6 +2019,7 @@ class TestDispatchInteractiveReplyApproval:
         assert "Denied" in confirm_payload["text"]["body"]
 
 
+@pytest.mark.usefixtures("authorized_interactive_env")
 class TestDispatchInteractiveReplySlashConfirm:
     """Inbound side: slash-confirm-tap → tools.slash_confirm.resolve."""
 
@@ -2008,6 +2063,68 @@ class TestDispatchInteractiveReplySlashConfirm:
         assert "MCP reloaded" in reply_payload["text"]["body"]
 
 
+class TestDispatchInteractiveReplyAuthorization:
+    """Interactive taps must honor the same DM allowlist as text intake."""
+
+    @pytest.mark.asyncio
+    async def test_approval_tap_denied_when_sender_not_allowlisted(self, monkeypatch):
+        adapter = _make_adapter(
+            _dm_policy="allowlist",
+            _allow_from={"19998887777"},
+        )
+        adapter._exec_approval_state["app1"] = "sess-app-1"
+        calls = []
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+        )
+
+        raw = {
+            "from": "15551234567",
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {"id": "appr:app1:approve", "title": "Approve"},
+            },
+        }
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        assert handled is True
+        assert calls == []
+        assert adapter._exec_approval_state["app1"] == "sess-app-1"
+
+    @pytest.mark.asyncio
+    async def test_approval_tap_allowed_when_sender_allowlisted(self, monkeypatch):
+        adapter = _make_adapter(
+            _dm_policy="allowlist",
+            _allow_from={"15551234567"},
+        )
+        adapter._exec_approval_state["app1"] = "sess-app-1"
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
+        )
+        calls = []
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+        )
+
+        raw = {
+            "from": "15551234567",
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {"id": "appr:app1:approve", "title": "Approve"},
+            },
+        }
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        assert handled is True
+        assert calls == [("sess-app-1", "approve")]
+
+
+@pytest.mark.usefixtures("authorized_interactive_env")
 class TestInteractiveReplyEndToEnd:
     """Integration: `_build_message_event_from_cloud` must SHORT-CIRCUIT
     on a recognized interactive reply and NOT also produce a fresh
@@ -2422,4 +2539,3 @@ class TestReplyContextResolution:
             rich_sent_store.lookup("15551234567", "wamid.OUT")
             == "here is your answer"
         )
-

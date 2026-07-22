@@ -31,7 +31,7 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
-import json
+import orjson
 import logging
 import os
 import time
@@ -165,7 +165,7 @@ def _extract_tool_stats(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, i
             is_success = True
             try:
                 # Try to parse as JSON and check for actual error values
-                content_json = json.loads(content) if isinstance(content, str) else content
+                content_json = orjson.loads(content) if isinstance(content, str) else content
                 
                 if isinstance(content_json, dict):
                     # Check if error field exists AND has a non-null value
@@ -185,7 +185,7 @@ def _extract_tool_stats(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, i
                     if content_json.get("success") is False:
                         is_success = False
                         
-            except (json.JSONDecodeError, ValueError, TypeError):
+            except (orjson.JSONDecodeError, ValueError, TypeError):
                 # If not JSON, check if content is empty or explicitly states an error
                 # Note: We avoid simple substring matching to prevent false positives
                 if not content:
@@ -484,7 +484,7 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
             
             # Append to batch output file
             with open(batch_output_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(trajectory_entry, ensure_ascii=False) + "\n")
+                f.write(orjson.dumps(trajectory_entry).decode('utf-8') + "\n")
         
         # Aggregate tool statistics
         for tool_name, stats in result.get("tool_stats", {}).items():
@@ -657,12 +657,12 @@ class BatchRunner:
                     continue
                 
                 try:
-                    entry = json.loads(line)
+                    entry = orjson.loads(line)
                     if 'prompt' not in entry:
                         print(f"⚠️  Warning: Line {line_num} missing 'prompt' field, skipping")
                         continue
                     dataset.append(entry)
-                except json.JSONDecodeError as e:
+                except orjson.JSONDecodeError as e:
                     print(f"⚠️  Warning: Invalid JSON on line {line_num}: {e}")
                     continue
         
@@ -702,7 +702,7 @@ class BatchRunner:
         
         try:
             with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                return orjson.loads(f.read())
         except Exception as e:
             print(f"⚠️  Warning: Failed to load checkpoint: {e}")
             return {
@@ -752,7 +752,7 @@ class BatchRunner:
                 with open(batch_file, 'r', encoding='utf-8') as f:
                     for line in f:
                         try:
-                            entry = json.loads(line.strip())
+                            entry = orjson.loads(line.strip())
                             
                             # Skip failed entries - we want to retry these
                             if entry.get("failed", False):
@@ -766,7 +766,7 @@ class BatchRunner:
                                     if prompt_text:
                                         completed_prompts.add(prompt_text)
                                     break  # Only need the first human message
-                        except json.JSONDecodeError:
+                        except orjson.JSONDecodeError:
                             continue
             except Exception as e:
                 print(f"  ⚠️  Warning: Error reading {batch_file.name}: {e}")
@@ -1048,7 +1048,7 @@ class BatchRunner:
                     for line in infile:
                         total_entries += 1
                         try:
-                            data = json.loads(line)
+                            data = orjson.loads(line)
                             tool_stats = data.get('tool_stats', {})
                             
                             # Check for invalid tool names (model hallucinations)
@@ -1061,7 +1061,7 @@ class BatchRunner:
                                 continue
                             
                             outfile.write(line)
-                        except json.JSONDecodeError:
+                        except orjson.JSONDecodeError:
                             filtered_entries += 1
                             print(f"   ⚠️  Filtering invalid JSON entry (batch {batch_num})")
         
@@ -1084,7 +1084,7 @@ class BatchRunner:
         }
         
         with open(self.stats_file, 'w', encoding='utf-8') as f:
-            json.dump(final_stats, f, indent=2, ensure_ascii=False)
+            f.write(orjson.dumps(final_stats, option=orjson.OPT_INDENT_2).decode('utf-8'))
         
         # Print summary
         print("\n" + "=" * 70)
@@ -1192,7 +1192,7 @@ def main(
         providers_order (str): Comma-separated list of OpenRouter providers to try in order (e.g. "anthropic,openai,google")
         provider_sort (str): Sort providers by "price", "throughput", or "latency" (OpenRouter only)
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
-        reasoning_effort (str): OpenRouter reasoning effort level: "none", "minimal", "low", "medium", "high", "xhigh" (default: "medium")
+        reasoning_effort (str): Reasoning effort: "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" (default: "medium")
         reasoning_disabled (bool): Completely disable reasoning/thinking tokens (default: False)
         prefill_messages_file (str): Path to JSON file containing prefill messages (list of {role, content} dicts)
         max_samples (int): Only process the first N samples from the dataset (optional, processes all if not set)
@@ -1261,7 +1261,7 @@ def main(
         print("🧠 Reasoning: DISABLED (effort=none)")
     elif reasoning_effort:
         # Use specified effort level
-        valid_efforts = ["none", "minimal", "low", "medium", "high", "xhigh"]
+        valid_efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
         if reasoning_effort not in valid_efforts:
             print(f"❌ Error: --reasoning_effort must be one of: {', '.join(valid_efforts)}")
             return
@@ -1273,7 +1273,7 @@ def main(
     if prefill_messages_file:
         try:
             with open(prefill_messages_file, 'r', encoding='utf-8') as f:
-                prefill_messages = json.load(f)
+                prefill_messages = orjson.loads(f.read())
             if not isinstance(prefill_messages, list):
                 print("❌ Error: prefill_messages_file must contain a JSON array of messages")
                 return

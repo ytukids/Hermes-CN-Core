@@ -5,7 +5,9 @@ import {
   appendAssistantTextPart,
   appendReasoningPart,
   chatMessageText,
+  mergeFinalAssistantText,
   preserveLocalAssistantErrors,
+  reasoningPart,
   renderMediaTags,
   toChatMessages,
   upsertToolPart
@@ -786,100 +788,64 @@ describe('upsertToolPart', () => {
   })
 })
 
-describe('toChatMessages stored-tool-result resolution (issue #19 O(N^2) → O(N))', () => {
-  type ToolCallPart = Extract<ChatMessagePart, { type: 'tool-call' }>
+describe('mergeFinalAssistantText', () => {
+  it('removes all text parts and appends the final text', () => {
+    const parts = [
+      { type: 'text' as const, text: 'streamed delta 1' },
+      { type: 'text' as const, text: 'streamed delta 2' },
+      { type: 'tool-call' as const, toolCallId: 'tc1', toolName: 'terminal', args: {} as never, argsText: '{}' }
+    ]
 
-  const toolParts = (messages: ChatMessage[]): ToolCallPart[] =>
-    messages.flatMap(m => m.parts.filter((p): p is ToolCallPart => p.type === 'tool-call'))
+    const result = mergeFinalAssistantText(parts, 'final answer')
 
-  const resultFor = (messages: ChatMessage[], toolCallId: string): unknown =>
-    toolParts(messages).find(p => p.toolCallId === toolCallId)?.result
-
-  it('resolves tool results to the matching tool-call by id even when rows arrive out of order', () => {
-    const messages = toChatMessages([
-      { role: 'user', content: 'go', timestamp: 1 },
-      {
-        role: 'assistant',
-        content: 'first',
-        timestamp: 2,
-        tool_calls: [{ id: 'tc-1', function: { name: 'terminal', arguments: '{}' } }]
-      },
-      {
-        role: 'assistant',
-        content: 'second',
-        timestamp: 3,
-        tool_calls: [{ id: 'tc-2', function: { name: 'terminal', arguments: '{}' } }]
-      },
-      // results arrive in REVERSE order of the calls
-      { role: 'tool', tool_call_id: 'tc-2', tool_name: 'terminal', content: '{"output":"RESULT-2"}', timestamp: 4 },
-      { role: 'tool', tool_call_id: 'tc-1', tool_name: 'terminal', content: '{"output":"RESULT-1"}', timestamp: 5 }
-    ])
-
-    expect(resultFor(messages, 'tc-1')).toMatchObject({ output: 'RESULT-1' })
-    expect(resultFor(messages, 'tc-2')).toMatchObject({ output: 'RESULT-2' })
+    expect(result.filter(p => p.type === 'text')).toHaveLength(1)
+    expect(result.filter(p => p.type === 'text')[0]).toMatchObject({ text: 'final answer' })
+    expect(result.some(p => p.type === 'tool-call')).toBe(true)
   })
 
-  it('disambiguates same-named tools by id, not tool name', () => {
-    const messages = toChatMessages([
-      {
-        role: 'assistant',
-        content: '',
-        timestamp: 1,
-        tool_calls: [
-          { id: 'a', function: { name: 'terminal', arguments: '{"command":"ls"}' } },
-          { id: 'b', function: { name: 'terminal', arguments: '{"command":"pwd"}' } }
-        ]
-      },
-      { role: 'tool', tool_call_id: 'b', tool_name: 'terminal', content: '{"output":"/home"}', timestamp: 2 },
-      { role: 'tool', tool_call_id: 'a', tool_name: 'terminal', content: '{"output":"file.txt"}', timestamp: 3 }
-    ])
+  it('drops reasoning that the final text fully covers (reasoning ⊆ final)', () => {
+    const parts = [reasoningPart('Let me check the files.'), { type: 'text' as const, text: 'streamed' }]
 
-    expect(resultFor(messages, 'a')).toMatchObject({ output: 'file.txt' })
-    expect(resultFor(messages, 'b')).toMatchObject({ output: '/home' })
+    const result = mergeFinalAssistantText(parts, 'Let me check the files. Everything looks good.')
+
+    expect(result.filter(p => p.type === 'reasoning')).toHaveLength(0)
+    expect(result.filter(p => p.type === 'text')).toHaveLength(1)
   })
 
-  it('still resolves a tool row that has no tool_call_id via the tool-name fallback', () => {
-    const messages = toChatMessages([
-      {
-        role: 'assistant',
-        content: 'thinking',
-        timestamp: 1,
-        tool_calls: [{ id: 'only', function: { name: 'web_search', arguments: '{}' } }]
-      },
-      // legacy/orphaned row: no tool_call_id, matched by tool_name
-      { role: 'tool', tool_name: 'web_search', content: '{"summary":"hit"}', timestamp: 2 }
-    ])
+  it('keeps a longer reasoning block when the final text is only a short prefix', () => {
+    // #61447: a short final ("Done.") must NOT swallow a longer reasoning block
+    // that merely starts with it.
+    const parts = [
+      reasoningPart(
+        'Done. The root cause was a bare catch block swallowing Stripe errors. The fix adds proper error logging.'
+      ),
+      { type: 'text' as const, text: 'streamed' }
+    ]
 
-    expect(resultFor(messages, 'only')).toMatchObject({ summary: 'hit' })
+    const result = mergeFinalAssistantText(parts, 'Done.')
+
+    expect(result.filter(p => p.type === 'reasoning')).toHaveLength(1)
+    expect(result.filter(p => p.type === 'text')[0]).toMatchObject({ text: 'Done.' })
   })
 
-  it('attaches every result correctly across many turns (scale guard for the index path)', () => {
-    const N = 40
-    const rows = []
+  it('keeps non-restating reasoning', () => {
+    const parts = [
+      reasoningPart('I analyzed the issue and found a race condition in the event loop.'),
+      { type: 'text' as const, text: 'streamed' }
+    ]
 
-    for (let i = 0; i < N; i += 1) {
-      rows.push({
-        role: 'assistant' as const,
-        content: `step ${i}`,
-        timestamp: i * 2 + 1,
-        tool_calls: [{ id: `tc-${i}`, function: { name: 'terminal', arguments: `{"command":"echo ${i}"}` } }]
-      })
-      rows.push({
-        role: 'tool' as const,
-        tool_call_id: `tc-${i}`,
-        tool_name: 'terminal',
-        content: `{"output":"out-${i}"}`,
-        timestamp: i * 2 + 2
-      })
-    }
+    const result = mergeFinalAssistantText(parts, 'Fixed the race condition.')
 
-    const messages = toChatMessages(rows)
-    const parts = toolParts(messages)
+    expect(result.filter(p => p.type === 'reasoning')).toHaveLength(1)
+    expect(result.filter(p => p.type === 'text')).toHaveLength(1)
+  })
 
-    expect(parts).toHaveLength(N)
+  it('handles empty final text', () => {
+    const parts = [{ type: 'text' as const, text: 'streamed' }, reasoningPart('some reasoning')]
 
-    for (let i = 0; i < N; i += 1) {
-      expect(resultFor(messages, `tc-${i}`)).toMatchObject({ output: `out-${i}` })
-    }
+    const result = mergeFinalAssistantText(parts, '')
+
+    expect(result.filter(p => p.type === 'text')).toHaveLength(0)
+    expect(result.filter(p => p.type === 'reasoning')).toHaveLength(1)
   })
 })

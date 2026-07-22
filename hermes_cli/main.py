@@ -148,7 +148,17 @@ def _wants_tui_early(argv: "list[str] | None" = None) -> bool:
     """Earliest TUI decision, usable before argparse/config imports.
 
     Precedence: explicit ``--cli`` wins (forces classic REPL), then
-    ``--tui``/``HERMES_TUI=1``, then ``display.interface`` in config.
+    explicit ``--tui``/``HERMES_TUI=1``, then a real-TTY gate (a
+    non-interactive stdio can't host the Ink UI, so ambient config never
+    boots it there), then ``display.interface`` in config.
+
+    The TTY gate is load-bearing for headless spawners — kanban workers,
+    cron jobs, pipes run ``hermes … chat -q`` with stdio on a pipe. This
+    is the earliest launch decision (it runs before ``cmd_chat`` /
+    ``_resolve_use_tui``), so a ``display.interface: tui`` default used to
+    boot the TUI here — whose no-TTY bail-out exits 0 without doing the
+    task → "protocol violation" on every attempt. An explicit ``--tui``
+    still reaches the informative bail-out.
     """
     if argv is None:
         argv = sys.argv[1:]
@@ -156,6 +166,11 @@ def _wants_tui_early(argv: "list[str] | None" = None) -> bool:
         return False
     if os.environ.get("HERMES_TUI") == "1" or "--tui" in argv:
         return True
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+    except Exception:
+        return False
     return _config_default_interface_early() == "tui"
 
 
@@ -229,9 +244,9 @@ def _read_openai_version_fast() -> str | None:
 def _print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
     print(f"Hermes Agent v{__version__} ({__release_date__})")
-    print(f"Project: {project_root}")
+    print(f"Install directory: {PROJECT_ROOT}")
+
     print(f"Python: {sys.version.split()[0]}")
 
     openai_version = _read_openai_version_fast()
@@ -256,7 +271,7 @@ if _try_termux_ultrafast_version():
 
 import argparse
 import hashlib
-import json
+import orjson
 import shlex
 import shutil
 import stat
@@ -287,6 +302,7 @@ from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
 from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
 from hermes_cli.subcommands.config import build_config_parser
+from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.version import build_version_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
@@ -398,6 +414,7 @@ def _apply_profile_override() -> None:
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
+        "--usage-file",
     }
     optional_value_flags = {"-c", "--continue"}
     i = 0
@@ -434,8 +451,7 @@ def _apply_profile_override() -> None:
     # Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never call
     # resolve_profile_env() with a value it must reject + sys.exit on.
     if profile_name is not None and consume == 2:
-        import re as _re
-
+        from agent.re_compat import re as _re
         if not _re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", profile_name):
             profile_name = None
             consume = 0
@@ -571,7 +587,7 @@ try:
         mode=(
             "gui"
             if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "gui", "desktop"}
+            in {"dashboard", "serve", "gui", "desktop"}
             else "cli"
         )
     )
@@ -616,6 +632,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_stepfun,
     _model_flow_bedrock_api_key,
     _model_flow_bedrock,
+    _model_flow_vertex,
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
@@ -828,6 +845,8 @@ def _has_any_provider_configured() -> bool:
                 line = line.strip()
                 if line.startswith("#") or "=" not in line:
                     continue
+                if line.startswith("export "):
+                    line = line[7:]
                 key, _, val = line.partition("=")
                 val = val.strip().strip("'\"")
                 if key.strip() in provider_env_vars and val:
@@ -850,9 +869,9 @@ def _has_any_provider_configured() -> bool:
     auth_file = get_hermes_home() / "auth.json"
     if auth_file.exists():
         try:
-            import json
+            import orjson
 
-            auth = json.loads(auth_file.read_text())
+            auth = orjson.loads(auth_file.read_text())
             active = auth.get("active_provider")
             if active:
                 status = get_auth_status(active)
@@ -1161,7 +1180,11 @@ def _probe_container(cmd: list, backend: str, via_sudo: bool = False):
     all other exceptions propagate naturally.
     """
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        _subprocess_kwargs = {}
+        if sys.platform == "win32":
+            from hermes_cli._subprocess_compat import windows_hide_flags
+            _subprocess_kwargs["creationflags"] = windows_hide_flags()
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15, **_subprocess_kwargs)  # windows-footgun: ok — creationflags in _subprocess_kwargs
     except subprocess.TimeoutExpired:
         label = f"sudo {backend}" if via_sudo else backend
         print(
@@ -1309,7 +1332,7 @@ def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = orjson.loads(Path(path).read_text(encoding="utf-8"))
         sid = str(data.get("session_id") or "").strip()
         return sid or None
     except Exception:
@@ -1495,9 +1518,9 @@ def _tui_need_npm_install(root: Path) -> bool:
     # can bump the root lockfile timestamp even when installed deps already
     # match. Fall back to mtime when either file is unparseable.
     try:
-        wanted = json.loads(lock.read_text(encoding="utf-8")).get("packages") or {}
-        installed = json.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        wanted = orjson.loads(lock.read_text(encoding="utf-8")).get("packages") or {}
+        installed = orjson.loads(marker.read_text(encoding="utf-8")).get("packages") or {}
+    except (OSError, UnicodeDecodeError, orjson.JSONDecodeError):
         return lock.stat().st_mtime > marker.stat().st_mtime
 
     def comparable(pkg: dict) -> dict:
@@ -1612,6 +1635,10 @@ def _ensure_tui_node() -> None:
 
     hermes_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
     try:
+        _subprocess_kwargs = {}
+        if sys.platform == "win32":
+            from hermes_cli._subprocess_compat import windows_hide_flags
+            _subprocess_kwargs["creationflags"] = windows_hide_flags()
         # Helper writes logs to stderr; we ask bash to print `command -v node`
         # on stdout once ensure_node succeeds. Subshell PATH edits don't leak
         # back into Python, so the stdout capture is the bridge.
@@ -1627,6 +1654,7 @@ def _ensure_tui_node() -> None:
             encoding="utf-8",
             errors="replace",
             check=False,
+            **_subprocess_kwargs,
         )
     except (OSError, subprocess.SubprocessError):
         return
@@ -1670,12 +1698,17 @@ def _restore_tui_workspace(tui_dir: Path) -> bool:
     if not git or not (tui_dir.parent / ".git").exists():
         return False
     try:
+        _subprocess_kwargs = {}
+        if sys.platform == "win32":
+            from hermes_cli._subprocess_compat import windows_hide_flags
+            _subprocess_kwargs["creationflags"] = windows_hide_flags()
         subprocess.run(
             [git, "restore", "--", tui_dir.name],
             cwd=str(tui_dir.parent),
             capture_output=True,
             text=True,
             check=False,
+            **_subprocess_kwargs,
         )
     except OSError:
         return False
@@ -2017,6 +2050,14 @@ def _launch_tui(
         apply_terminal_config_to_env(env=env)
     except Exception:
         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
+    # Bridge display.theme → HERMES_TUI_THEME env var so the TUI (Ink) picks it up
+    try:
+        from hermes_cli.config import load_config_readonly
+        _theme = load_config_readonly().get("display", {}).get("theme", "auto")
+        if _theme and _theme != "auto":
+            env["HERMES_TUI_THEME"] = _theme
+    except Exception:
+        pass
     active_session_fd, active_session_file = tempfile.mkstemp(
         prefix="hermes-tui-active-session-", suffix=".json"
     )
@@ -2200,16 +2241,34 @@ def _resolve_use_tui(args) -> bool:
 
     Precedence (highest first):
       1. ``--cli`` flag         → always classic REPL
-      2. ``--tui`` flag / ``HERMES_TUI=1`` → always TUI
-      3. ``display.interface`` config value ("cli" | "tui")
-      4. default → classic REPL
+      2. ``--tui`` flag         → always TUI (explicit ask)
+      3. no TTY                 → always classic (ambient prefs don't apply)
+      4. ``HERMES_TUI=1`` env   → TUI
+      5. ``display.interface`` config value ("cli" | "tui")
+      6. default → classic REPL
 
     Explicit flags always win over config so muscle memory and scripts keep
     working regardless of the configured default.
+
+    The TTY gate (3) is load-bearing: ambient TUI preferences (env var or
+    config default) must never hijack a NON-interactive invocation. Kanban
+    workers, cron jobs, and pipelines run ``hermes … chat -q`` with stdout
+    on a pipe; booting the Ink TUI there hits its no-TTY bail-out, which
+    prints a resume hint and exits 0 — a kanban worker then dies with
+    "exited cleanly without calling kanban_complete — protocol violation"
+    on every attempt (found dogfooding the desktop kanban board). A user
+    who *explicitly* passes ``--tui`` still gets the informative bail-out.
     """
     if getattr(args, "cli", False):
         return False
-    if getattr(args, "tui", False) or os.environ.get("HERMES_TUI") == "1":
+    if getattr(args, "tui", False):
+        return True
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+    except Exception:
+        return False
+    if os.environ.get("HERMES_TUI") == "1":
         return True
     try:
         from hermes_cli.config import load_config
@@ -2223,6 +2282,8 @@ def _resolve_use_tui(args) -> bool:
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
+
+    _apply_safe_mode(args)
 
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
@@ -2330,21 +2391,13 @@ def cmd_chat(args):
     except Exception:
         pass
 
-    # --yolo: bypass all dangerous command approvals
+    # --yolo: bypass all dangerous command approvals.
+    # Also set in main() before _prepare_agent_startup() — that is the
+    # authoritative site because it runs before tool imports freeze
+    # _YOLO_MODE_FROZEN.  This redundant set is a safety net for callers
+    # that invoke cmd_chat directly (e.g. subcommand dispatch).
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
-
-    # --safe-mode: troubleshooting mode that disables ALL customizations.
-    # Inspired by Claude Code v2.1.169's --safe-mode (June 2026): run with a
-    # pristine environment to isolate whether a problem comes from the user's
-    # setup (config, rules files, plugins, MCP servers) or from Hermes itself.
-    # Implemented as a superset of --ignore-user-config + --ignore-rules plus
-    # plugin/MCP discovery suppression (HERMES_SAFE_MODE is checked by
-    # hermes_cli/plugins.py and tools/mcp_tool.py).
-    if getattr(args, "safe_mode", False):
-        os.environ["HERMES_SAFE_MODE"] = "1"
-        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
-        os.environ["HERMES_IGNORE_RULES"] = "1"
 
     # --ignore-user-config: make load_cli_config() / load_config() skip the
     # user's ~/.hermes/config.yaml and return built-in defaults. Set BEFORE
@@ -3119,6 +3172,8 @@ def select_provider_and_model(args=None):
         _model_flow_stepfun(config, current_model)
     elif selected_provider == "bedrock":
         _model_flow_bedrock(config, current_model)
+    elif selected_provider == "vertex":
+        _model_flow_vertex(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
     elif selected_provider in {
@@ -3697,8 +3752,7 @@ def _auto_provider_name(base_url: str) -> str:
     "RunPod (xyz.runpod.io)".  Used as the default when prompting the
     user for a display name during custom endpoint setup.
     """
-    import re
-
+    from agent.re_compat import re
     clean = base_url.replace("https://", "").replace("http://", "").rstrip("/")
     clean = re.sub(r"/v1/?$", "", clean)
     name = clean.split("/")[0]
@@ -3903,22 +3957,28 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
             str(effort).strip().lower() for effort in efforts if str(effort).strip()
         )
     )
-    canonical_order = ("minimal", "low", "medium", "high", "xhigh")
+    canonical_order = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
     ordered = [effort for effort in canonical_order if effort in deduped]
     ordered.extend(effort for effort in deduped if effort not in canonical_order)
     if not ordered:
         return None
 
     def _label(effort):
-        if effort == current_effort:
-            return f"{effort}  ← currently in use"
-        return effort
+        if effort == "off":
+            label = "off (disable reasoning)"
+        else:
+            label = effort
+        if effort == current_effort or (current_effort == "none" and effort == "off"):
+            return f"{label}  ← currently in use"
+        return label
 
-    disable_label = "Disable reasoning"
     skip_label = "Skip (keep current)"
+    has_off = "off" in ordered
 
-    if current_effort == "none":
-        default_idx = len(ordered)
+    if current_effort == "none" and has_off:
+        default_idx = ordered.index("off")
+    elif current_effort == "none":
+        default_idx = len(ordered)  # disable option past end
     elif current_effort in ordered:
         default_idx = ordered.index(current_effort)
     elif "medium" in ordered:
@@ -3930,7 +3990,8 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
         from hermes_cli.curses_ui import curses_radiolist
 
         choices = [_label(effort) for effort in ordered]
-        choices.append(disable_label)
+        if not has_off:
+            choices.append("Disable reasoning")
         choices.append(skip_label)
         idx = curses_radiolist(
             "Select reasoning effort:",
@@ -3942,7 +4003,12 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
             return None
         print()
         if idx < len(ordered):
-            return ordered[idx]
+            chosen = ordered[idx]
+            return "none" if chosen == "off" else chosen
+        if has_off:
+            # idx == len(ordered) → skip
+            return None
+        # idx == len(ordered) → disable, idx == len(ordered)+1 → skip
         if idx == len(ordered):
             return "none"
         return None
@@ -3953,23 +4019,33 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
     for i, effort in enumerate(ordered, 1):
         print(f"  {i}. {_label(effort)}")
     n = len(ordered)
-    print(f"  {n + 1}. {disable_label}")
-    print(f"  {n + 2}. {skip_label}")
+    if has_off:
+        print(f"  {n + 1}. {skip_label}")
+        n_choices = n + 1
+    else:
+        print(f"  {n + 1}. Disable reasoning")
+        print(f"  {n + 2}. {skip_label}")
+        n_choices = n + 2
     print()
 
     while True:
         try:
-            choice = input(f"Choice [1-{n + 2}] (default: keep current): ").strip()
+            choice = input(f"Choice [1-{n_choices}] (default: keep current): ").strip()
             if not choice:
                 return None
             idx = int(choice)
             if 1 <= idx <= n:
-                return ordered[idx - 1]
-            if idx == n + 1:
-                return "none"
-            if idx == n + 2:
-                return None
-            print(f"Please enter 1-{n + 2}")
+                chosen = ordered[idx - 1]
+                return "none" if chosen == "off" else chosen
+            if has_off:
+                if idx == n + 1:
+                    return None  # skip
+            else:
+                if idx == n + 1:
+                    return "none"  # disable
+                if idx == n + 2:
+                    return None  # skip
+            print(f"Please enter 1-{n_choices}")
         except ValueError:
             print("Please enter a number")
         except (KeyboardInterrupt, EOFError):
@@ -4342,10 +4418,12 @@ def cmd_import(args):
 
 
 def _print_version_info(*, check_updates: bool = True) -> None:
+    from hermes_cli.config import detect_install_method
     from hermes_cli.banner import format_banner_version_label
 
     print(format_banner_version_label())
-    print(f"Project: {PROJECT_ROOT}")
+    print(f"Install directory: {PROJECT_ROOT}")
+    print(f"Install method: {detect_install_method(PROJECT_ROOT)}")
 
     # Show Python version
     print(f"Python: {sys.version.split()[0]}")
@@ -4396,7 +4474,7 @@ def cmd_uninstall(args):
     if getattr(args, "gui_summary", False):
         from hermes_cli.gui_uninstall import gui_install_summary
 
-        print(json.dumps(gui_install_summary()))
+        print(orjson.dumps(gui_install_summary()).decode('utf-8'))
         return
 
     # GUI-only uninstall. The desktop app shells out to this non-interactively
@@ -4447,14 +4525,17 @@ def _clear_bytecode_cache(root: Path) -> int:
     return removed
 
 
-# Critical files that every ``hermes`` invocation imports at startup. If any
-# of these fail to parse after a pull, the CLI is bricked — the user can't
-# even run ``hermes update`` again to roll forward. The post-pull syntax
-# guard validates these and auto-rolls-back on failure.
+# Critical files that Hermes must be able to import immediately after an
+# update/install. Most are imported on every CLI startup; ``web_server.py``
+# is the desktop/dashboard backend path that a fresh Windows install launches
+# right away. If any of these fail to parse after a pull, the user can be
+# left with a bricked CLI or desktop backend. The post-pull syntax guard
+# validates these and auto-rolls-back on failure.
 _UPDATE_CRITICAL_FILES = (
     "hermes_cli/main.py",
     "hermes_cli/config.py",
     "hermes_cli/__init__.py",
+    "hermes_cli/web_server.py",
     "cli.py",
     "run_agent.py",
     "model_tools.py",
@@ -4530,7 +4611,7 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
     config migration) are forwarded to the messenger instead of being silently
     skipped.
     """
-    import json as _json
+    import orjson as _json
     import uuid as _uuid
     from hermes_constants import get_hermes_home
 
@@ -4547,7 +4628,7 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
         "id": str(_uuid.uuid4()),
     }
     tmp = prompt_path.with_suffix(".tmp")
-    tmp.write_text(_json.dumps(payload))
+    tmp.write_text(_json.dumps(payload).decode('utf-8'))
     tmp.replace(prompt_path)
 
     # Poll for response
@@ -4729,8 +4810,7 @@ def _nixos_build_env() -> dict[str, str] | None:
     Returns an env dict suitable for ``subprocess.run(env=...)`` or
     ``None`` when we are not on NixOS or python3 is already on PATH.
     """
-    import re
-
+    from agent.re_compat import re
     try:
         os_release = Path("/etc/os-release").read_text(encoding="utf-8")
     except OSError:
@@ -5055,8 +5135,8 @@ def _desktop_build_needed(desktop_dir: Path, project_root: Path, *, source_mode:
         return True
 
     try:
-        stamp_data = json.loads(stamp_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, KeyError):
+        stamp_data = orjson.loads(stamp_file.read_text(encoding="utf-8"))
+    except (OSError, orjson.JSONDecodeError, KeyError):
         return True
 
     # If the mode changed (source vs packaged), force a rebuild
@@ -5083,7 +5163,7 @@ def _write_desktop_build_stamp(project_root: Path, *, source_mode: bool) -> None
             "sourceMode": source_mode,
             "builtAt": datetime.now(timezone.utc).isoformat(),
         }
-        stamp_file.write_text(json.dumps(stamp_data, indent=2) + "\n", encoding="utf-8")
+        stamp_file.write_text(orjson.dumps(stamp_data, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n", encoding="utf-8")
     except Exception as exc:
         # Never let stamp-writing block or fail a build
         logger.debug("Failed to write desktop build stamp: %s", exc)
@@ -5598,6 +5678,8 @@ def cmd_gui(args: argparse.Namespace):
         env["HERMES_DESKTOP_HERMES_ROOT"] = str(Path(args.hermes_root).expanduser().resolve())
     if getattr(args, "cwd", None):
         env["HERMES_DESKTOP_CWD"] = str(Path(args.cwd).expanduser().resolve())
+    else:
+        env["HERMES_DESKTOP_CWD"] = os.getcwd()
 
     # Desktop launch options from config.yaml (`desktop.electron_flags`,
     # `desktop.disable_gpu`). The GPU policy is bridged to the env var the
@@ -5813,9 +5895,9 @@ def _find_stale_dashboard_pids(
 
     *exclude_pids* is an optional set of PIDs that must never be returned.
     This is used by the Hermes Desktop Electron app to protect its own
-    backend child process: when the desktop spawns ``hermes dashboard`` as
+    backend child process: when the desktop spawns ``hermes serve`` as
     a backend and triggers an auto-update, the update must not kill the
-    dashboard that the desktop itself manages.  The desktop sets the
+    backend that the desktop itself manages.  The desktop sets the
     environment variable ``HERMES_DESKTOP_CHILD_PID`` on the spawned
     backend process; ``_kill_stale_dashboard_processes`` reads it and
     passes it here.  (#37532)
@@ -5826,6 +5908,12 @@ def _find_stale_dashboard_pids(
         "hermes dashboard",
         "hermes_cli.main dashboard",
         "hermes_cli/main.py dashboard",
+        # The headless backend (`hermes serve`) is the same long-lived server
+        # under a different command name — the desktop app spawns it. Reap it
+        # on update for the same frontend/backend-mismatch reason.
+        "hermes serve",
+        "hermes_cli.main serve",
+        "hermes_cli/main.py serve",
     ]
     self_pid = os.getpid()
     dashboard_pids: list[int] = []
@@ -6416,7 +6504,11 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     )
     if unmerged.stdout.strip():
         print("→ Clearing unmerged index entries from a previous conflict...")
-        subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
+        _gk = {}
+        if sys.platform == "win32":
+            from hermes_cli._subprocess_compat import windows_hide_flags
+            _gk["creationflags"] = windows_hide_flags()
+        subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True, **_gk)  # windows-footgun: ok — creationflags in _gk
 
     from datetime import datetime, timezone
 
@@ -7689,7 +7781,7 @@ def _install_python_dependencies_with_optional_fallback(
 def _load_console_script_names() -> list[str]:
     """Return ``[project.scripts]`` entry-point names from pyproject.toml."""
     try:
-        import tomllib  # Python 3.11+
+        import tomllib  # Python 3.14+
     except ImportError:  # pragma: no cover
         return []
 
@@ -7795,8 +7887,8 @@ def _verify_core_dependencies_installed(
     that caused it, instead of hours later in a downstream subprocess.
     """
     try:
-        import tomllib  # Python 3.11+
-    except ImportError:  # pragma: no cover — Python < 3.11 unsupported but be safe
+        import tomllib  # Python 3.14+
+    except ImportError:  # pragma: no cover — Python < 3.14 unsupported but be safe
         return
 
     pyproject = PROJECT_ROOT / "pyproject.toml"
@@ -8373,8 +8465,14 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     on a PyPI install we surface a one-line notice instead of silently
     dropping the flag.
     """
-    from hermes_cli.config import detect_install_method
+    from hermes_cli.config import (
+        detect_install_method,
+        format_unsupported_install_warning,
+        is_unsupported_install_method,
+    )
     method = detect_install_method(PROJECT_ROOT)
+    if is_unsupported_install_method(method):
+        print(f"⚠ {format_unsupported_install_warning(method)}")
     if method == "docker":
         # Docker can't ``git fetch`` from within the container.  Surface the
         # same long-form ``docker pull`` guidance ``hermes update`` (apply
@@ -8714,8 +8812,8 @@ def _run_pre_update_backup(args) -> None:
 
     print(f"  Saved:    {display_path} ({size_str}, {elapsed:.1f}s)")
     print(f"  Restore:  hermes import {out_path}")
-    print(f"  Disable:  omit --backup (backups are off by default)")
-    print(f"            set updates.pre_update_backup: false in config.yaml")
+    print("  Disable:  omit --backup (backups are off by default)")
+    print("            set updates.pre_update_backup: false in config.yaml")
     print()
 
 
@@ -8773,6 +8871,193 @@ def _wait_for_windows_update_gateway_exit(
         except Exception:
             pass
     return survivors
+
+
+def _venv_core_imports_healthy() -> tuple[bool, str]:
+    """Probe the project venv for the core imports the backend needs to boot.
+
+    Runs a tiny import check inside the venv interpreter (NOT this process —
+    ``hermes update`` may be driven by a different Python). Catches the
+    half-updated-venv state: git checkout current but a dependency sync that
+    failed or was killed partway (e.g. Windows access-denied on a loaded
+    .pyd), leaving imports like ``fastapi``'s new transitive deps missing.
+    Without this probe, ``hermes update`` on a current checkout prints
+    "Already up to date!" and returns without ever re-syncing dependencies —
+    the user's install stays broken no matter how many times they update
+    (ryanc's incident, July 2026).
+
+    Returns ``(healthy, detail)``. Never raises; unknown states report
+    healthy so a probe failure can't force needless reinstalls.
+    """
+    venv_dir = PROJECT_ROOT / "venv"
+    python_name = "python.exe" if _is_windows() else "python"
+    bin_dir = "Scripts" if _is_windows() else "bin"
+    venv_python = venv_dir / bin_dir / python_name
+    if not venv_python.exists():
+        # No venv interpreter at all. In a dev checkout that's normal (the
+        # dev may run hermes from any interpreter), so report healthy to
+        # avoid forcing reinstalls. But on a MANAGED install (the Windows
+        # installer / desktop bootstrap stamps `.hermes-bootstrap-complete`,
+        # and an interrupted update leaves `.update-incomplete`), the venv
+        # IS the install — its absence means a repair got interrupted after
+        # the old venv was moved aside, and "Already up to date!" would
+        # gaslight the user while nothing can run.
+        managed_markers = (
+            PROJECT_ROOT / ".hermes-bootstrap-complete",
+            _update_marker_path(),
+        )
+        if any(m.exists() for m in managed_markers):
+            return False, f"venv python missing ({venv_python})"
+        return True, ""
+
+    # Core web/serve imports plus their newest transitive deps. Import (not
+    # just metadata) — a package can have intact dist-info but a missing
+    # module after an interrupted uninstall/install cycle.
+    check = (
+        "import importlib\n"
+        "mods = ['fastapi', 'uvicorn', 'pydantic', 'openai', 'yaml']\n"
+        "missing = []\n"
+        "for m in mods:\n"
+        "    try: importlib.import_module(m)\n"
+        "    except Exception as e: missing.append(f'{m}: {e}')\n"
+        "print('\\n'.join(missing))\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(venv_python), "-c", check],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=PROJECT_ROOT,
+        )
+    except Exception as exc:
+        logger.debug("venv health probe failed to run: %s", exc)
+        return True, ""
+
+    missing = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if result.returncode != 0 and not missing:
+        # Interpreter itself is broken (e.g. deleted stdlib) — that IS unhealthy.
+        detail = (result.stderr or "").strip().splitlines()
+        return False, detail[0] if detail else "venv python failed to run"
+    if missing:
+        return False, "; ".join(missing[:4])
+    return True, ""
+
+
+def _detect_venv_python_processes(
+    *, exclude_pids: set[int] | None = None
+) -> list[tuple[int, str, str]]:
+    """Find live processes running from the project venv's interpreter.
+
+    The hermes.exe shim guard misses the biggest lock-holder class on
+    Windows: the Desktop app's backend (``python.exe -m hermes_cli.main
+    serve``) and anything else running straight off ``venv\\Scripts\\python
+    (w).exe``. Those processes keep native ``.pyd`` extensions mapped, so a
+    dependency sync mid-update dies with access-denied and strands the venv
+    half-updated (ryanc's brotlicffi/_sodium.pyd incidents, July 2026).
+
+    Killing them from here is pointless — the Desktop app supervises its
+    backend and respawns it within seconds — so the caller should refuse and
+    tell the user to close the app instead. Returns ``(pid, name, cmdline)``
+    tuples; empty off-Windows / without psutil / when nothing matches. The
+    calling process and its ancestors are always excluded (a CLI ``hermes
+    update`` itself runs from the venv python). Never raises.
+    """
+    if not _is_windows():
+        return []
+    try:
+        import psutil
+    except Exception:
+        return []
+
+    venv_dir = PROJECT_ROOT / "venv"
+    try:
+        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
+    except OSError:
+        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
+    try:
+        root_prefix = str(PROJECT_ROOT.resolve()).lower().rstrip(os.sep) + os.sep
+    except OSError:
+        root_prefix = str(PROJECT_ROOT).lower().rstrip(os.sep) + os.sep
+
+    skip: set[int] = set(exclude_pids or set())
+    skip.add(os.getpid())
+    try:
+        for anc in psutil.Process().parents():
+            skip.add(int(anc.pid))
+    except Exception:
+        pass
+
+    matches: list[tuple[int, str, str]] = []
+    try:
+        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+    except Exception:
+        return []
+    for proc in proc_iter:
+        try:
+            info = proc.info
+        except Exception:
+            continue
+        pid = info.get("pid")
+        exe = info.get("exe")
+        if not exe or pid is None or int(pid) in skip:
+            continue
+        try:
+            exe_norm = str(Path(exe).resolve()).lower()
+        except (OSError, ValueError):
+            exe_norm = str(exe).lower()
+        cmdline_raw = " ".join(info.get("cmdline") or [])
+        cmdline_low = cmdline_raw.lower()
+        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
+
+        # Primary match: the executable itself lives under this venv
+        # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
+        is_holder = exe_norm.startswith(venv_prefix)
+        # Fallback: uv/base-interpreter trampolines run a python whose exe is
+        # OUTSIDE the venv but which still imports from it and holds its .pyd
+        # files. Catch those by what they're running: a cmdline that references
+        # this venv's path, or a `-m hermes_cli.main ...` invocation tied to
+        # this install (install root in the cmdline or as the working dir).
+        if not is_holder and venv_prefix in cmdline_low:
+            is_holder = True
+        if not is_holder and "hermes_cli.main" in cmdline_low:
+            if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
+                is_holder = True
+        if not is_holder:
+            continue
+        name = info.get("name") or Path(exe).name
+        matches.append((int(pid), str(name), cmdline_raw[:120]))
+    return matches
+
+
+def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
+    """Explain which venv processes block the update and how to clear them."""
+    lines = [
+        "✗ Other Hermes processes are running from this install's venv:",
+    ]
+    for pid, name, cmdline in matches[:6]:
+        hint = ""
+        low = cmdline.lower()
+        if "serve" in low or "dashboard" in low:
+            hint = "  ← Hermes Desktop backend (close the desktop app)"
+        elif "gateway" in low:
+            hint = "  ← gateway"
+        lines.append(f"  PID {pid}  {name}  {cmdline}{hint}")
+    if len(matches) > 6:
+        lines.append(f"  ... and {len(matches) - 6} more")
+    lines.append("")
+    lines.append(
+        "  On Windows these keep native extension files (.pyd) locked, so the"
+    )
+    lines.append(
+        "  dependency update would fail partway and leave a broken install."
+    )
+    lines.append(
+        "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
+    )
+    lines.append("    hermes update")
+    lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
+    return "\n".join(lines)
 
 
 def _pause_windows_gateways_for_update() -> dict | None:
@@ -9070,9 +9355,20 @@ def cmd_update(args):
     from hermes_cli.config import (
         detect_install_method,
         format_docker_update_message,
+        format_unsupported_install_warning,
         is_managed,
+        is_unsupported_install_method,
         managed_error,
     )
+
+    # Deprecation notice for pip/Homebrew installs — printed before the
+    # managed-mode early-return below so Homebrew users (who are blocked from
+    # applying the update here) still see it. Warn, don't block: the update
+    # itself still proceeds (except Homebrew, which is managed-mode blocked
+    # for an unrelated reason — brew owns its own upgrade path).
+    _install_method_for_warning = detect_install_method(PROJECT_ROOT)
+    if is_unsupported_install_method(_install_method_for_warning):
+        print(f"⚠ {format_unsupported_install_warning(_install_method_for_warning)}")
 
     if is_managed():
         managed_error("update Hermes Agent")
@@ -9234,6 +9530,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _windows_gateway_resume,
         )
 
+    # With gateways paused, anything still running from the venv interpreter
+    # (most commonly the Desktop app's `hermes serve` backend) will keep .pyd
+    # files locked and corrupt the dependency sync below. Refuse rather than
+    # race: killing the desktop backend is futile (the app supervises and
+    # respawns it), so the user must close the app. Deliberately NOT bypassed
+    # by plain --force: the desktop bootstrap updater passes --force to skip
+    # the hermes.exe shim guard above, but its lock probe only checks the shim
+    # and app.asar — a non-desktop venv python holding a .pyd would sail
+    # through and corrupt the sync (the exact failure this guard exists for).
+    # --force-venv is the explicit escape hatch.
+    if _is_windows() and not getattr(args, "force_venv", False):
+        _venv_holders = _detect_venv_python_processes()
+        if _venv_holders:
+            print(_format_venv_python_holders_message(_venv_holders))
+            _resume_windows_gateways_after_update(_windows_gateway_resume)
+            sys.exit(2)
+
     # Try git-based update first, fall back to ZIP download on Windows
     # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)
     use_zip_update = False
@@ -9331,7 +9644,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "✗ Authentication failed — check your git credentials or SSH key."
                 )
             else:
-                print(f"✗ Failed to fetch updates from origin.")
+                print("✗ Failed to fetch updates from origin.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
@@ -9435,7 +9748,57 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     text=True,
                     check=False,
                 )
-            print("✓ Already up to date!")
+
+            # A current checkout does NOT imply a healthy install: a previous
+            # dependency sync may have failed partway (classic on Windows,
+            # where a running gateway/desktop backend keeps .pyd files locked
+            # and uv/pip dies with access-denied, stranding the venv between
+            # versions). Probe the venv's core imports and repair if broken —
+            # otherwise "Already up to date!" gaslights the user while their
+            # install stays bricked.
+            healthy, detail = _venv_core_imports_healthy()
+            if not healthy:
+                print("⚠ Checkout is current, but the venv is unhealthy:")
+                print(f"  {detail}")
+                print("→ Repairing Python dependencies...")
+                _write_update_incomplete_marker()
+                from hermes_cli.managed_uv import ensure_uv
+
+                repair_uv = ensure_uv()
+                # A managed install whose venv is gone entirely (interrupted
+                # repair after the old venv was moved aside) needs the venv
+                # recreated before dependencies can be installed into it.
+                venv_python_missing = not (
+                    PROJECT_ROOT
+                    / "venv"
+                    / ("Scripts" if _is_windows() else "bin")
+                    / ("python.exe" if _is_windows() else "python")
+                ).exists()
+                if venv_python_missing and repair_uv:
+                    print("→ Recreating virtual environment...")
+                    subprocess.run(
+                        [repair_uv, "venv", "venv"],
+                        cwd=PROJECT_ROOT,
+                        check=False,
+                    )
+                if repair_uv:
+                    repair_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+                    _install_python_dependencies_with_optional_fallback(
+                        [repair_uv, "pip"], env=repair_env, group="all"
+                    )
+                else:
+                    _install_python_dependencies_with_optional_fallback(
+                        [sys.executable, "-m", "pip"], group="all"
+                    )
+                _clear_update_incomplete_marker()
+                healthy_after, detail_after = _venv_core_imports_healthy()
+                if healthy_after:
+                    print("✓ Dependencies repaired!")
+                else:
+                    print(f"⚠ Venv still unhealthy after repair: {detail_after}")
+                    print("  Close all Hermes windows/gateways and re-run: hermes update")
+            else:
+                print("✓ Already up to date!")
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
@@ -9545,7 +9908,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(
                         f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
                     )
-                    print(f"  Restore manually with: git stash apply")
+                    print("  Restore manually with: git stash apply")
                 elif discard_local_changes:
                     # Non-interactive update + user opted into discarding local
                     # source edits (updates.non_interactive_local_changes:
@@ -9987,7 +10350,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # predictable cadence (matches when they pull new agent code) without
         # adding startup latency or a per-launch GitHub API call.
         try:
-            if sys.platform in ("darwin", "win32", "linux") and shutil.which("cua-driver"):
+            refresh_cua_driver = True
+            try:
+                from hermes_cli.config import load_config
+
+                _update_cfg = (load_config() or {}).get("updates", {})
+                if isinstance(_update_cfg, dict):
+                    refresh_cua_driver = bool(
+                        _update_cfg.get("refresh_cua_driver", True)
+                    )
+            except Exception as cfg_exc:
+                logger.debug("Could not read updates.refresh_cua_driver: %s", cfg_exc)
+
+            if (
+                refresh_cua_driver
+                and sys.platform in ("darwin", "win32", "linux")
+                and shutil.which("cua-driver")
+            ):
                 from hermes_cli.tools_config import install_cua_driver
 
                 print()
@@ -10747,6 +11126,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "uninstall",
         "profile",
         "dashboard",
+        "serve",
         "desktop",
         "gui",
         "honcho",
@@ -10877,7 +11257,7 @@ def cmd_profile(args):
         try:
             set_active_profile(name)
             if name == "default":
-                print(f"Switched to: default (~/.hermes)")
+                print("Switched to: default (~/.hermes)")
             else:
                 print(f"Switched to: {name}")
         except (ValueError, FileNotFoundError) as e:
@@ -10966,9 +11346,9 @@ def cmd_profile(args):
                         if not _is_wrapper_dir_in_path():
                             print(f"\n⚠ {_get_wrapper_dir()} is not in your PATH.")
                             print(
-                                f"  Add to your shell config (~/.bashrc or ~/.zshrc):"
+                                "  Add to your shell config (~/.bashrc or ~/.zshrc):"
                             )
-                            print(f'    export PATH="$HOME/.local/bin:$PATH"')
+                            print('    export PATH="$HOME/.local/bin:$PATH"')
 
             # Profile dir for display
             try:
@@ -10977,7 +11357,7 @@ def cmd_profile(args):
                 profile_dir_display = str(profile_dir)
 
             # Next steps
-            print(f"\nNext steps:")
+            print("\nNext steps:")
             print(f"  {name} setup              Configure API keys and model")
             print(f"  {name} chat               Start chatting")
             print(f"  {name} gateway start      Start the messaging gateway")
@@ -10988,7 +11368,7 @@ def cmd_profile(args):
                 print(
                     f"\n  ⚠ This profile has no API keys yet. Run '{name} setup' first,"
                 )
-                print(f"    or it will inherit keys from your shell environment.")
+                print("    or it will inherit keys from your shell environment.")
                 print(f"  Edit {profile_dir_display}/SOUL.md to customize personality")
             print()
 
@@ -11157,13 +11537,19 @@ def cmd_profile(args):
         remove = getattr(args, "remove", False)
         custom_name = getattr(args, "alias_name", None)
 
-        from hermes_cli.profiles import profile_exists
+        from hermes_cli.profiles import profile_exists, validate_alias_name
 
         if not profile_exists(name):
             print(f"Error: Profile '{name}' does not exist.")
             sys.exit(1)
 
         alias_name = custom_name or name
+
+        try:
+            validate_alias_name(alias_name)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
 
         if remove:
             if remove_wrapper_script(alias_name):
@@ -11643,6 +12029,11 @@ def cmd_dashboard(args):
         remaining = _find_stale_dashboard_pids()
         sys.exit(1 if remaining else 0)
 
+    # `serve` is the headless backend: no UI build, no SPA mount, neutral
+    # ready sentinel. Resolved once and threaded through the re-exec, the
+    # build gate, and start_server.
+    _headless_backend = getattr(args, "headless_backend", False)
+
     # ── Unified profile launch routing ────────────────────────────────
     # The dashboard is a MACHINE management surface: it can read/write any
     # profile via the per-request ?profile= scoping. Running one dashboard
@@ -11662,12 +12053,23 @@ def cmd_dashboard(args):
     except Exception:
         _launch_profile = "default"
 
+    # Fix C: If HERMES_HOME already points to a profiles/<name> dir,
+    # the Desktop has already routed us correctly — skip re-exec.
+    _hermes_home_in_profile = (
+        os.environ.get("HERMES_HOME", "")
+        and Path(os.environ["HERMES_HOME"]).parent.name == "profiles"
+    )
+
     if (
         _launch_profile not in ("default", "custom")
         and not getattr(args, "isolated", False)
         and not getattr(args, "open_profile", "")
         # Desktop pool backends are intentionally per-profile.
         and os.environ.get("HERMES_DESKTOP") != "1"
+        # Fix B: Defense-in-depth — catch Desktop spawn sites that forget HERMES_DESKTOP
+        and os.environ.get("HERMES_DESKTOP_MANAGED") != "1"
+        # Fix C: If HERMES_HOME is already in a profile dir, we're correctly routed
+        and not _hermes_home_in_profile
     ):
         url = f"http://{args.host or '127.0.0.1'}:{args.port}/?profile={_launch_profile}"
         if _dashboard_listening(args.host, args.port):
@@ -11688,7 +12090,9 @@ def cmd_dashboard(args):
         reexec_argv = [
             sys.executable, "-m", "hermes_cli.main",
             "-p", "default",
-            "dashboard",
+            # Preserve the lean serve path across the re-exec so a named-profile
+            # `serve` doesn't silently rebuild the UI as `dashboard`.
+            "serve" if _headless_backend else "dashboard",
             "--port", str(args.port),
             "--host", args.host,
             "--open-profile", _launch_profile,
@@ -11757,7 +12161,11 @@ def cmd_dashboard(args):
     # backend is the desktop's primary entrypoint and needs the same.
     _sync_bundled_skills_quietly()
 
-    if "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
+    if _headless_backend:
+        # Don't build the SPA, and tell mount_spa() (read at web_server import
+        # below) to disable it even if a stray dist exists. Set it first.
+        os.environ["HERMES_SERVE_HEADLESS"] = "1"
+    elif "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
         if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
             sys.exit(1)
     elif getattr(args, "skip_build", False):
@@ -11775,6 +12183,23 @@ def cmd_dashboard(args):
             print("  Or drop --skip-build to build automatically.")
             sys.exit(1)
         print(f"→ Skipping web UI build (--skip-build); using dist at {_dist_root}")
+    else:
+        # HERMES_WEB_DIST is set without --skip-build: the build is skipped
+        # (the env var points at a caller-managed dist), so validate it the
+        # same way the --skip-build branch does — otherwise the server starts
+        # and serves 404s with no obvious cause (same failure mode as #23817,
+        # via the env-var path).
+        _dist_root = Path(os.environ["HERMES_WEB_DIST"]).expanduser()
+        if not (_dist_root / "index.html").exists():
+            print(f"✗ HERMES_WEB_DIST is set but no web dist found at: {_dist_root}")
+            print("  Pre-build first:  npm install --workspace web && npm run build -w web")
+            print("  Or unset HERMES_WEB_DIST to build and use the default web UI dist.")
+            sys.exit(1)
+        # Write the expanded path back: web_server reads HERMES_WEB_DIST raw
+        # at import (no expanduser), so a validated "~/dist" would otherwise
+        # pass here and still 404 there.
+        os.environ["HERMES_WEB_DIST"] = str(_dist_root)
+        print(f"→ Using web dist from HERMES_WEB_DIST: {_dist_root}")
 
     # Discover and load plugins so any DashboardAuthProvider plugin
     # (e.g. plugins/dashboard_auth/nous) registers BEFORE start_server's
@@ -11879,13 +12304,39 @@ def cmd_dashboard(args):
     # The in-browser Chat tab (the embedded TUI over PTY/WebSocket) is always
     # available — the desktop app and the dashboard's own Chat tab both rely on
     # the `/api/ws` + `/api/pty` sockets, so there is no reason to gate them.
-    start_server(
-        host=args.host,
-        port=args.port,
-        open_browser=not args.no_open,
-        allow_public=getattr(args, "insecure", False),
-        initial_profile=getattr(args, "open_profile", "") or "",
-    )
+
+    # Coordinate with other Hermes instances (desktop-managed dashboards,
+    # gateways, proxies) before binding. We claim the dashboard port plus the
+    # well-known associated ports so a CLI dashboard and a desktop dashboard
+    # never silently collide on the same HERMES_HOME.
+    from hermes_cli.port_lock import claim_port_set
+
+    _dashboard_port = int(args.port)
+    _well_known_ports = [8644, 8645]
+    if _dashboard_port > 0:
+        _well_known_ports.insert(0, _dashboard_port)
+    _port_locks = claim_port_set(_well_known_ports)
+    if _port_locks is None:
+        print(
+            f"Error: port {_dashboard_port} (or associated webhook/proxy ports) "
+            f"is already claimed by another Hermes instance.\n"
+            f"Stop the other instance, or use `--port 0` to let the OS assign a free port.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        start_server(
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_open,
+            allow_public=getattr(args, "insecure", False),
+            initial_profile=getattr(args, "open_profile", "") or "",
+            headless=_headless_backend,
+        )
+    finally:
+        for _pl in _port_locks:
+            _pl.release()
 
 
 def cmd_dashboard_register(args):
@@ -11943,6 +12394,13 @@ def cmd_logs(args):
     )
 
 
+def cmd_console(args):
+    """Open the safe Hermes command console."""
+    from hermes_cli.console_engine import run_console_repl
+
+    return run_console_repl()
+
+
 def _build_provider_choices() -> list[str]:
     """Build the --provider choices list from CANONICAL_PROVIDERS + 'auto'."""
     try:
@@ -11952,7 +12410,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
@@ -11972,9 +12430,10 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
@@ -12005,6 +12464,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
+        "--usage-file",
         # ``-c / --continue`` is nargs='?' (optional value). Treat it as
         # value-taking: if the next token is a subcommand-looking word
         # the user almost certainly meant it as the session name, and
@@ -12100,6 +12560,17 @@ def _should_background_mcp_startup(args) -> bool:
 
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
+    # plugin/tool discovery below imports tools.approval, which freezes
+    # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
+    # dispatch path also sets this earlier, but _prepare_agent_startup() is
+    # reachable from other launchers too (e.g. the Termux fast-CLI path),
+    # so the guarantee lives here where the import is actually triggered
+    # (#60328).
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+    _apply_safe_mode(args)
+
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
         args.command in _AGENT_COMMANDS
@@ -12165,6 +12636,14 @@ def _prepare_agent_startup(args) -> None:
         )
 
 
+def _apply_safe_mode(args) -> None:
+    if not getattr(args, "safe_mode", False):
+        return
+    os.environ["HERMES_SAFE_MODE"] = "1"
+    os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    os.environ["HERMES_IGNORE_RULES"] = "1"
+
+
 def _set_chat_arg_defaults(args) -> None:
     for attr, default in [
         ("query", None),
@@ -12228,6 +12707,7 @@ def _try_termux_fast_cli_launch() -> bool:
                 model=getattr(args, "model", None),
                 provider=getattr(args, "provider", None),
                 toolsets=getattr(args, "toolsets", None),
+                usage_file=getattr(args, "usage_file", None),
             )
         )
 
@@ -12327,7 +12807,7 @@ def cmd_memory(args):
             )
             return
 
-        print(f"\n  This will permanently erase the following memory files:")
+        print("\n  This will permanently erase the following memory files:")
         for f, desc in existing:
             path = mem_dir / f
             size = path.stat().st_size
@@ -12348,7 +12828,7 @@ def cmd_memory(args):
             print(f"  ✓ Deleted {f} ({desc})")
 
         print(
-            f"\n  Memory reset complete. New sessions will start with a blank slate."
+            "\n  Memory reset complete. New sessions will start with a blank slate."
         )
         print(f"  Files were in: {display_hermes_home()}/memories/\n")
     else:
@@ -12450,7 +12930,7 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
-    # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
+    # Cosmetic: make the process show up as 'hermes' instead of 'python3.14'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
 
@@ -12552,16 +13032,16 @@ def main():
     fallback_parser.set_defaults(func=cmd_fallback)
 
     # =========================================================================
-    # secrets command — external secret managers (currently: Bitwarden)
+    # secrets command — external secret managers (Bitwarden, 1Password)
     # =========================================================================
     secrets_parser = subparsers.add_parser(
         "secrets",
-        help="Manage external secret sources (Bitwarden Secrets Manager)",
+        help="Manage external secret sources (Bitwarden, 1Password)",
         description=(
             "Pull API keys from an external secret manager at process startup "
-            "instead of storing them in ~/.hermes/.env.  Currently supports "
-            "Bitwarden Secrets Manager.  See: "
-            "https://hermes-agent.nousresearch.com/docs/user-guide/secrets/bitwarden"
+            "instead of storing them in ~/.hermes/.env.  Supports Bitwarden "
+            "Secrets Manager and 1Password.  See: "
+            "https://hermes-agent.nousresearch.com/docs/user-guide/secrets/"
         ),
     )
     secrets_subparsers = secrets_parser.add_subparsers(dest="secrets_command")
@@ -12572,15 +13052,26 @@ def main():
         help="Bitwarden Secrets Manager integration",
     )
 
+    secrets_op = secrets_subparsers.add_parser(
+        "onepassword",
+        aliases=["op", "1password"],
+        help="1Password (op:// references) integration",
+    )
+
     # Lazy import — only pays for itself when this subcommand is actually used.
     from hermes_cli import secrets_cli as _secrets_cli
+    from hermes_cli import onepassword_secrets_cli as _op_secrets_cli
 
     _secrets_cli.register_cli(secrets_bw)
+    _op_secrets_cli.register_cli(secrets_op)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
+        op_sub = getattr(args, "secrets_op_command", None)
         if sub in ("bitwarden", "bw") and bw_sub is not None:
+            return args.func(args)
+        if sub in ("onepassword", "op", "1password") and op_sub is not None:
             return args.func(args)
         secrets_parser.print_help()
         return 0
@@ -12795,6 +13286,11 @@ def main():
     build_config_parser(subparsers, cmd_config=cmd_config)
 
     # =========================================================================
+    # console command  (parser built in hermes_cli/subcommands/console.py)
+    # =========================================================================
+    build_console_parser(subparsers, cmd_console=cmd_console)
+
+    # =========================================================================
     # pairing command  (parser built in hermes_cli/subcommands/pairing.py)
     # =========================================================================
     build_pairing_parser(subparsers, cmd_pairing=cmd_pairing)
@@ -12910,6 +13406,27 @@ def main():
         _register_pets_cli(pets_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("pets CLI wiring failed: %s", _exc)
+
+    # =========================================================================
+    # journey command — learned skills + memories over time, in the terminal
+    # =========================================================================
+    journey_parser = subparsers.add_parser(
+        "journey",
+        aliases=["learning", "memory-graph"],
+        help="Timeline of learned skills + memories over time",
+        description=(
+            "A terminal rendition of the desktop Star Map / Memory Graph: a "
+            "timeline bar chart of learned skills and memories over time "
+            "(oldest at top, newest at bottom) plus a playable constellation "
+            "scrubber. Mirrors the TUI `/journey` overlay and the desktop panel."
+        ),
+    )
+    try:
+        from hermes_cli.journey import register_cli as _register_journey_cli
+
+        _register_journey_cli(journey_parser)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("journey CLI wiring failed: %s", _exc)
 
     # =========================================================================
     # memory command  (parser built in hermes_cli/subcommands/memory.py)
@@ -13088,11 +13605,11 @@ def main():
                 from tools.computer_use.permissions import request_permissions_grant
                 sys.exit(request_permissions_grant())
             if perms_action == "status":
-                import json as _json
+                import orjson as _json
                 from tools.computer_use.permissions import computer_use_status
                 st = computer_use_status()
                 if bool(getattr(args, "json", False)):
-                    print(_json.dumps(st, indent=2, sort_keys=True))
+                    print(_json.dumps(st, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode('utf-8'))
                     sys.exit(0 if st["ready"] else 1)
                 if not st["platform_supported"]:
                     print(f"Computer Use is not supported on {st['platform']}.")
@@ -13144,14 +13661,181 @@ def main():
         "--limit", type=int, default=20, help="Max sessions to show"
     )
 
+    def _add_session_filter_args(p, default_older_help):
+        p.add_argument(
+            "--older-than",
+            metavar="AGE",
+            help=default_older_help,
+        )
+        p.add_argument(
+            "--newer-than",
+            metavar="AGE",
+            help="Only match sessions started within the last AGE "
+            "(e.g. '5h', '2d') or after an ISO timestamp",
+        )
+        p.add_argument(
+            "--before",
+            metavar="TIME",
+            help="Only match sessions started before TIME "
+            "(duration ago like '5h', or ISO timestamp like '2026-07-05 14:30')",
+        )
+        p.add_argument(
+            "--after",
+            metavar="TIME",
+            help="Only match sessions started at/after TIME "
+            "(duration ago like '5h', or ISO timestamp)",
+        )
+        p.add_argument("--source", help="Only match sessions from this source")
+        p.add_argument(
+            "--title", help="Only match sessions whose title contains this substring"
+        )
+        p.add_argument(
+            "--end-reason", help="Only match sessions with this end reason"
+        )
+        p.add_argument(
+            "--cwd", help="Only match sessions whose working directory is under this path"
+        )
+        p.add_argument(
+            "--min-messages", type=int, help="Only match sessions with >= N messages"
+        )
+        p.add_argument(
+            "--max-messages", type=int, help="Only match sessions with <= N messages"
+        )
+        p.add_argument(
+            "--model",
+            help="Only match sessions whose model name contains this substring "
+            "(e.g. 'sonnet', 'gpt-5', 'hermes')",
+        )
+        p.add_argument(
+            "--provider",
+            help="Only match sessions billed through this provider "
+            "(e.g. openrouter, anthropic, nous)",
+        )
+        p.add_argument(
+            "--user", help="Only match sessions from this user ID"
+        )
+        p.add_argument(
+            "--chat-id", help="Only match sessions from this chat/channel ID"
+        )
+        p.add_argument(
+            "--chat-type",
+            help="Only match sessions with this chat type (e.g. dm, group)",
+        )
+        p.add_argument(
+            "--branch",
+            help="Only match sessions whose git branch contains this substring",
+        )
+        p.add_argument(
+            "--min-tokens", type=int,
+            help="Only match sessions with >= N total tokens (input+output)",
+        )
+        p.add_argument(
+            "--max-tokens", type=int,
+            help="Only match sessions with <= N total tokens (input+output)",
+        )
+        p.add_argument(
+            "--min-cost", type=float,
+            help="Only match sessions costing >= N USD (actual or estimated)",
+        )
+        p.add_argument(
+            "--max-cost", type=float,
+            help="Only match sessions costing <= N USD (actual or estimated)",
+        )
+        p.add_argument(
+            "--min-tool-calls", type=int,
+            help="Only match sessions with >= N tool calls",
+        )
+        p.add_argument(
+            "--max-tool-calls", type=int,
+            help="Only match sessions with <= N tool calls",
+        )
+        p.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="List matching sessions without changing anything",
+        )
+        p.add_argument(
+            "--yes", "-y", action="store_true", help="Skip confirmation"
+        )
+
     sessions_export = sessions_subparsers.add_parser(
-        "export", help="Export sessions to a JSONL file"
+        "export", help="Export sessions to JSONL, Markdown, or QMD"
     )
     sessions_export.add_argument(
-        "output", help="Output JSONL file path (use - for stdout)"
+        "output",
+        nargs="?",
+        help=(
+            "Output path. JSONL: file path (use - for stdout, required). "
+            "md/qmd: output directory (default: <hermes home>/session-exports)"
+        ),
     )
-    sessions_export.add_argument("--source", help="Filter by source")
-    sessions_export.add_argument("--session-id", help="Export a specific session")
+    sessions_export.add_argument(
+        "--format",
+        choices=["jsonl", "md", "qmd", "html", "trace"],
+        default="jsonl",
+        help=(
+            "Export format (default: jsonl). 'trace' emits Claude Code JSONL "
+            "for the Hugging Face Agent Trace Viewer"
+        ),
+    )
+    sessions_export.add_argument(
+        "--upload",
+        action="store_true",
+        help=(
+            "trace only: upload to your Hugging Face traces dataset instead "
+            "of writing a local file (needs HF_TOKEN)"
+        ),
+    )
+    sessions_export.add_argument(
+        "--public",
+        action="store_true",
+        help="trace --upload only: create/update a public dataset instead of private",
+    )
+    sessions_export.add_argument(
+        "--no-redact",
+        action="store_true",
+        help=(
+            "trace only: skip the forced secret redaction; "
+            "only use after manual review"
+        ),
+    )
+    sessions_export.add_argument(
+        "--only",
+        choices=["user-prompts"],
+        help=(
+            "Export only a filtered view (user-prompts: one prompt record "
+            "per line for jsonl, headed sections for md)"
+        ),
+    )
+    sessions_export.add_argument(
+        "--session-id", help="Session ID or unique prefix to export"
+    )
+    _add_session_filter_args(
+        sessions_export,
+        "Only export sessions older than AGE (duration like '5h'/'2d', "
+        "bare number of days, or an ISO timestamp)",
+    )
+    sessions_export.add_argument(
+        "--redact",
+        action="store_true",
+        help="Redact secrets (API keys, tokens, credentials) from exported content",
+    )
+    sessions_export.add_argument(
+        "--lineage",
+        choices=["single", "logical"],
+        default="single",
+        help="md/qmd only: export one row or its compression lineage",
+    )
+    sessions_export.add_argument(
+        "--delete-after-verified",
+        action="store_true",
+        help="md/qmd only: after verified single-session export, delete that session (needs --yes)",
+    )
+    sessions_export.add_argument(
+        "--force",
+        action="store_true",
+        help="md/qmd only: overwrite an existing export file",
+    )
 
     sessions_delete = sessions_subparsers.add_parser(
         "delete", help="Delete a specific session"
@@ -13161,16 +13845,30 @@ def main():
         "--yes", "-y", action="store_true", help="Skip confirmation"
     )
 
-    sessions_prune = sessions_subparsers.add_parser("prune", help="Delete old sessions")
-    sessions_prune.add_argument(
-        "--older-than",
-        type=int,
-        default=90,
-        help="Delete sessions older than N days (default: 90)",
+    sessions_prune = sessions_subparsers.add_parser(
+        "prune",
+        help="Delete old sessions (filterable by time window, source, title, ...)",
     )
-    sessions_prune.add_argument("--source", help="Only prune sessions from this source")
+    _add_session_filter_args(
+        sessions_prune,
+        "Delete sessions older than AGE — days if bare number, or a duration "
+        "like '5h'/'2d'/'1w', or an ISO timestamp (bare prune with no filters "
+        "defaults to 90 days; any filter matches all ages)",
+    )
     sessions_prune.add_argument(
-        "--yes", "-y", action="store_true", help="Skip confirmation"
+        "--include-archived",
+        action="store_true",
+        help="Also delete archived sessions (excluded by default)",
+    )
+
+    sessions_archive = sessions_subparsers.add_parser(
+        "archive",
+        help="Bulk-archive (soft-hide) sessions matching filters — no deletion",
+    )
+    _add_session_filter_args(
+        sessions_archive,
+        "Only archive sessions older than AGE (duration like '5h'/'2d', "
+        "bare number of days, or ISO timestamp)",
     )
 
     sessions_subparsers.add_parser(
@@ -13317,34 +14015,411 @@ def main():
                     print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
 
         elif action == "export":
+            from hermes_cli.session_filters import (
+                build_prune_filters,
+                describe_filters,
+            )
+
+            _filter_arg_names = (
+                "older_than", "newer_than", "before", "after",
+                "source", "title", "end_reason", "cwd",
+                "min_messages", "max_messages", "model", "provider",
+                "user", "chat_id", "chat_type", "branch",
+                "min_tokens", "max_tokens", "min_cost", "max_cost",
+                "min_tool_calls", "max_tool_calls",
+            )
+            _any_filters = any(
+                getattr(args, a, None) is not None for a in _filter_arg_names
+            )
+            filters = None
+            if _any_filters:
+                try:
+                    filters = build_prune_filters(args)
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    return
+                # Unlike prune/archive, export includes archived sessions.
+                filters["archived"] = None
+
+            def _redact(data):
+                if not args.redact or data is None:
+                    return data
+                from hermes_cli.session_export_md import redact_session_data
+
+                return redact_session_data(data)
+
+            def _collect_sessions():
+                """Resolve --session-id / filters / bare export into a list
+                of redacted session dicts, or None after printing an error."""
+                if args.session_id:
+                    resolved = db.resolve_session_id(args.session_id)
+                    data = _redact(db.export_session(resolved)) if resolved else None
+                    if not data:
+                        print(f"Session '{args.session_id}' not found.")
+                        return None
+                    return [data]
+                if filters:
+                    candidates = db.list_prune_candidates(**filters)
+                    if args.dry_run:
+                        print(
+                            f"Would export {len(candidates)} session(s) "
+                            f"({describe_filters(filters)})."
+                        )
+                        for row in candidates[:100]:
+                            print(f"  {row.get('id')}  {row.get('source', '')}")
+                        if len(candidates) > 100:
+                            print(f"  ... {len(candidates) - 100} more")
+                        return None
+                    return [
+                        s
+                        for s in (
+                            _redact(db.export_session(row["id"])) for row in candidates
+                        )
+                        if s
+                    ]
+                if args.dry_run:
+                    print("--dry-run requires at least one filter.")
+                    return None
+                return [_redact(s) for s in db.export_all(source=None)]
+
+            # Prompt-only export (--only user-prompts): one prompt record per
+            # line (jsonl) or headed sections (md). Delegates rendering to
+            # hermes_cli.session_export.
+            if getattr(args, "only", None):
+                if args.format not in ("jsonl", "md"):
+                    print("--only user-prompts supports --format jsonl or md.")
+                    return
+                from hermes_cli.session_export import (
+                    export_record_count,
+                    render_sessions_export,
+                )
+
+                sessions = _collect_sessions()
+                if sessions is None:
+                    db.close()
+                    return
+                rendered = render_sessions_export(
+                    sessions,
+                    fmt="markdown" if args.format == "md" else "jsonl",
+                    only=args.only,
+                )
+                if not args.output or args.output == "-":
+                    sys.stdout.write(rendered)
+                    db.close()
+                    return
+                with open(args.output, "w", encoding="utf-8") as f:
+                    f.write(rendered)
+                count, noun = export_record_count(sessions, only=args.only)
+                suffix = "" if count == 1 else "s"
+                print(f"Exported {count} {noun}{suffix} to {args.output}")
+                db.close()
+                return
+
+            # Standalone HTML export: one self-contained file (single session
+            # or multi-session with sidebar navigation).
+            if args.format == "html":
+                if not args.output or args.output == "-":
+                    print("HTML export requires an output file path.")
+                    return
+                from hermes_cli.session_export_html import (
+                    generate_html_export,
+                    generate_multi_session_html_export,
+                )
+
+                sessions = _collect_sessions()
+                if sessions is None:
+                    db.close()
+                    return
+                if len(sessions) == 1:
+                    content = generate_html_export(sessions[0])
+                else:
+                    content = generate_multi_session_html_export(sessions)
+                with open(args.output, "w", encoding="utf-8") as f:
+                    f.write(content)
+                suffix = "" if len(sessions) == 1 else "s"
+                print(f"Exported {len(sessions)} session{suffix} to {args.output} (HTML)")
+                db.close()
+                return
+
+            # Claude Code JSONL trace export — local file or HF upload.
+            # Redaction is ON by default for traces (they leave the machine
+            # when --upload is used); --no-redact opts out after review.
+            if args.format == "trace":
+                if getattr(args, "only", None):
+                    print("--only user-prompts supports --format jsonl or md.")
+                    db.close()
+                    return
+                session_id = args.session_id
+                if not session_id and not filters:
+                    # Match the shell's common intent: "the last thing I did".
+                    rows = db.list_sessions_rich(limit=1, order_by_last_active=True)
+                    session_id = rows[0].get("id") if rows else None
+                    if not session_id:
+                        print("No session found to export. Pass --session-id.")
+                        db.close()
+                        return
+                if session_id and not db.resolve_session_id(session_id):
+                    print(f"Session '{session_id}' not found.")
+                    db.close()
+                    return
+
+                from agent.trace_upload import (
+                    TraceRedactionError,
+                    build_trace_jsonl,
+                    upload_session_trace,
+                )
+
+                redact_trace = not getattr(args, "no_redact", False)
+
+                if getattr(args, "upload", False):
+                    if not session_id:
+                        print("--upload exports one session: pass --session-id (or drop filters to use the most recent).")
+                        db.close()
+                        return
+                    resolved = db.resolve_session_id(session_id)
+                    db.close()
+                    status = upload_session_trace(
+                        resolved,
+                        cwd="",
+                        redact=redact_trace,
+                        private=not getattr(args, "public", False),
+                    )
+                    print(status)
+                    return
+
+                # Local trace file(s)
+                def _trace_ids():
+                    if session_id:
+                        return [db.resolve_session_id(session_id)]
+                    candidates = db.list_prune_candidates(**filters)
+                    if args.dry_run:
+                        print(
+                            f"Would export {len(candidates)} session(s) "
+                            f"({describe_filters(filters)})."
+                        )
+                        for row in candidates[:100]:
+                            print(f"  {row.get('id')}  {row.get('source', '')}")
+                        if len(candidates) > 100:
+                            print(f"  ... {len(candidates) - 100} more")
+                        return None
+                    return [row["id"] for row in candidates]
+
+                ids = _trace_ids()
+                if ids is None:
+                    db.close()
+                    return
+
+                def _render_trace(sid):
+                    meta = db.get_session(sid) or {}
+                    messages = db.get_messages_as_conversation(sid)
+                    if not messages:
+                        return None
+                    return build_trace_jsonl(
+                        messages,
+                        session_id=sid,
+                        model=meta.get("model") or "",
+                        cwd="",
+                        redact=redact_trace,
+                    )
+
+                try:
+                    if len(ids) == 1:
+                        jsonl = _render_trace(ids[0])
+                        if not jsonl:
+                            print(f"No transcript to export for session '{ids[0]}'.")
+                            db.close()
+                            return
+                        if not args.output or args.output == "-":
+                            sys.stdout.write(jsonl)
+                        else:
+                            with open(args.output, "w", encoding="utf-8") as f:
+                                f.write(jsonl)
+                            print(f"Exported 1 session trace to {args.output}")
+                    else:
+                        out_dir = (
+                            Path(args.output).expanduser()
+                            if args.output and args.output != "-"
+                            else get_hermes_home() / "session-exports"
+                        )
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        exported = 0
+                        for sid in ids:
+                            jsonl = _render_trace(sid)
+                            if not jsonl:
+                                continue
+                            (out_dir / f"{sid}.trace.jsonl").write_text(
+                                jsonl, encoding="utf-8"
+                            )
+                            exported += 1
+                        print(f"Exported {exported} session trace(s) to {out_dir}")
+                except TraceRedactionError:
+                    print("Redaction failed; refusing to export unredacted trace content.")
+                db.close()
+                return
+
+            if args.format == "jsonl":
+                if not args.output:
+                    print("JSONL export requires an output path (use - for stdout).")
+                    return
+                if args.session_id:
+                    resolved_session_id = db.resolve_session_id(args.session_id)
+                    if not resolved_session_id:
+                        print(f"Session '{args.session_id}' not found.")
+                        return
+                    data = _redact(db.export_session(resolved_session_id))
+                    if not data:
+                        print(f"Session '{args.session_id}' not found.")
+                        return
+                    line = _json.dumps(data, ensure_ascii=False) + "\n"
+                    if args.output == "-":
+
+                        sys.stdout.write(line)
+                    else:
+                        with open(args.output, "w", encoding="utf-8") as f:
+                            f.write(line)
+                        print(f"Exported 1 session to {args.output}")
+                else:
+                    if filters:
+                        candidates = db.list_prune_candidates(**filters)
+                        if args.dry_run:
+                            print(
+                                f"Would export {len(candidates)} session(s) "
+                                f"({describe_filters(filters)})."
+                            )
+                            for row in candidates[:100]:
+                                print(f"  {row.get('id')}  {row.get('source', '')}")
+                            if len(candidates) > 100:
+                                print(f"  ... {len(candidates) - 100} more")
+                            return
+                        sessions = [
+                            s
+                            for s in (
+                                db.export_session(row["id"]) for row in candidates
+                            )
+                            if s
+                        ]
+                    else:
+                        if args.dry_run:
+                            print("--dry-run requires at least one filter.")
+                            return
+                        sessions = db.export_all(source=None)
+                    if args.output == "-":
+
+                        for s in sessions:
+                            sys.stdout.write(
+                                _json.dumps(_redact(s), ensure_ascii=False) + "\n"
+                            )
+                    else:
+                        with open(args.output, "w", encoding="utf-8") as f:
+                            for s in sessions:
+                                f.write(
+                                    _json.dumps(_redact(s), ensure_ascii=False) + "\n"
+                                )
+                        print(f"Exported {len(sessions)} sessions to {args.output}")
+                return
+
+            # Markdown / QMD export
+            from hermes_cli.session_export_md import (
+                append_manifest_entry,
+                verify_export_file,
+                write_session_markdown,
+            )
+
+            if args.output == "-":
+                print("Markdown/QMD export writes files; stdout (-) is only supported with --format jsonl.")
+                db.close()
+                return
+            output_dir = Path(args.output).expanduser() if args.output else get_hermes_home() / "session-exports"
+
+            def _export_one(session_id: str):
+                data = (
+                    db.export_session_lineage(session_id)
+                    if getattr(args, "lineage", "single") == "logical"
+                    else db.export_session(session_id)
+                )
+                if not data:
+                    return None, None
+                data = _redact(data)
+                path = write_session_markdown(
+                    data,
+                    output_dir,
+                    fmt=args.format,
+                    force=args.force,
+                )
+                append_manifest_entry(output_dir, data, path, fmt=args.format)
+                return data, path
+
+            if args.delete_after_verified and not args.yes:
+                print("--delete-after-verified requires --yes.")
+                db.close()
+                return
+            if args.delete_after_verified and not args.session_id:
+                print("--delete-after-verified is only supported with --session-id.")
+                db.close()
+                return
+
             if args.session_id:
                 resolved_session_id = db.resolve_session_id(args.session_id)
                 if not resolved_session_id:
                     print(f"Session '{args.session_id}' not found.")
+                    db.close()
                     return
-                data = db.export_session(resolved_session_id)
-                if not data:
+                try:
+                    data, exported_path = _export_one(resolved_session_id)
+                except FileExistsError as e:
+                    print(f"Export already exists: {e}. Pass --force to overwrite.")
+                    db.close()
+                    return
+                if not data or not exported_path:
                     print(f"Session '{args.session_id}' not found.")
+                    db.close()
                     return
-                line = _json.dumps(data, ensure_ascii=False) + "\n"
-                if args.output == "-":
+                message_count = len(data.get("messages") or [])
+                suffix = "" if message_count == 1 else "s"
+                print(f"Exported 1 session ({message_count} message{suffix}) to {exported_path}")
+                if args.delete_after_verified:
+                    ok, reason = verify_export_file(exported_path, data)
+                    if not ok:
+                        print(f"Export verification failed; not deleting: {reason}")
+                        db.close()
+                        return
+                    sessions_dir = get_hermes_home() / "sessions"
+                    if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+                        print(f"Deleted exported session '{resolved_session_id}'.")
+                    else:
+                        print(f"Exported, but session '{resolved_session_id}' was not deleted because it was not found.")
+                db.close()
+                return
 
-                    sys.stdout.write(line)
-                else:
-                    with open(args.output, "w", encoding="utf-8") as f:
-                        f.write(line)
-                    print(f"Exported 1 session to {args.output}")
-            else:
-                sessions = db.export_all(source=args.source)
-                if args.output == "-":
-
-                    for s in sessions:
-                        sys.stdout.write(_json.dumps(s, ensure_ascii=False) + "\n")
-                else:
-                    with open(args.output, "w", encoding="utf-8") as f:
-                        for s in sessions:
-                            f.write(_json.dumps(s, ensure_ascii=False) + "\n")
-                    print(f"Exported {len(sessions)} sessions to {args.output}")
+            if not filters:
+                print(
+                    "Refusing bulk export without a filter. Pass --session-id or "
+                    "at least one filter (e.g. --older-than 90, --source telegram)."
+                )
+                db.close()
+                return
+            candidates = db.list_prune_candidates(**filters)
+            if args.dry_run:
+                print(
+                    f"Would export {len(candidates)} session(s) "
+                    f"({describe_filters(filters)})."
+                )
+                for row in candidates[:100]:
+                    print(f"  {row.get('id')}  {row.get('source', '')}")
+                if len(candidates) > 100:
+                    print(f"  ... {len(candidates) - 100} more")
+                db.close()
+                return
+            exported = 0
+            for row in candidates:
+                try:
+                    data, exported_path = _export_one(row["id"])
+                except FileExistsError as e:
+                    print(f"Skipping existing export: {e}. Pass --force to overwrite.")
+                    continue
+                if data and exported_path:
+                    exported += 1
+            print(f"Exported {exported} session(s) to {output_dir}")
 
         elif action == "delete":
             resolved_session_id = db.resolve_session_id(args.session_id)
@@ -13363,20 +14438,114 @@ def main():
             else:
                 print(f"Session '{args.session_id}' not found.")
 
-        elif action == "prune":
-            days = args.older_than
-            source_msg = f" from '{args.source}'" if args.source else ""
+        elif action in ("prune", "archive"):
+            from hermes_cli.session_filters import (
+                build_prune_filters,
+                describe_filters,
+                format_epoch,
+            )
+
+            # Preserve the historical default ONLY for a truly bare
+            # `hermes sessions prune`: no time window and no filters at all
+            # means "older than 90 days". ANY filter — including --source —
+            # suppresses the implicit cutoff, so `prune --source cron`
+            # matches ALL cron sessions regardless of age. The preview +
+            # confirmation below (count, oldest/newest) is the safety net.
+            _non_time_filters = any(
+                getattr(args, a, None) is not None
+                for a in (
+                    "source", "title", "end_reason", "cwd",
+                    "min_messages", "max_messages", "model", "provider",
+                    "user", "chat_id", "chat_type", "branch",
+                    "min_tokens", "max_tokens", "min_cost", "max_cost",
+                    "min_tool_calls", "max_tool_calls",
+                )
+            )
+            if (
+                action == "prune"
+                and args.older_than is None
+                and args.newer_than is None
+                and args.before is None
+                and args.after is None
+                and not _non_time_filters
+            ):
+                args.older_than = "90"
+
+            try:
+                filters = build_prune_filters(args)
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
+
+            if action == "archive" and not any(
+                v for k, v in filters.items() if k != "older_than_days"
+            ):
+                print(
+                    "Refusing to archive every ended session: pass at least one "
+                    "filter (e.g. --newer-than 5h, --source cli, --title codex)."
+                )
+                return
+
+            # Prune skips archived sessions unless --include-archived;
+            # archive only targets not-yet-archived rows (idempotent).
+            if action == "prune":
+                filters["archived"] = (
+                    None if getattr(args, "include_archived", False) else False
+                )
+            else:
+                filters["archived"] = False
+
+            candidates = db.list_prune_candidates(**filters)
+            verb = "Delete" if action == "prune" else "Archive"
+            if not candidates:
+                print(f"No sessions match ({describe_filters(filters)}).")
+                return
+
+            # Candidates are ordered oldest-first — surface the age span so
+            # the confirmation makes the blast radius obvious.
+            _oldest = candidates[0].get("started_at")
+            _newest = candidates[-1].get("started_at")
+            _span = (
+                f"oldest {format_epoch(_oldest)}, newest {format_epoch(_newest)}"
+            )
+
+            if args.dry_run or not args.yes:
+                shown = candidates if args.dry_run else candidates[:15]
+                print(
+                    f"{len(candidates)} session(s) match "
+                    f"({describe_filters(filters)}; {_span}):"
+                )
+                for s in shown:
+                    title = (s.get("title") or "")[:36]
+                    model = (s.get("model") or "-").split("/")[-1][:24]
+                    print(
+                        f"  {s['id']}  {format_epoch(s['started_at']):<17} "
+                        f"{s['source']:<10} {model:<24} "
+                        f"{s['message_count']:>4} msgs  {title}"
+                    )
+                if len(candidates) > len(shown):
+                    print(f"  … and {len(candidates) - len(shown)} more")
+                if args.dry_run:
+                    print(f"Dry run — nothing {'deleted' if action == 'prune' else 'archived'}.")
+                    return
+
             if not args.yes:
                 if not _confirm_prompt(
-                    f"Delete all ended sessions older than {days} days{source_msg}? [y/N] "
+                    f"{verb} these {len(candidates)} session(s) ({_span})? [y/N] "
                 ):
                     print("Cancelled.")
                     return
-            sessions_dir = get_hermes_home() / "sessions"
-            count = db.prune_sessions(
-                older_than_days=days, source=args.source, sessions_dir=sessions_dir
-            )
-            print(f"Pruned {count} session(s).")
+
+            if action == "prune":
+                sessions_dir = get_hermes_home() / "sessions"
+                count = db.prune_sessions(sessions_dir=sessions_dir, **filters)
+                print(f"Pruned {count} session(s).")
+            else:
+                count = db.archive_sessions(**filters)
+                print(
+                    f"Archived {count} session(s). They're hidden from listings "
+                    "but fully recoverable (nothing was deleted)."
+                )
 
         elif action == "rename":
             resolved_session_id = db.resolve_session_id(args.session_id)
@@ -13572,7 +14741,7 @@ def main():
     _processed_argv = _coalesce_session_name_args(sys.argv[1:])
 
     # ── Defensive subparser routing (bpo-9338 workaround) ───────────
-    # On some Python versions (notably <3.11), argparse fails to route
+    # On some Python versions (notably <3.14), argparse fails to route
     # subcommand tokens when the parent parser has nargs='?' optional
     # arguments (--continue).  The symptom: "unrecognized arguments: model"
     # even though 'model' is a registered subcommand.
@@ -13617,6 +14786,15 @@ def main():
         cmd_version(args)
         return
 
+    # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
+    # _prepare_agent_startup() below triggers discover_plugins() → tool
+    # imports, and tools.approval freezes _YOLO_MODE_FROZEN at module
+    # import time (PR #7994, security hardening against prompt-injection).
+    # If the env var is set only later (e.g. inside cmd_chat), the frozen
+    # value is already False and --yolo silently does nothing.
+    if getattr(args, "yolo", False):
+        os.environ["HERMES_YOLO_MODE"] = "1"
+
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated
     # so introspection/management commands (hermes hooks list, cron
@@ -13635,6 +14813,7 @@ def main():
                 model=getattr(args, "model", None),
                 provider=getattr(args, "provider", None),
                 toolsets=getattr(args, "toolsets", None),
+                usage_file=getattr(args, "usage_file", None),
             )
         )
 

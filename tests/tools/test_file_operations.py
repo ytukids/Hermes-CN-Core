@@ -1,11 +1,64 @@
 """Tests for tools/file_operations.py — deny list, result dataclasses, helpers."""
 
 import os
-import re
+from agent.re_compat import re
 import pytest
+import ripgrepy
 import subprocess
+import tools.file_operations
 from pathlib import Path
 from unittest.mock import MagicMock
+
+
+class FakeRipgrepy:
+    """Drop-in replacement for ripgrepy.Ripgrepy that skips binary probing."""
+
+    def __init__(self, regex_pattern, path, rg_path="rg"):
+        self.regex_pattern = regex_pattern
+        self.path = path
+        self.command = [rg_path or "rg"]
+
+    def files(self):
+        self.command.append("--files")
+        return self
+
+    def glob(self, pattern):
+        self.command.extend(["--glob", pattern])
+        return self
+
+    def sortr(self, value):
+        self.command.append(f"--sortr={value}")
+        return self
+
+    def line_number(self):
+        self.command.append("--line-number")
+        return self
+
+    def no_heading(self):
+        self.command.append("--no-heading")
+        return self
+
+    def with_filename(self):
+        self.command.append("--with-filename")
+        return self
+
+    def context(self, n):
+        self.command.extend(["--context", str(n)])
+        return self
+
+    def files_with_matches(self):
+        self.command.append("--files-with-matches")
+        return self
+
+    def count_matches(self):
+        self.command.append("--count-matches")
+        return self
+
+
+@pytest.fixture
+def fake_ripgrepy(monkeypatch):
+    monkeypatch.setattr(ripgrepy, "Ripgrepy", FakeRipgrepy)
+
 
 from tools.file_operations import (
     _is_write_denied,
@@ -15,6 +68,7 @@ from tools.file_operations import (
     SearchResult,
     SearchMatch,
     LintResult,
+    ExecuteResult,
     ShellFileOperations,
     MAX_LINE_LENGTH,
     normalize_read_pagination,
@@ -325,7 +379,7 @@ class TestSearchResultDensify:
     def test_densify_is_lossless(self):
         # Every path, line number, and content byte must be recoverable from
         # the dense form.
-        import re
+        from agent.re_compat import re
         matches = [
             SearchMatch(path="src/x.py", line_number=12, content="    def foo():"),
             SearchMatch(path="src/x.py", line_number=45, content="        return bar"),
@@ -353,11 +407,11 @@ class TestSearchResultDensify:
             assert rec[2] == orig.content
 
     def test_densify_smaller_than_verbose(self):
-        import json
+        import orjson
         matches = self._matches(40, paths=["pkg/module_one.py", "pkg/module_two.py"])
         r = SearchResult(matches=matches, total_count=40)
-        verbose = json.dumps(r.to_dict(densify=False), ensure_ascii=False)
-        dense = json.dumps(r.to_dict(densify=True), ensure_ascii=False)
+        verbose = orjson.dumps(r.to_dict(densify=False)).decode('utf-8')
+        dense = orjson.dumps(r.to_dict(densify=True)).decode('utf-8')
         assert len(dense) < len(verbose)
 
     @pytest.mark.parametrize("content", [
@@ -466,6 +520,61 @@ class TestShellFileOpsHelpers:
         assert "'" in result
         # Should be safely escaped
         assert result.count("'") >= 4  # wrapping + escaping
+
+    def test_escape_shell_arg_rewrites_windows_drive_paths_to_msys(self, monkeypatch, file_ops):
+        # bash eats backslashes and MSYS mangles ``C:\...``; the Git Bash
+        # ``/c/...`` form is the reliable one (reuses _windows_to_msys_path).
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_shell_arg(r"C:\Users\alice\notes.txt") == "'/c/Users/alice/notes.txt'"
+        # Non-drive paths are untouched.
+        assert file_ops._escape_shell_arg("/tmp/foo") == "'/tmp/foo'"
+
+    def test_escape_shell_arg_normalizes_mixed_msys_paths(self, monkeypatch, file_ops):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        mixed = r"/c/Users/Alexander\Documents\NewTEST\readme.txt"
+        assert file_ops._escape_shell_arg(mixed) == (
+            "'/c/Users/Alexander/Documents/NewTEST/readme.txt'"
+        )
+
+    def test_escape_shell_arg_rewrites_forward_slash_native_paths(self, monkeypatch, file_ops):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_shell_arg(
+            "C:/Users/alice/notes.txt"
+        ) == "'/c/Users/alice/notes.txt'"
+
+    def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("wc -c"):
+                return {"output": "5\n", "returncode": 0}
+            if command.startswith("head -c"):
+                return {"output": "hello", "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": "hello\n", "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "1\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file(r"C:\Users\alice\notes.txt")
+
+        assert result.error is None
+        assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[2] == "sed -n '1,500p' '/c/Users/alice/notes.txt'"
+        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
@@ -643,27 +752,19 @@ class TestSearchPathValidation:
 
 
 class TestSearchFilesFallbackHiddenPaths:
-    def _make_env(self):
-        env = MagicMock()
-        env.cwd = "/"
-
-        def execute(command, **kwargs):
-            completed = subprocess.run(
-                command,
-                shell=True,
-                text=True,
-                capture_output=True,
-            )
-            return {
-                "output": completed.stdout,
-                "returncode": completed.returncode,
-            }
-
-        env.execute = execute
-        return env
+    def _make_env(self, monkeypatch):
+        # Use the real local backend so the portable Python fallback is
+        # exercised; this keeps the tests runnable on Windows where the POSIX
+        # ``find`` command does not exist. Force rg off so we hit the Python
+        # walk rather than the rg path (rg includes hidden descendants when
+        # the root path itself is hidden, which differs from the find/Python
+        # semantics these tests assert).
+        monkeypatch.setattr(tools.file_operations.shutil, "which", lambda name: None)
+        from tools.environments.local import LocalEnvironment
+        return LocalEnvironment()
 
     def test_hidden_root_with_hidden_ancestor_includes_files(self, tmp_path, monkeypatch):
-        """Fallback find should include visible files when path is inside hidden root."""
+        """Fallback search should include visible files when path is inside hidden root."""
         root = tmp_path / ".hermes" / "logs"
         root.mkdir(parents=True)
         visible_file = root / "agent.log"
@@ -675,15 +776,14 @@ class TestSearchFilesFallbackHiddenPaths:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("x")
 
-        ops = ShellFileOperations(self._make_env())
-        monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
+        ops = ShellFileOperations(self._make_env(monkeypatch))
         result = ops._search_files("*.log", str(root), limit=50, offset=0)
 
         assert result.error is None
         assert set(result.files) == {str(visible_file), str(visible_nested_file)}
 
     def test_normal_root_still_excludes_hidden_descendants(self, tmp_path, monkeypatch):
-        """Fallback find should still exclude hidden descendant paths for normal roots."""
+        """Fallback search should still exclude hidden descendant paths for normal roots."""
         root = tmp_path / "repo"
         root.mkdir()
         visible_file = root / "agent.log"
@@ -694,12 +794,45 @@ class TestSearchFilesFallbackHiddenPaths:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("x")
 
-        ops = ShellFileOperations(self._make_env())
-        monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
+        ops = ShellFileOperations(self._make_env(monkeypatch))
         result = ops._search_files("*.log", str(root), limit=50, offset=0)
 
         assert result.error is None
         assert set(result.files) == {str(visible_file), str(visible_nested_file)}
+
+
+class TestShellFileOpsWriteVerification:
+    def test_write_file_verification_catches_mismatch(self, file_ops, monkeypatch):
+        """If _atomic_write claims success but the on-disk size differs,
+        write_file returns an error instead of silent success."""
+        monkeypatch.setattr(
+            file_ops, "_atomic_write",
+            lambda path, content: ExecuteResult(stdout="5", exit_code=0)
+        )
+        monkeypatch.setattr(
+            file_ops, "_prim_stat_size",
+            lambda path: ExecuteResult(stdout="99", exit_code=0)
+        )
+        result = file_ops.write_file("/tmp/test.txt", "hello")
+        assert result.error is not None
+        assert "verification failed" in result.error.lower()
+        assert "did not persist" in result.error.lower()
+        assert result.bytes_written == 0
+
+    def test_write_file_verification_catches_unstatable(self, file_ops, monkeypatch):
+        """If the post-write stat itself fails, write_file returns an error."""
+        monkeypatch.setattr(
+            file_ops, "_atomic_write",
+            lambda path, content: ExecuteResult(stdout="5", exit_code=0)
+        )
+        monkeypatch.setattr(
+            file_ops, "_prim_stat_size",
+            lambda path: ExecuteResult(stdout="", exit_code=1)
+        )
+        result = file_ops.write_file("/tmp/test.txt", "hello")
+        assert result.error is not None
+        assert "could not stat" in result.error.lower()
+        assert result.bytes_written == 0
 
 
 class TestShellFileOpsWriteDenied:
@@ -1025,8 +1158,11 @@ class TestIsLocalEnv:
 # =========================================================================
 
 
+@pytest.mark.usefixtures("fake_ripgrepy")
 class TestSearchFilesRgRipgrepy:
     """Tests for _search_files_rg_ripgrepy on local backends."""
+
+    _RG_PATH = "/usr/bin/rg"
 
     @staticmethod
     def _make_local_ops():
@@ -1049,7 +1185,7 @@ class TestSearchFilesRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_files_rg_ripgrepy("foo.py", str(tmp_path), 50, 0)
+        result = ops._search_files_rg_ripgrepy("foo.py", str(tmp_path), 50, 0, self._RG_PATH)
 
         assert result.error is None
         assert "--glob" in captured_cmds[0]
@@ -1067,7 +1203,7 @@ class TestSearchFilesRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        ops._search_files_rg_ripgrepy("src/foo.py", str(tmp_path), 50, 0)
+        ops._search_files_rg_ripgrepy("src/foo.py", str(tmp_path), 50, 0, self._RG_PATH)
 
         assert "--glob" in captured_cmds[0]
         assert "src/foo.py" in captured_cmds[0]
@@ -1084,9 +1220,9 @@ class TestSearchFilesRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        ops._search_files_rg_ripgrepy("test.py", str(tmp_path), 50, 0)
+        ops._search_files_rg_ripgrepy("test.py", str(tmp_path), 50, 0, self._RG_PATH)
 
-        assert "--sortr" in captured_cmds[0]
+        assert any("--sortr" in arg for arg in captured_cmds[0])
 
     def test_fallbacks_to_shell_on_error(self, tmp_path, monkeypatch):
         """On subprocess error, falls back to _search_files_rg_shell."""
@@ -1101,7 +1237,7 @@ class TestSearchFilesRgRipgrepy:
         monkeypatch.setattr(ops, "_search_files_rg_shell",
                            lambda p, pa, l, o: SearchResult(files=["fallback.py"], total_count=1))
 
-        result = ops._search_files_rg_ripgrepy("test.py", str(tmp_path), 50, 0)
+        result = ops._search_files_rg_ripgrepy("test.py", str(tmp_path), 50, 0, self._RG_PATH)
         assert result.files == ["fallback.py"]
 
     def test_results_sliced_with_offset_and_limit(self, tmp_path, monkeypatch):
@@ -1114,7 +1250,7 @@ class TestSearchFilesRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_files_rg_ripgrepy("file_*.py", str(tmp_path), 3, 2)
+        result = ops._search_files_rg_ripgrepy("file_*.py", str(tmp_path), 3, 2, self._RG_PATH)
         assert result.files == ["file_2.py", "file_3.py", "file_4.py"]
         assert result.total_count == 10
         assert result.truncated is True
@@ -1125,8 +1261,11 @@ class TestSearchFilesRgRipgrepy:
 # =========================================================================
 
 
+@pytest.mark.usefixtures("fake_ripgrepy")
 class TestSearchWithRgRipgrepy:
     """Tests for _search_with_rg_ripgrepy on local backends."""
+
+    _RG_PATH = "/usr/bin/rg"
 
     @staticmethod
     def _make_local_ops():
@@ -1148,7 +1287,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_with_rg_ripgrepy("hello", str(tmp_path), None, 50, 0, "content", 0)
+        result = ops._search_with_rg_ripgrepy("hello", str(tmp_path), None, 50, 0, "content", 0, self._RG_PATH)
 
         assert result.error is None
         assert len(result.matches) == 1
@@ -1169,7 +1308,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "files_only", 0)
+        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "files_only", 0, self._RG_PATH)
 
         assert "--files-with-matches" in captured_cmds[0]
         assert result.files == ["src/a.py", "src/b.py"]
@@ -1185,7 +1324,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "count", 0)
+        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "count", 0, self._RG_PATH)
 
         assert "--count-matches" in captured_cmds[0]
         assert result.counts == {"src/a.py": 5}
@@ -1201,7 +1340,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        ops._search_with_rg_ripgrepy("pattern", str(tmp_path), "*.py", 50, 0, "content", 0)
+        ops._search_with_rg_ripgrepy("pattern", str(tmp_path), "*.py", 50, 0, "content", 0, self._RG_PATH)
 
         assert "--glob" in captured_cmds[0]
         assert "*.py" in captured_cmds[0]
@@ -1217,7 +1356,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "content", 3)
+        ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "content", 3, self._RG_PATH)
 
         assert "--context" in captured_cmds[0]
         assert "3" in captured_cmds[0]
@@ -1231,7 +1370,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "content", 0)
+        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "content", 0, self._RG_PATH)
 
         assert result.error is None
         assert len(result.matches) == 1
@@ -1246,7 +1385,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "content", 0)
+        result = ops._search_with_rg_ripgrepy("pattern", str(tmp_path), None, 50, 0, "content", 0, self._RG_PATH)
 
         assert result.error is not None
         assert "Search failed" in result.error
@@ -1260,7 +1399,7 @@ class TestSearchWithRgRipgrepy:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        result = ops._search_with_rg_ripgrepy("zxzxzx_nonexistent", str(tmp_path), None, 50, 0, "content", 0)
+        result = ops._search_with_rg_ripgrepy("zxzxzx_nonexistent", str(tmp_path), None, 50, 0, "content", 0, self._RG_PATH)
 
         assert result.error is None
         assert result.total_count == 0
@@ -1277,7 +1416,7 @@ class TestSearchWithRgRipgrepy:
                            lambda p, pa, fg, l, o, om, c: SearchResult(
                                files=["fallback.py"], total_count=1))
 
-        result = ops._search_with_rg_ripgrepy("test", str(tmp_path), None, 50, 0, "files_only", 0)
+        result = ops._search_with_rg_ripgrepy("test", str(tmp_path), None, 50, 0, "files_only", 0, self._RG_PATH)
         assert result.files == ["fallback.py"]
 
 
@@ -1304,7 +1443,7 @@ class TestRgDispatchToRipgrepy:
 
         called = {"ripgrepy": False, "shell": False}
         monkeypatch.setattr(ops, "_search_files_rg_ripgrepy",
-                           lambda p, pa, l, o: called.update({"ripgrepy": True}) or SearchResult())
+                           lambda p, pa, l, o, rp: called.update({"ripgrepy": True}) or SearchResult())
         monkeypatch.setattr(ops, "_search_files_rg_shell",
                            lambda p, pa, l, o: called.update({"shell": True}) or SearchResult())
 
@@ -1321,7 +1460,7 @@ class TestRgDispatchToRipgrepy:
 
         called = {"ripgrepy": False, "shell": False}
         monkeypatch.setattr(ops, "_search_files_rg_ripgrepy",
-                           lambda p, pa, l, o: called.update({"ripgrepy": True}) or SearchResult())
+                           lambda p, pa, l, o, rp: called.update({"ripgrepy": True}) or SearchResult())
         monkeypatch.setattr(ops, "_search_files_rg_shell",
                            lambda p, pa, l, o: called.update({"shell": True}) or SearchResult())
 
@@ -1336,7 +1475,7 @@ class TestRgDispatchToRipgrepy:
 
         called = {"ripgrepy": False, "shell": False}
         monkeypatch.setattr(ops, "_search_with_rg_ripgrepy",
-                           lambda p, pa, fg, l, o, om, c: called.update({"ripgrepy": True}) or SearchResult())
+                           lambda p, pa, fg, l, o, om, c, rp: called.update({"ripgrepy": True}) or SearchResult())
         monkeypatch.setattr(ops, "_search_with_rg_shell",
                            lambda p, pa, fg, l, o, om, c: called.update({"shell": True}) or SearchResult())
 
@@ -1353,7 +1492,7 @@ class TestRgDispatchToRipgrepy:
 
         called = {"ripgrepy": False, "shell": False}
         monkeypatch.setattr(ops, "_search_with_rg_ripgrepy",
-                           lambda p, pa, fg, l, o, om, c: called.update({"ripgrepy": True}) or SearchResult())
+                           lambda p, pa, fg, l, o, om, c, rp: called.update({"ripgrepy": True}) or SearchResult())
         monkeypatch.setattr(ops, "_search_with_rg_shell",
                            lambda p, pa, fg, l, o, om, c: called.update({"shell": True}) or SearchResult())
 

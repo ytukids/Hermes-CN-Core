@@ -8,7 +8,7 @@ because routing is the part most likely to break silently.
 from __future__ import annotations
 
 import asyncio
-import json
+import orjson
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -27,7 +27,7 @@ class _FakeResponse:
     def __init__(self, status: int = 200, payload: Optional[Dict[str, Any]] = None):
         self.status_code = status
         self._payload = payload or {}
-        self.text = json.dumps(self._payload)
+        self.text = orjson.dumps(self._payload).decode('utf-8')
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -122,7 +122,7 @@ class TestXAIPayload:
         provider, captured = xai_provider
         provider.generate("animate this", image_url="https://example.com/cat.png")
         payload = _last_post(captured)["json"]
-        assert payload["model"] == "grok-imagine-video-1.5-preview"
+        assert payload["model"] == "grok-imagine-video-1.5"
         assert payload["image"] == {"url": "https://example.com/cat.png"}
 
     def test_local_image_path_is_sent_as_data_uri(self, xai_provider, tmp_path):
@@ -133,7 +133,7 @@ class TestXAIPayload:
         provider.generate("animate this", image_url=str(image_path))
 
         payload = _last_post(captured)["json"]
-        assert payload["model"] == "grok-imagine-video-1.5-preview"
+        assert payload["model"] == "grok-imagine-video-1.5"
         assert payload["image"]["url"].startswith("data:image/png;base64,")
 
     def test_explicit_model_override_is_honored_for_image(self, xai_provider):

@@ -9,7 +9,7 @@ Pairing store: ~/.hermes/feishu_comment_pairing.json.
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
 import time
 from dataclasses import dataclass, field
@@ -91,10 +91,10 @@ class _MtimeCache:
 
         try:
             with open(self._path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                data = orjson.loads(f.read())
             if not isinstance(data, dict):
                 data = {}
-        except (json.JSONDecodeError, OSError):
+        except (orjson.JSONDecodeError, OSError):
             logger.warning("[Feishu-Rules] Failed to read %s, using empty config", self._path)
             data = {}
 
@@ -236,7 +236,7 @@ def _save_pairing(data: dict) -> None:
     PAIRING_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = PAIRING_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2).decode('utf-8'))
     tmp.replace(PAIRING_FILE)
     # Invalidate cache so next load picks up change
     _pairing_cache._mtime = 0.0
@@ -302,7 +302,7 @@ def _print_status() -> None:
     print(f"Pairing file: {PAIRING_FILE}")
     print(f"  exists: {PAIRING_FILE.exists()}")
     print()
-    print(f"Top-level:")
+    print("Top-level:")
     print(f"  enabled:    {cfg.enabled}")
     print(f"  policy:     {cfg.policy}")
     print(f"  allow_from: {sorted(cfg.allow_from) if cfg.allow_from else '[]'}")
@@ -339,7 +339,7 @@ def _do_check(doc_key: str, user_open_id: str) -> None:
     allowed = is_user_allowed(rule, user_open_id)
     print(f"Document:     {doc_key}")
     print(f"User:         {user_open_id}")
-    print(f"Resolved rule:")
+    print("Resolved rule:")
     print(f"  enabled:      {rule.enabled}")
     print(f"  policy:       {rule.policy}")
     print(f"  allow_from:   {sorted(rule.allow_from) if rule.allow_from else '[]'}")

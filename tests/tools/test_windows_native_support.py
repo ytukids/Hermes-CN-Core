@@ -50,6 +50,7 @@ class TestConfigureWindowsStdio:
         yield
         sys.modules.pop("hermes_cli.stdio", None)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test — no-op on Windows")
     def test_no_op_on_posix(self):
         from hermes_cli import stdio
 
@@ -285,6 +286,7 @@ class TestSigkillFallback:
         result = getattr(fake_signal, "SIGKILL", fake_signal.SIGTERM)
         assert result == 15
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL not available on Windows")
     def test_getattr_fallback_prefers_sigkill_when_present(self):
         """On POSIX the fallback is a no-op: real SIGKILL wins."""
         result = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -423,7 +425,7 @@ class TestTzdataDependencyDeclared:
         # not care about the exact pinned version (which is bumped over time)
         # — only that tzdata is declared with a win32 marker. This is an
         # invariant check, not a snapshot test.
-        import re
+        from agent.re_compat import re
         # Match `"tzdata` … `; sys_platform == 'win32'"` allowing any version
         # specifier in between (==X.Y.Z, >=X.Y.Z,<W, etc.) and either quote
         # style on the marker.

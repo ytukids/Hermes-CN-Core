@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import base64
-import json
+import pybase64 as base64
+import orjson
 import time
 
 from hermes_cli import auth
@@ -9,12 +9,12 @@ from hermes_cli import auth
 
 def _jwt_with_exp(exp: int) -> str:
     header = (
-        base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode())
+        base64.urlsafe_b64encode(orjson.dumps({"alg": "none"}))
         .decode()
         .rstrip("=")
     )
     payload = (
-        base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode())
+        base64.urlsafe_b64encode(orjson.dumps({"exp": exp}))
         .decode()
         .rstrip("=")
     )
@@ -41,3 +41,17 @@ def test_xai_oauth_token_not_expiring_beyond_one_hour_skew() -> None:
         token,
         auth.XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     )
+
+
+def test_xai_proactive_refresh_skew_short_lived_token() -> None:
+    token = _jwt_with_exp(int(time.time()) + 15 * 60)
+    skew = auth._xai_proactive_refresh_skew_seconds(token)
+
+    assert skew == 120
+    assert not auth._xai_access_token_is_expiring(token, skew)
+
+
+def test_xai_proactive_refresh_skew_long_lived_token() -> None:
+    token = _jwt_with_exp(int(time.time()) + 5 * 60 * 60)
+
+    assert auth._xai_proactive_refresh_skew_seconds(token) == auth.XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS

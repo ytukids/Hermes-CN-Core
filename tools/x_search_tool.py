@@ -42,7 +42,7 @@ reworked to honor both auth modes per Teknium's design.
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
 import time
 from datetime import date, datetime, timezone
@@ -56,9 +56,10 @@ from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
 logger = logging.getLogger(__name__)
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
+DEFAULT_X_SEARCH_MODEL = "grok-4.5"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 180
 DEFAULT_X_SEARCH_RETRIES = 2
+X_SEARCH_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 MAX_HANDLES = 10
 
 
@@ -78,6 +79,22 @@ def _load_x_search_config() -> Dict[str, Any]:
 def _get_x_search_model() -> str:
     cfg = _load_x_search_config()
     return (str(cfg.get("model") or "").strip() or DEFAULT_X_SEARCH_MODEL)
+
+
+def _get_x_search_reasoning_effort() -> Optional[str]:
+    cfg = _load_x_search_config()
+    raw_value = cfg.get("reasoning_effort")
+    if raw_value is None or not str(raw_value).strip():
+        return None
+
+    effort = str(raw_value).strip().lower()
+    if effort not in X_SEARCH_REASONING_EFFORTS:
+        allowed = ", ".join(X_SEARCH_REASONING_EFFORTS)
+        raise ValueError(
+            f"x_search.reasoning_effort must be one of: {allowed} "
+            f"(got {raw_value!r})"
+        )
+    return effort
 
 
 def _get_x_search_timeout_seconds() -> int:
@@ -299,6 +316,11 @@ def x_search_tool(
         except ValueError as exc:
             return tool_error(str(exc))
 
+        try:
+            reasoning_effort = _get_x_search_reasoning_effort()
+        except ValueError as exc:
+            return tool_error(str(exc))
+
         tool_def: Dict[str, Any] = {"type": "x_search"}
         if allowed:
             tool_def["allowed_x_handles"] = allowed
@@ -324,6 +346,8 @@ def x_search_tool(
             "tools": [tool_def],
             "store": False,
         }
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
 
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
@@ -398,8 +422,7 @@ def x_search_tool(
             else None
         )
 
-        return json.dumps(
-            {
+        return orjson.dumps({
                 "success": True,
                 "provider": "xai",
                 "credential_source": source,
@@ -411,45 +434,34 @@ def x_search_tool(
                 "inline_citations": inline_citations,
                 "degraded": degraded,
                 "degraded_reason": degraded_reason,
-            },
-            ensure_ascii=False,
-        )
+            }).decode('utf-8')
     except requests.HTTPError as e:
         logger.error("x_search failed: %s", e, exc_info=True)
-        return json.dumps(
-            {
+        return orjson.dumps({
                 "success": False,
                 "provider": "xai",
                 "tool": "x_search",
                 "error": _http_error_message(e),
                 "error_type": type(e).__name__,
-            },
-            ensure_ascii=False,
-        )
+            }).decode('utf-8')
     except requests.ReadTimeout as e:
         logger.error("x_search timed out: %s", e, exc_info=True)
-        return json.dumps(
-            {
+        return orjson.dumps({
                 "success": False,
                 "provider": "xai",
                 "tool": "x_search",
                 "error": f"xAI x_search timed out after {_get_x_search_timeout_seconds()} seconds",
                 "error_type": type(e).__name__,
-            },
-            ensure_ascii=False,
-        )
+            }).decode('utf-8')
     except Exception as e:
         logger.error("x_search failed: %s", e, exc_info=True)
-        return json.dumps(
-            {
+        return orjson.dumps({
                 "success": False,
                 "provider": "xai",
                 "tool": "x_search",
                 "error": str(e),
                 "error_type": type(e).__name__,
-            },
-            ensure_ascii=False,
-        )
+            }).decode('utf-8')
 
 
 X_SEARCH_SCHEMA = {

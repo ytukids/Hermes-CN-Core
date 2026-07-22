@@ -18,9 +18,9 @@ Configuration in config.yaml:
           bot_id: "your-bot-id"          # or WECOM_BOT_ID env var
           secret: "your-secret"          # or WECOM_SECRET env var
           websocket_url: "wss://openws.work.weixin.qq.com"
-          dm_policy: "open"              # open | allowlist | disabled | pairing
+          dm_policy: "pairing"           # open | allowlist | disabled | pairing
           allow_from: ["user_id_1"]
-          group_policy: "open"           # open | allowlist | disabled
+          group_policy: "pairing"        # open | allowlist | disabled | pairing
           group_allow_from: ["group_id_1"]
           groups:
             group_id_1:
@@ -30,13 +30,13 @@ Configuration in config.yaml:
 from __future__ import annotations
 
 import asyncio
-import base64
+import pybase64 as base64
 import hashlib
-import json
+import orjson
 import logging
 import mimetypes
 import os
-import re
+from agent.re_compat import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -161,7 +161,7 @@ class WeComAdapter(BasePlatformAdapter):
             or os.getenv("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
         ).strip() or DEFAULT_WS_URL
 
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "open")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "pairing")).strip().lower()
         # dm_policy already honors WECOM_DM_POLICY, so the allowlist must honor
         # WECOM_ALLOWED_USERS too. Without the env fallback an env-only setup
         # (dm_policy=allowlist via env, no config extra) runs with an empty
@@ -172,7 +172,7 @@ class WeComAdapter(BasePlatformAdapter):
             or os.getenv("WECOM_ALLOWED_USERS", "")
         )
 
-        self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
+        self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
 
@@ -480,7 +480,7 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _parse_json(raw: Any) -> Optional[Dict[str, Any]]:
         try:
-            payload = json.loads(raw)
+            payload = orjson.loads(raw)
         except Exception:
             logger.debug("Failed to parse WeCom payload: %r", raw)
             return None
@@ -514,7 +514,7 @@ class WeComAdapter(BasePlatformAdapter):
             if not self._is_group_allowed(chat_id, sender_id):
                 logger.debug("[%s] Group %s / sender %s blocked by policy", self.name, chat_id, sender_id)
                 return
-        elif not self._is_dm_allowed(sender_id):
+        elif not self._is_dm_intake_allowed(sender_id):
             logger.debug("[%s] DM sender %s blocked by policy", self.name, sender_id)
             return
 
@@ -578,6 +578,7 @@ class WeComAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=event.source.profile,
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -861,15 +862,38 @@ class WeComAdapter(BasePlatformAdapter):
         """WeCom gates DM/group access at intake via dm_policy/group_policy."""
         return True
 
+    def _open_dm_opted_in(self) -> bool:
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+            return True
+        return os.getenv("WECOM_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
             return _entry_matches(self._allow_from, sender_id)
-        return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
+
+    def _is_dm_intake_allowed(self, sender_id: str) -> bool:
+        principal = str(sender_id or "").strip()
+        if not principal:
+            return False
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return _entry_matches(self._allow_from, principal)
+        if self._dm_policy == "pairing":
+            return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
 
     def _is_group_allowed(self, chat_id: str, sender_id: str) -> bool:
         if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "pairing":
             return False
         if self._group_policy == "allowlist" and not _entry_matches(self._group_allow_from, chat_id):
             return False
@@ -1548,7 +1572,7 @@ def qr_scan_for_bot_info(
     try:
         req = urllib.request.Request(generate_url, headers={"User-Agent": "HermesAgent/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+            raw = orjson.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         logger.error("WeCom QR: failed to fetch QR code: %s", exc)
         print(f" failed: {exc}")
@@ -1598,7 +1622,7 @@ def qr_scan_for_bot_info(
         try:
             req = urllib.request.Request(query_url, headers={"User-Agent": "HermesAgent/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
+                result = orjson.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             logger.debug("WeCom QR poll error: %s", exc)
             time.sleep(_QR_POLL_INTERVAL)

@@ -10,9 +10,9 @@ Subscriptions persist to ~/.hermes/webhook_subscriptions.json and are
 hot-reloaded by the webhook adapter without a gateway restart.
 """
 
-import json
+import orjson
 import os
-import re
+from agent.re_compat import re
 import secrets
 import tempfile
 import time
@@ -42,7 +42,7 @@ def _load_subscriptions() -> Dict[str, dict]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = orjson.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -64,7 +64,7 @@ def _save_subscriptions(subs: Dict[str, dict]) -> None:
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(subs, fh, indent=2, ensure_ascii=False)
+            fh.write(orjson.dumps(subs, option=orjson.OPT_INDENT_2).decode('utf-8'))
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_path, _SUBSCRIPTIONS_FILE_MODE)
@@ -96,9 +96,11 @@ def _is_webhook_enabled() -> bool:
 
 def _get_webhook_base_url() -> str:
     wh = _get_webhook_config().get("extra", {})
-    host = wh.get("host", "0.0.0.0")
+    host = wh.get("host")
     port = wh.get("port", 8644)
-    display_host = "localhost" if host == "0.0.0.0" else host
+    display_host = "localhost" if not host or host in {"0.0.0.0", "::"} else host
+    if ":" in display_host and not display_host.startswith("["):
+        display_host = f"[{display_host}]"
     return f"http://{display_host}:{port}"
 
 
@@ -115,7 +117,6 @@ def _setup_hint() -> str:
        webhook:
          enabled: true
          extra:
-           host: "0.0.0.0"
            port: 8644
            secret: "your-global-hmac-secret"
 
@@ -189,6 +190,10 @@ def _cmd_subscribe(args):
             return
         route["deliver_only"] = True
 
+    script = getattr(args, "script", "") or ""
+    if script.strip():
+        route["script"] = script.strip()
+
     if args.deliver_chat_id:
         route["deliver_extra"] = {"chat_id": args.deliver_chat_id}
 
@@ -212,9 +217,11 @@ def _cmd_subscribe(args):
         prompt_preview = route["prompt"][:80] + ("..." if len(route["prompt"]) > 80 else "")
         label = "Message" if route.get("deliver_only") else "Prompt"
         print(f"  {label}: {prompt_preview}")
-    print(f"\n  Configure your service to POST to the URL above.")
-    print(f"  Use the secret for HMAC-SHA256 signature validation.")
-    print(f"  The gateway must be running to receive events (hermes gateway run).\n")
+    if route.get("script"):
+        print(f"  Script: {route['script']}")
+    print("\n  Configure your service to POST to the URL above.")
+    print("  Use the secret for HMAC-SHA256 signature validation.")
+    print("  The gateway must be running to receive events (hermes gateway run).\n")
 
 
 def _cmd_list(args):
@@ -238,6 +245,8 @@ def _cmd_list(args):
         print(f"    URL:     {base_url}/webhooks/{name}")
         print(f"    Events:  {events}")
         print(f"    Deliver: {deliver}")
+        if route.get("script"):
+            print(f"    Script:  {route['script']}")
         print()
 
 

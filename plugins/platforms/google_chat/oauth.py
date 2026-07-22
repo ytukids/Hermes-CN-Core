@@ -57,10 +57,10 @@ Token storage layout
 from __future__ import annotations
 
 import argparse
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import secrets
 import stat
 import subprocess
@@ -304,7 +304,7 @@ def _persist_credentials(creds: Any, token_path: Path) -> None:
     try:
         _write_private_json(
             token_path,
-            _normalize_authorized_user_payload(json.loads(creds.to_json())),
+            _normalize_authorized_user_payload(orjson.loads(creds.to_json())),
         )
     except Exception:
         logger.debug(
@@ -342,7 +342,7 @@ def _write_private_json(path: Path, data: Any) -> None:
             stat.S_IRUSR | stat.S_IWUSR,
         )
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write(orjson.dumps(data, option=orjson.OPT_INDENT_2).decode('utf-8'))
             fh.flush()
             os.fsync(fh.fileno())
         atomic_replace(tmp_path, path)
@@ -379,13 +379,14 @@ def install_deps() -> bool:
 
     print("Installing Google Chat OAuth dependencies...")
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + _REQUIRED_PACKAGES,
-            stdout=subprocess.DEVNULL,
-        )
+        from hermes_cli.tools_config import _pip_install
+
+        result = _pip_install(["--quiet"] + _REQUIRED_PACKAGES)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or "install failed").strip()[:300])
         print("Dependencies installed.")
         return True
-    except subprocess.CalledProcessError as exc:
+    except Exception as exc:
         print(f"ERROR: Failed to install dependencies: {exc}")
         print("Or install via the optional extra:")
         print("  pip install 'hermes-agent[google_chat]'")
@@ -419,8 +420,8 @@ def store_client_secret(path: str) -> None:
         sys.exit(1)
 
     try:
-        data = json.loads(src.read_text())
-    except json.JSONDecodeError:
+        data = orjson.loads(src.read_text())
+    except orjson.JSONDecodeError:
         print("ERROR: File is not valid JSON.")
         sys.exit(1)
 
@@ -459,7 +460,7 @@ def _load_pending_auth(email: Optional[str] = None) -> dict:
         print("ERROR: No pending OAuth session found. Run --auth-url first.")
         sys.exit(1)
     try:
-        data = json.loads(pending.read_text())
+        data = orjson.loads(pending.read_text())
     except Exception as exc:
         print(f"ERROR: Could not read pending OAuth session: {exc}")
         print("Run --auth-url again to start a fresh session.")
@@ -564,7 +565,7 @@ def exchange_auth_code(code: str, email: Optional[str] = None) -> None:
         sys.exit(1)
 
     creds = flow.credentials
-    token_payload = _normalize_authorized_user_payload(json.loads(creds.to_json()))
+    token_payload = _normalize_authorized_user_payload(orjson.loads(creds.to_json()))
 
     actually_granted = (
         list(creds.granted_scopes or [])

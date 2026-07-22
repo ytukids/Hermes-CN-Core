@@ -54,11 +54,11 @@ import concurrent.futures
 import hashlib
 import hmac
 import itertools
-import json
+import orjson
 import logging
 import mimetypes
 import os
-import re
+from agent.re_compat import re
 import threading
 import time
 import uuid
@@ -254,6 +254,19 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "always": "Approved permanently",
     "deny": "Denied",
 }
+
+
+async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes`` from an aiohttp request body."""
+    try:
+        body = await request.content.readexactly(max_bytes + 1)
+    except asyncio.IncompleteReadError as exc:
+        body = exc.partial
+    if len(body) > max_bytes:
+        raise ValueError("payload too large")
+    return body
+
+
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
@@ -577,14 +590,11 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 
 def _build_markdown_post_payload(content: str) -> str:
     rows = _build_markdown_post_rows(content)
-    return json.dumps(
-        {
+    return orjson.dumps({
             "zh_cn": {
                 "content": rows,
             }
-        },
-        ensure_ascii=False,
-    )
+        }).decode('utf-8')
 
 
 def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
@@ -904,8 +914,8 @@ def normalize_feishu_message(
 
 def _load_feishu_payload(raw_content: str) -> Dict[str, Any]:
     try:
-        parsed = json.loads(raw_content) if raw_content else {}
-    except json.JSONDecodeError:
+        parsed = orjson.loads(raw_content) if raw_content else {}
+    except orjson.JSONDecodeError:
         return {"text": raw_content}
     return parsed if isinstance(parsed, dict) else {"content": parsed}
 
@@ -1813,10 +1823,49 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
+
+        # Send a WebSocket CLOSE frame to Feishu BEFORE tearing down the
+        # thread loop. Without this, Feishu's server never learns the
+        # connection is dead and continues routing messages to the stale
+        # endpoint — the channel goes silent until the server-side
+        # CLOSE-WAIT expires (minutes to hours). See issue #10202.
+        #
+        # ``_disable_websocket_auto_reconnect()`` nils ``self._ws_client``,
+        # so capture the client reference first.
+        ws_client = self._ws_client
+        ws_thread_loop = self._ws_thread_loop
         self._disable_websocket_auto_reconnect()
         await self._stop_webhook_server()
 
-        ws_thread_loop = self._ws_thread_loop
+        if (
+            ws_client is not None
+            and ws_thread_loop is not None
+            and not ws_thread_loop.is_closed()
+            and hasattr(ws_client, "_disconnect")
+        ):
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    ws_client._disconnect(), ws_thread_loop
+                )
+                # 5s is generous — the CLOSE frame is a single WebSocket
+                # control frame. If it takes longer than that the
+                # connection is already wedged and we gain nothing by
+                # waiting further.
+                await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
+                logger.debug("[Feishu] Sent WebSocket CLOSE frame to Feishu")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Feishu] CLOSE frame not acknowledged within 5s — "
+                    "Feishu may briefly route messages to the stale "
+                    "connection until server-side timeout"
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[Feishu] Could not send WebSocket CLOSE frame: %s",
+                    exc,
+                    exc_info=True,
+                )
+
         if ws_thread_loop is not None and not ws_thread_loop.is_closed():
             logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
 
@@ -1922,7 +1971,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        payload=orjson.dumps({"text": _strip_markdown_to_plain_text(chunk)}).decode('utf-8'),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -1935,7 +1984,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        payload=orjson.dumps({"text": _strip_markdown_to_plain_text(chunk)}).decode('utf-8'),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -1969,7 +2018,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
                 fallback_body = self._build_update_message_body(
                     msg_type="text",
-                    content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                    content=orjson.dumps({"text": _strip_markdown_to_plain_text(content)}).decode('utf-8'),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
                 fallback_response = await self._run_blocking(self._client.im.v1.message.update, fallback_request)
@@ -2030,7 +2079,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 ],
             }
 
-            payload = json.dumps(card, ensure_ascii=False)
+            payload = orjson.dumps(card).decode('utf-8')
             response = await self._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="interactive",
@@ -2095,10 +2144,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             prompt_id = next(self._update_prompt_counter)
-            payload = json.dumps(
-                self._build_update_prompt_card(prompt=prompt, default=default, prompt_id=prompt_id),
-                ensure_ascii=False,
-            )
+            payload = orjson.dumps(self._build_update_prompt_card(prompt=prompt, default=default, prompt_id=prompt_id)).decode('utf-8')
             response = await self._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="interactive",
@@ -2270,7 +2316,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 message_response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
                     msg_type="image",
-                    payload=json.dumps({"image_key": image_key}, ensure_ascii=False),
+                    payload=orjson.dumps({"image_key": image_key}).decode('utf-8'),
                     reply_to=reply_to,
                     metadata=metadata,
                 )
@@ -2949,6 +2995,7 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=message_id,
+            channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
@@ -2989,7 +3036,7 @@ class FeishuAdapter(BasePlatformAdapter):
         synthetic_text = f"/card {action_tag}"
         if action_value:
             try:
-                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
+                synthetic_text += f" {orjson.dumps(action_value).decode('utf-8')}"
             except Exception:
                 pass
 
@@ -3011,6 +3058,7 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=token or str(uuid.uuid4()),
+            channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
@@ -3213,6 +3261,18 @@ class FeishuAdapter(BasePlatformAdapter):
     # Inbound processing pipeline
     # ===
 
+    def _resolve_channel_prompt(self, chat_id: str, parent_id: str | None = None) -> str | None:
+        """Resolve a Feishu per-channel system prompt.
+
+        Mirrors the Discord/Slack behaviour so ``channel_prompts: {<chat_id>:
+        "<prompt>"}`` in ``PlatformConfig.extra`` is honoured for Feishu chats
+        instead of being silently ignored.
+        """
+        from gateway.platforms.base import resolve_channel_prompt
+        _config = getattr(self, "config", None)
+        _extra = getattr(_config, "extra", None) or {}
+        return resolve_channel_prompt(_extra, chat_id, parent_id)
+
     async def _process_inbound_message(
         self,
         *,
@@ -3290,6 +3350,7 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -3470,9 +3531,16 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             body_bytes: bytes = await asyncio.wait_for(
-                request.read(),
+                _read_limited_feishu_webhook_body(
+                    request,
+                    _FEISHU_WEBHOOK_MAX_BODY_BYTES,
+                ),
                 timeout=_FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS,
             )
+        except ValueError:
+            logger.warning("[Feishu] Webhook body exceeds limit from %s", remote_ip)
+            self._record_webhook_anomaly(remote_ip, "413")
+            return web.Response(status=413, text="Request body too large")
         except asyncio.TimeoutError:
             logger.warning("[Feishu] Webhook body read timed out after %ds from %s", _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS, remote_ip)
             self._record_webhook_anomaly(remote_ip, "408")
@@ -3481,14 +3549,9 @@ class FeishuAdapter(BasePlatformAdapter):
             self._record_webhook_anomaly(remote_ip, "400")
             return web.json_response({"code": 400, "msg": "failed to read body"}, status=400)
 
-        if len(body_bytes) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
-            logger.warning("[Feishu] Webhook body exceeds limit (%d bytes) from %s", len(body_bytes), remote_ip)
-            self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
-
         try:
-            payload = json.loads(body_bytes.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = orjson.loads(body_bytes.decode("utf-8"))
+        except (orjson.JSONDecodeError, UnicodeDecodeError):
             self._record_webhook_anomaly(remote_ip, "400")
             return web.json_response({"code": 400, "msg": "invalid json"}, status=400)
 
@@ -3592,9 +3655,16 @@ class FeishuAdapter(BasePlatformAdapter):
             ]
             for k in stale_keys:
                 del self._webhook_rate_counts[k]
-            # If still at capacity after pruning, allow through without tracking.
+            # If still at capacity after pruning, deny untracked keys (fail closed).
+            # The table only fills with this many distinct (account, endpoint, IP)
+            # triples under abuse; allowing untracked requests through at capacity
+            # would let an attacker who flooded the table bypass the limiter entirely.
             if rate_key not in self._webhook_rate_counts and len(self._webhook_rate_counts) >= _FEISHU_WEBHOOK_RATE_MAX_KEYS:
-                return True
+                logger.warning(
+                    "[Feishu] Webhook rate-limit table at capacity (%d keys) — denying untracked key",
+                    _FEISHU_WEBHOOK_RATE_MAX_KEYS,
+                )
+                return False
         self._webhook_rate_counts[rate_key] = (1, now)
         return True
 
@@ -4127,7 +4197,7 @@ class FeishuAdapter(BasePlatformAdapter):
             content = getattr(getattr(resp, "raw", None), "content", None)
             if not content:
                 return None
-            payload = json.loads(content)
+            payload = orjson.loads(content)
             if payload.get("code") != 0:
                 return None
             bots = (payload.get("data") or {}).get("bots") or {}
@@ -4235,6 +4305,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
+            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
+            # forward DMs to gateway intake so the pairing handshake can run.
+            # Gateway auth fail-closes agent access until approval.
+            if not self._allowed_group_users:
+                return None
+            if not (sender_ids and (sender_ids & self._allowed_group_users)):
+                return "dm_policy_rejected"
             return None
 
         if not self._allow_group_message(
@@ -4375,7 +4456,7 @@ class FeishuAdapter(BasePlatformAdapter):
             resp = await self._run_blocking(self._client.request, req)
             content = getattr(getattr(resp, "raw", None), "content", None)
             if content:
-                payload = json.loads(content)
+                payload = orjson.loads(content)
                 parsed = _parse_bot_response(payload) or {}
                 open_id = (parsed.get("bot_open_id") or "").strip()
                 bot_name = (parsed.get("bot_name") or "").strip()
@@ -4427,10 +4508,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _load_seen_message_ids(self) -> None:
         try:
-            payload = json.loads(self._dedup_state_path.read_text(encoding="utf-8"))
+            payload = orjson.loads(self._dedup_state_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return
-        except (OSError, json.JSONDecodeError):
+        except (OSError, orjson.JSONDecodeError):
             logger.warning("[Feishu] Failed to load persisted dedup state from %s", self._dedup_state_path, exc_info=True)
             return
         seen_data = payload.get("message_ids", {}) if isinstance(payload, dict) else {}
@@ -4497,11 +4578,11 @@ class FeishuAdapter(BasePlatformAdapter):
         # Force plain text for anything that looks like a markdown table.
         if _MARKDOWN_TABLE_RE.search(content):
             text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
+            return "text", orjson.dumps(text_payload).decode('utf-8')
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
-        return "text", json.dumps(text_payload, ensure_ascii=False)
+        return "text", orjson.dumps(text_payload).decode('utf-8')
 
     async def _send_uploaded_file_message(
         self,
@@ -4558,7 +4639,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 message_response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
                     msg_type=resolved_message_type,
-                    payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                    payload=orjson.dumps({"file_key": file_key}).decode('utf-8'),
                     reply_to=reply_to,
                     metadata=metadata,
                 )
@@ -4717,7 +4798,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
         await self._hydrate_bot_identity()
-        app = web.Application()
+        # client_max_size backstops the bounded reader in
+        # _handle_webhook_request; aiohttp then enforces the same cap on
+        # every read path (#58536/#58902/#59180 pattern).
+        app = web.Application(client_max_size=_FEISHU_WEBHOOK_MAX_BODY_BYTES)
         app.router.add_post(self._webhook_path, self._handle_webhook_request)
         self._webhook_runner = web.AppRunner(app)
         await self._webhook_runner.setup()
@@ -4970,10 +5054,10 @@ class FeishuAdapter(BasePlatformAdapter):
         return _build_markdown_post_payload(content)
 
     def _build_media_post_payload(self, *, caption: str, media_tag: Dict[str, str]) -> str:
-        payload = json.loads(self._build_post_payload(caption))
+        payload = orjson.loads(self._build_post_payload(caption))
         content = payload.setdefault("zh_cn", {}).setdefault("content", [])
         content.append([media_tag])
-        return json.dumps(payload, ensure_ascii=False)
+        return orjson.dumps(payload).decode('utf-8')
 
     @staticmethod
     def _resolve_outbound_file_routing(
@@ -5025,13 +5109,13 @@ def _post_registration(base_url: str, body: Dict[str, str]) -> dict:
     req = Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
         with urlopen(req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return orjson.loads(resp.read().decode("utf-8"))
     except HTTPError as exc:
         body_bytes = exc.read()
         if body_bytes:
             try:
-                return json.loads(body_bytes.decode("utf-8"))
-            except (ValueError, json.JSONDecodeError):
+                return orjson.loads(body_bytes.decode("utf-8"))
+            except (ValueError, orjson.JSONDecodeError):
                 raise exc from None
         raise
 
@@ -5102,7 +5186,7 @@ def _poll_registration(
                 "device_code": device_code,
                 "tp": "ob_app",
             })
-        except (URLError, OSError, json.JSONDecodeError):
+        except (URLError, OSError, orjson.JSONDecodeError):
             time.sleep(interval)
             continue
 
@@ -5221,7 +5305,7 @@ def _probe_bot_sdk(app_id: str, app_secret: str, domain: str) -> Optional[dict]:
         content = getattr(getattr(resp, "raw", None), "content", None)
         if content is None:
             return None
-        return _parse_bot_response(json.loads(content))
+        return _parse_bot_response(orjson.loads(content))
     except Exception as exc:
         logger.debug("[Feishu onboard] SDK probe failed: %s", exc)
         return None
@@ -5231,14 +5315,14 @@ def _probe_bot_http(app_id: str, app_secret: str, domain: str) -> Optional[dict]
     """Fallback probe using raw HTTP (when lark_oapi is not installed)."""
     base_url = _onboard_open_base_url(domain)
     try:
-        token_data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+        token_data = orjson.dumps({"app_id": app_id, "app_secret": app_secret})
         token_req = Request(
             f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
             data=token_data,
             headers={"Content-Type": "application/json"},
         )
         with urlopen(token_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
-            token_res = json.loads(resp.read().decode("utf-8"))
+            token_res = orjson.loads(resp.read().decode("utf-8"))
 
         access_token = token_res.get("tenant_access_token")
         if not access_token:
@@ -5252,10 +5336,10 @@ def _probe_bot_http(app_id: str, app_secret: str, domain: str) -> Optional[dict]
             },
         )
         with urlopen(bot_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
-            bot_res = json.loads(resp.read().decode("utf-8"))
+            bot_res = orjson.loads(resp.read().decode("utf-8"))
 
         return _parse_bot_response(bot_res)
-    except (URLError, OSError, KeyError, json.JSONDecodeError) as exc:
+    except (URLError, OSError, KeyError, orjson.JSONDecodeError) as exc:
         logger.debug("[Feishu onboard] HTTP probe failed: %s", exc)
         return None
 
@@ -5283,7 +5367,7 @@ def qr_register(
     """
     try:
         return _qr_register_inner(initial_domain=initial_domain, timeout_seconds=timeout_seconds)
-    except (RuntimeError, URLError, OSError, json.JSONDecodeError) as exc:
+    except (RuntimeError, URLError, OSError, orjson.JSONDecodeError) as exc:
         logger.warning("[Feishu onboard] Registration failed: %s", exc)
         return None
 

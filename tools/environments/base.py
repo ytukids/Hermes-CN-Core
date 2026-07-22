@@ -7,7 +7,7 @@ or a temp file (local).
 """
 
 import codecs
-import json
+import orjson
 import logging
 import os
 import select
@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -142,7 +141,7 @@ def _popen_bash(
     Backends with special Popen needs (e.g. local's ``preexec_fn``) can bypass
     this and call :func:`_pipe_stdin` directly.
     """
-    kwargs.setdefault("creationflags", windows_hide_flags())
+    kwargs.setdefault("creationflags", subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -160,7 +159,7 @@ def _load_json_store(path: Path) -> dict:
     """Load a JSON file as a dict, returning ``{}`` on any error."""
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return orjson.loads(path.read_text(encoding="utf-8"))
         except Exception:
             pass
     return {}
@@ -169,7 +168,7 @@ def _load_json_store(path: Path) -> dict:
 def _save_json_store(path: Path, data: dict) -> None:
     """Write *data* as pretty-printed JSON to *path*."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    path.write_text(orjson.dumps(data, option=orjson.OPT_INDENT_2).decode('utf-8'), encoding="utf-8")
 
 
 def _file_mtime_key(host_path: str) -> tuple[float, int] | None:
@@ -357,11 +356,15 @@ class BaseEnvironment(ABC):
         ``_snapshot_ready = True`` so subsequent commands source the snapshot
         instead of running with ``bash -l``.
         """
-        # Full capture: env vars, functions (filtered), aliases, shell options.
+        # Full capture: env vars, functions, aliases, shell options.
         # Restore configured cwd after login shell profile scripts, which may
         # change the working directory (e.g. bashrc `cd ~`).  Without this,
         # pwd -P captures the profile's directory, not terminal.cwd.
-        _quoted_cwd = shlex.quote(self.cwd)
+        # Route through ``_quote_cwd_for_cd`` so subclasses can adapt the cwd
+        # form for their shell. ([CN-fork] P-019: Windows never reaches this
+        # bash path — it dispatches to PowerShell — so no msys conversion
+        # override exists; the base implementation quotes verbatim.)
+        _quoted_cwd = self._quote_cwd_for_cd(self.cwd)
         # Quote the snapshot / cwd-file paths so the shell on Windows handles
         # ``C:/Users/...``-shaped paths without glob-splitting the colon or
         # tripping on drive letters.  On POSIX this is a no-op (no colons /
@@ -386,12 +389,27 @@ class BaseEnvironment(ABC):
         # mid-write, and mv would then publish a torn file (the corruption is
         # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
         # and is genuinely unique per writer, which closes the race.  The
-        # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
+        # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces; relevant when shell:bash is configured)
         # with ``$BASHPID`` left outside the quotes so it still expands.
         _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
         bootstrap = (
+            f"umask 077\n"
             f"export -p > {_snap_tmp}\n"
-            f"declare -f | grep -vE '^_[^_]' >> {_snap_tmp}\n"
+            # Dump function definitions, filtering out private (``_``-prefixed)
+            # helpers — mainly bash-completion internals (``_git``, ``_make``…)
+            # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
+            # is line-based: it strips the function *header* line but leaves the
+            # orphaned ``{ … }`` body behind, which corrupts the snapshot and
+            # makes every sourced command fail (e.g. exit 127).  Selecting the
+            # wanted names with ``declare -F`` first, then dumping only those
+            # whole definitions, preserves the filter's intent without ever
+            # tearing a function body.  The non-empty guard matters: bare
+            # ``declare -f`` with no name args dumps ALL functions, so an empty
+            # name list (only private funcs present) would otherwise leak the
+            # very functions we meant to drop.
+            f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
+            f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns "
+            f">> {_snap_tmp} 2>/dev/null || true\n"
             f"alias -p >> {_snap_tmp}\n"
             f"echo 'shopt -s expand_aliases' >> {_snap_tmp}\n"
             f"echo 'set +e' >> {_snap_tmp}\n"
@@ -399,13 +417,17 @@ class BaseEnvironment(ABC):
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
             f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
-            f"builtin cd {_quoted_cwd} 2>/dev/null || true\n"
+            f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
         try:
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
+            if int(result.get("returncode") or 0) != 0:
+                raise RuntimeError(
+                    f"snapshot bootstrap failed with exit code {result.get('returncode')}"
+                )
             self._snapshot_ready = True
             self._update_cwd(result)
             logger.info(
@@ -479,6 +501,9 @@ class BaseEnvironment(ABC):
         # Run the actual command
         parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
+        # Restrict Hermes metadata files without changing the user's command
+        # umask. Snapshot files may contain env-carried secrets.
+        parts.append("umask 077")
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
         # Chain mv on the export succeeding so a failed/partial dump never
@@ -910,7 +935,8 @@ class BaseEnvironment(ABC):
         self._update_cwd(result)
 
         # Attach pwsh transform warnings if present (only LocalEnvironment
-        # running Windows PowerShell sets these — other environments won't).
+        # running Windows PowerShell 5.1 sets these — pwsh has native
+        # support, so no warnings are generated).
         pwsh_warnings = getattr(self, '_pwsh_warnings', None)
         if pwsh_warnings:
             result["pwsh_warnings"] = pwsh_warnings

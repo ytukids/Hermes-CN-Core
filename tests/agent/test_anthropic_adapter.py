@@ -1,6 +1,6 @@
 """Tests for agent/anthropic_adapter.py — Anthropic Messages API adapter."""
 
-import json
+import orjson
 import sys
 import time
 from types import SimpleNamespace
@@ -201,6 +201,44 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
+    def test_palantir_foundry_anthropic_endpoint_uses_bearer_auth(self):
+        """Palantir Foundry's LLM proxy requires Authorization: Bearer.
+
+        Regression test for PR #36043: Palantir's
+        ``<org>.palantirfoundry.com/api/v2/llm/proxy/anthropic`` endpoint
+        rejects x-api-key with 401 — the SDK must be built with auth_token.
+        """
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "foundry-secret-123",
+                base_url="https://acme.palantirfoundry.com/api/v2/llm/proxy/anthropic",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "foundry-secret-123"
+            assert "api_key" not in kwargs
+
+    def test_palantir_bearer_auth_matches_hostname_not_substring(self):
+        """The palantirfoundry check must be a hostname match, not a loose
+        substring match — a URL merely *containing* the string (path segment,
+        lookalike domain) must not trigger Bearer auth."""
+        from agent.anthropic_adapter import _requires_bearer_auth
+
+        # Real Foundry hosts (org subdomains) → Bearer.
+        assert _requires_bearer_auth(
+            "https://acme.palantirfoundry.com/api/v2/llm/proxy/anthropic"
+        ) is True
+        assert _requires_bearer_auth("https://palantirfoundry.com/anthropic") is True
+        # Substring false-positives → x-api-key (default).
+        assert _requires_bearer_auth(
+            "https://evil.example.com/palantirfoundry/anthropic"
+        ) is False
+        assert _requires_bearer_auth(
+            "https://palantirfoundry.com.evil.example/anthropic"
+        ) is False
+        assert _requires_bearer_auth(
+            "https://notpalantirfoundry.com/anthropic"
+        ) is False
+
     def test_disables_sdk_retries_for_api_key(self):
         """#26293: the SDK's default max_retries=2 ignores Retry-After and
         double-retries inside hermes's outer loop. We delegate retry entirely
@@ -235,13 +273,13 @@ class TestReadClaudeCodeCredentials:
     def test_reads_valid_credentials(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({
+        cred_file.write_text(orjson.dumps({
             "claudeAiOauth": {
                 "accessToken": "sk-ant-oat01-token",
                 "refreshToken": "sk-ant-oat01-refresh",
                 "expiresAt": int(time.time() * 1000) + 3600_000,
             }
-        }))
+        }).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         creds = read_claude_code_credentials()
         assert creds is not None
@@ -251,7 +289,7 @@ class TestReadClaudeCodeCredentials:
 
     def test_ignores_primary_api_key_for_native_anthropic_resolution(self, tmp_path, monkeypatch):
         claude_json = tmp_path / ".claude.json"
-        claude_json.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-primary"}))
+        claude_json.write_text(orjson.dumps({"primaryApiKey": "sk-ant-api03-primary"}).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         creds = read_claude_code_credentials()
@@ -264,16 +302,16 @@ class TestReadClaudeCodeCredentials:
     def test_returns_none_for_missing_oauth_key(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({"someOtherKey": {}}))
+        cred_file.write_text(orjson.dumps({"someOtherKey": {}}).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert read_claude_code_credentials() is None
 
     def test_returns_none_for_empty_access_token(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({
+        cred_file.write_text(orjson.dumps({
             "claudeAiOauth": {"accessToken": "", "refreshToken": "x"}
-        }))
+        }).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert read_claude_code_credentials() is None
 
@@ -304,7 +342,7 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-        (tmp_path / ".claude.json").write_text(json.dumps({"primaryApiKey": "sk-ant-api03-primary"}))
+        (tmp_path / ".claude.json").write_text(orjson.dumps({"primaryApiKey": "sk-ant-api03-primary"}).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         assert resolve_anthropic_token() is None
@@ -343,13 +381,13 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({
+        cred_file.write_text(orjson.dumps({
             "claudeAiOauth": {
                 "accessToken": "cc-auto-token",
                 "refreshToken": "refresh",
                 "expiresAt": int(time.time() * 1000) + 3600_000,
             }
-        }))
+        }).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert resolve_anthropic_token() == "cc-auto-token"
 
@@ -484,13 +522,13 @@ class TestResolveAnthropicToken:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({
+        cred_file.write_text(orjson.dumps({
             "claudeAiOauth": {
                 "accessToken": "cc-auto-token",
                 "refreshToken": "refresh-token",
                 "expiresAt": int(time.time() * 1000) + 3600_000,
             }
-        }))
+        }).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         assert resolve_anthropic_token() == "cc-auto-token"
@@ -500,19 +538,29 @@ class TestResolveAnthropicToken:
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         claude_json = tmp_path / ".claude.json"
-        claude_json.write_text(json.dumps({"primaryApiKey": "sk-ant-api03-managed-key"}))
+        claude_json.write_text(orjson.dumps({"primaryApiKey": "sk-ant-api03-managed-key"}).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         assert resolve_anthropic_token() == "sk-ant-oat01-static-token"
 
 
 class TestRefreshOauthToken:
-    def test_returns_none_without_refresh_token(self):
+    def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        # Neutralize live Claude Code sources (macOS Keychain + ~/.claude file)
+        # so the adopt-already-refreshed branch can't short-circuit with a real
+        # credential on a dev/CI machine that happens to have Claude Code creds.
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
     def test_successful_refresh(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
 
         creds = {
             "accessToken": "old-token",
@@ -520,11 +568,11 @@ class TestRefreshOauthToken:
             "expiresAt": int(time.time() * 1000) - 3600_000,
         }
 
-        mock_response = json.dumps({
+        mock_response = orjson.dumps({
             "access_token": "new-token-abc",
             "refresh_token": "new-refresh-456",
             "expires_in": 7200,
-        }).encode()
+        })
 
         with patch("urllib.request.urlopen") as mock_urlopen:
             mock_ctx = MagicMock()
@@ -540,11 +588,15 @@ class TestRefreshOauthToken:
         # Verify credentials were written back
         cred_file = tmp_path / ".claude" / ".credentials.json"
         assert cred_file.exists()
-        written = json.loads(cred_file.read_text())
+        written = orjson.loads(cred_file.read_text())
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
-    def test_failed_refresh_returns_none(self):
+    def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
         creds = {
             "accessToken": "old",
             "refreshToken": "refresh-123",
@@ -561,7 +613,7 @@ class TestWriteClaudeCodeCredentials:
         _write_claude_code_credentials("tok", "ref", 12345)
         cred_file = tmp_path / ".claude" / ".credentials.json"
         assert cred_file.exists()
-        data = json.loads(cred_file.read_text())
+        data = orjson.loads(cred_file.read_text())
         assert data["claudeAiOauth"]["accessToken"] == "tok"
         assert data["claudeAiOauth"]["refreshToken"] == "ref"
         assert data["claudeAiOauth"]["expiresAt"] == 12345
@@ -571,9 +623,9 @@ class TestWriteClaudeCodeCredentials:
         cred_dir = tmp_path / ".claude"
         cred_dir.mkdir()
         cred_file = cred_dir / ".credentials.json"
-        cred_file.write_text(json.dumps({"otherField": "keep-me"}))
+        cred_file.write_text(orjson.dumps({"otherField": "keep-me"}).decode('utf-8'))
         _write_claude_code_credentials("new-tok", "new-ref", 99999)
-        data = json.loads(cred_file.read_text())
+        data = orjson.loads(cred_file.read_text())
         assert data["otherField"] == "keep-me"
         assert data["claudeAiOauth"]["accessToken"] == "new-tok"
 
@@ -606,13 +658,13 @@ class TestResolveWithRefresh:
         # Set up expired creds with a refresh token
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({
+        cred_file.write_text(orjson.dumps({
             "claudeAiOauth": {
                 "accessToken": "expired-tok",
                 "refreshToken": "valid-refresh",
                 "expiresAt": int(time.time() * 1000) - 3600_000,
             }
-        }))
+        }).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         # Mock refresh to succeed
@@ -628,13 +680,13 @@ class TestResolveWithRefresh:
 
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({
+        cred_file.write_text(orjson.dumps({
             "claudeAiOauth": {
                 "accessToken": "expired-claude-creds-token",
                 "refreshToken": "valid-refresh",
                 "expiresAt": int(time.time() * 1000) - 3600_000,
             }
-        }))
+        }).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         with patch("agent.anthropic_adapter._refresh_oauth_token", return_value="refreshed-token"):
@@ -658,13 +710,13 @@ class TestRunOauthSetupToken:
         # Pre-create credential files that will be found after subprocess
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
-        cred_file.write_text(json.dumps({
+        cred_file.write_text(orjson.dumps({
             "claudeAiOauth": {
                 "accessToken": "from-cred-file",
                 "refreshToken": "refresh",
                 "expiresAt": int(time.time() * 1000) + 3600_000,
             }
-        }))
+        }).decode('utf-8'))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
         with patch("subprocess.run") as mock_run:
@@ -996,6 +1048,57 @@ class TestConvertMessages:
         assert len(tool_results) == 1
         assert tool_results[0]["tool_use_id"] == "tc_valid"
 
+    def test_strips_tool_use_when_result_not_immediately_adjacent(self):
+        """A tool_use whose result appears LATER but not in the immediately
+        following user message must be stripped (adjacency, #52145).
+
+        The old logic matched tool_result ids globally across the whole
+        transcript, so it would wrongly KEEP such a tool_use; Anthropic then
+        400s because the result does not follow the tool_use turn. The adjacency
+        rewrite only honors a result in the next user message.
+        """
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_late", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            },
+            {"role": "user", "content": "actually, something else"},
+            {"role": "assistant", "content": "sure"},
+            {"role": "tool", "tool_call_id": "tc_late", "content": "late result"},
+        ]
+        _, result = convert_messages_to_anthropic(messages)
+        for m in result:
+            if m["role"] == "assistant" and isinstance(m["content"], list):
+                assert all(b.get("type") != "tool_use" for b in m["content"]), (
+                    "non-adjacent tool_use should have been stripped"
+                )
+        for m in result:
+            if m["role"] == "user" and isinstance(m["content"], list):
+                assert all(b.get("type") != "tool_result" for b in m["content"]), (
+                    "orphaned late tool_result should have been stripped"
+                )
+
+    def test_keeps_tool_use_when_result_immediately_adjacent(self):
+        """Control: an adjacent tool_use/result pair is preserved (no false strip)."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_ok", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_ok", "content": "good"},
+        ]
+        _, result = convert_messages_to_anthropic(messages)
+        asst = [m for m in result if m["role"] == "assistant"][0]
+        assert any(b.get("type") == "tool_use" for b in asst["content"])
+        user = [m for m in result if m["role"] == "user"][0]
+        assert any(b.get("type") == "tool_result" for b in user["content"])
+
     def test_system_with_cache_control(self):
         messages = [
             {
@@ -1023,6 +1126,72 @@ class TestConvertMessages:
         assert assistant_blocks[0]["type"] == "text"
         assert assistant_blocks[0]["text"] == "Hello from assistant"
         assert assistant_blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_assistant_tool_use_cache_control_is_preserved(self):
+        messages = apply_anthropic_cache_control([
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Run the tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "test_tool", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
+        ], native_anthropic=True)
+
+        _, result = convert_messages_to_anthropic(messages)
+        assistant_msg = [m for m in result if m["role"] == "assistant"][0]
+        tool_use = assistant_msg["content"][-1]
+
+        assert tool_use["type"] == "tool_use"
+        assert tool_use["id"] == "tc_1"
+        assert tool_use["cache_control"] == {"type": "ephemeral"}
+
+    def test_ordered_replay_tool_use_cache_control_is_preserved(self):
+        messages = apply_anthropic_cache_control([
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Run the tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "anthropic_content_blocks": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Need a tool.",
+                        "signature": "sig_1",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tc_1",
+                        "name": "test_tool",
+                        "input": {"query": "raw"},
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "id": "tc_1",
+                        "function": {
+                            "name": "test_tool",
+                            "arguments": '{"query":"redacted"}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
+        ], native_anthropic=True)
+
+        _, result = convert_messages_to_anthropic(messages)
+        assistant_msg = [m for m in result if m["role"] == "assistant"][0]
+        thinking, tool_use = assistant_msg["content"]
+
+        assert thinking["type"] == "thinking"
+        assert "cache_control" not in thinking
+        assert tool_use["type"] == "tool_use"
+        assert tool_use["id"] == "tc_1"
+        assert tool_use["input"] == {"query": "redacted"}
+        assert tool_use["cache_control"] == {"type": "ephemeral"}
 
     def test_tool_cache_control_is_preserved_on_tool_result_block(self):
         messages = apply_anthropic_cache_control([
@@ -1317,6 +1486,16 @@ class TestBuildAnthropicKwargs:
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kwargs["output_config"] == {"effort": "xhigh"}
 
+    def test_reasoning_config_clamps_generic_ultra_to_anthropic_max(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4.8",
+            messages=[{"role": "user", "content": "think harder"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "ultra"},
+        )
+        assert kwargs["output_config"] == {"effort": "max"}
+
     def test_reasoning_config_maps_max_effort_for_4_7_models(self):
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-7",
@@ -1424,17 +1603,49 @@ class TestBuildAnthropicKwargs:
             assert _forbids_sampling_params(m) is False, m
 
     def test_non_claude_anthropic_models_use_manual_path(self):
-        """Non-Claude Anthropic-Messages models (minimax, qwen3, kimi) must not
-        be misclassified as adaptive by the default-to-modern rule."""
+        """Non-Claude Anthropic-Messages models (minimax, qwen3, glm) must not
+        be misclassified as adaptive by the default-to-modern rule. Kimi is
+        the deliberate exception — see test_kimi_family_uses_adaptive_path."""
         from agent.anthropic_adapter import (
             _supports_adaptive_thinking,
             _supports_xhigh_effort,
             _forbids_sampling_params,
         )
-        for m in ("minimax-m2", "qwen3-max", "moonshotai/kimi-k2.5", "glm-4.6"):
+        for m in ("minimax-m2", "qwen3-max", "glm-4.6"):
             assert _supports_adaptive_thinking(m) is False, m
             assert _supports_xhigh_effort(m) is False, m
             assert _forbids_sampling_params(m) is False, m
+
+    def test_kimi_family_uses_adaptive_path(self):
+        """Kimi / Moonshot models use adaptive thinking: their
+        Anthropic-compatible endpoints accept thinking.type="adaptive" +
+        output_config.effort including xhigh. Sampling params stay untouched
+        (the 4.7+ sampling ban is a Claude-only contract)."""
+        from agent.anthropic_adapter import (
+            _supports_adaptive_thinking,
+            _supports_xhigh_effort,
+            _forbids_sampling_params,
+        )
+        for m in ("moonshotai/kimi-k2.5", "kimi-0714-preview", "k2-thinking"):
+            assert _supports_adaptive_thinking(m) is True, m
+            assert _supports_xhigh_effort(m) is True, m
+            assert _forbids_sampling_params(m) is False, m
+
+    def test_bare_k3_coding_plan_slug_is_kimi_family(self):
+        """Kimi Coding Plan serves K3 as the bare slug ``k3`` — it must be
+        classified as Kimi family (adaptive thinking) even on proxied
+        endpoints where only the model name is available. Lookalike
+        non-Kimi names must NOT match the exact-slug rule."""
+        from agent.anthropic_adapter import (
+            _model_name_is_kimi_family,
+            _supports_adaptive_thinking,
+        )
+        for m in ("k3", "K3", "moonshotai/k3", "k3.1-preview", "k3-turbo"):
+            assert _model_name_is_kimi_family(m) is True, m
+        assert _supports_adaptive_thinking("k3") is True
+        # Prefix-lookalikes without a separator must not be swept in.
+        for m in ("k30", "k3000-chat", "keras-3"):
+            assert _model_name_is_kimi_family(m) is False, m
 
     def test_fast_mode_omitted_for_unsupported_model(self):
         """fast_mode=True on Opus 4.7 must NOT inject speed=fast (API 400s)."""
@@ -1705,7 +1916,7 @@ class TestNormalizeResponse:
         assert nr.finish_reason == "tool_calls"
         assert len(nr.tool_calls) == 1
         assert nr.tool_calls[0].name == "search"
-        assert json.loads(nr.tool_calls[0].arguments) == {"query": "test"}
+        assert orjson.loads(nr.tool_calls[0].arguments) == {"query": "test"}
 
     def test_thinking_response(self):
         blocks = [

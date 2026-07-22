@@ -1,7 +1,7 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
 import shutil
-import json
+import orjson
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -172,7 +172,8 @@ class TestComputeRelativeDest:
         bundled = Path("/repo/skills")
         skill_dir = Path("/repo/skills/mlops/axolotl")
         dest = _compute_relative_dest(skill_dir, bundled)
-        assert str(dest).endswith("mlops/axolotl")
+        # as_posix: str(Path) uses backslashes on Windows.
+        assert dest.as_posix().endswith("mlops/axolotl")
 
     def test_flat_skill(self):
         bundled = Path("/repo/skills")
@@ -746,7 +747,7 @@ class TestSyncSkills:
 
         assert result["optional_provenance_backfilled"] == ["trl-fine-tuning"]
         lock_path = skills_dir / ".hub" / "lock.json"
-        data = json.loads(lock_path.read_text())
+        data = orjson.loads(lock_path.read_text())
         entry = data["installed"]["trl-fine-tuning"]
         assert entry["source"] == "official"
         assert entry["identifier"] == "official/mlops/training/trl-fine-tuning"
@@ -802,7 +803,7 @@ class TestSyncSkills:
         assert not wrong.exists()
         assert (Path(result["backup_dir"]) / "mlops" / "trl-fine-tuning" / "SKILL.md").exists()
 
-        data = json.loads((skills_dir / ".hub" / "lock.json").read_text())
+        data = orjson.loads((skills_dir / ".hub" / "lock.json").read_text())
         assert data["installed"]["trl-fine-tuning"]["source"] == "official"
         assert data["installed"]["trl-fine-tuning"]["install_path"] == "mlops/training/trl-fine-tuning"
 

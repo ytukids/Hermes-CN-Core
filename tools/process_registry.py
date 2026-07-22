@@ -29,10 +29,10 @@ Usage:
     process_registry.kill(session.id)
 """
 
-import json
+import orjson
 import logging
 import os
-import platform
+from platform_utils import is_windows
 import shlex
 import signal
 import subprocess
@@ -40,9 +40,14 @@ import threading
 import time
 import uuid
 
-_IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
-from hermes_cli._subprocess_compat import windows_hide_flags
+_IS_WINDOWS = is_windows()
+from tools.environments.local import (
+    _build_powershell_background_script,
+    _find_shell,
+    _resolve_safe_cwd,
+    _resolve_shell,
+    _sanitize_subprocess_env,
+)
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -196,6 +201,15 @@ class ProcessRegistry:
         self._global_watch_window_hits: int = 0
         self._global_watch_tripped_until: float = 0.0
         self._global_watch_suppressed_during_trip: int = 0
+        # Live-output sink set by a driver (e.g. the desktop gateway): called from
+        # reader threads with (session, chunk) to stream output to a UI in
+        # real time, instead of polling the output tail.
+        self.on_output = None
+        # Close-view sink set by a driver (desktop gateway): called with
+        # (session_or_none, process_id) when the agent asks to close a read-only
+        # terminal tab. Distinct from kill — the process keeps running; only the
+        # UI view is dropped (the user can reopen it from the status stack).
+        self.on_close = None
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -204,6 +218,17 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    def _emit_output(self, session: ProcessSession, chunk: str) -> None:
+        """Forward a freshly-read chunk to the live-output sink, if one is set.
+        Called from reader threads; never raise into the read loop."""
+        sink = self.on_output
+        if sink is None or not chunk:
+            return
+        try:
+            sink(session, chunk)
+        except Exception:
+            pass
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -575,7 +600,7 @@ class ProcessRegistry:
                     capture_output=True,
                     text=True,
                     timeout=10,
-                    creationflags=windows_hide_flags(),
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     stdin=subprocess.DEVNULL,
                 )
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -659,6 +684,111 @@ class ProcessRegistry:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return "/tmp"
 
+    def _spawn_posix_local(
+        self,
+        session: ProcessSession,
+        command: str,
+        env_vars: dict,
+    ) -> subprocess.Popen:
+        """POSIX background spawn using the user's login shell."""
+        user_shell = _find_shell()
+        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        bg_env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            [user_shell, "-lic", f"set +m; {command}"],
+            text=True,
+            cwd=session.cwd,
+            env=bg_env,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return proc
+
+    def _spawn_windows_powershell_local(
+        self,
+        session: ProcessSession,
+        command: str,
+        shell_type: str,
+        shell_path: str,
+        env_vars: dict,
+        cwd_file: str | None = None,
+    ) -> subprocess.Popen:
+        """Windows non-PTY background spawn using PowerShell."""
+        ps_script = _build_powershell_background_script(
+            command=command,
+            cwd=session.cwd,
+            shell_type=shell_type,
+            cwd_file=cwd_file,
+        )
+        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        bg_env["PYTHONUNBUFFERED"] = "1"
+        _popen_kwargs = {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        }
+        proc = subprocess.Popen(
+            [
+                shell_path,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+            ],
+            text=True,
+            cwd=session.cwd,
+            env=bg_env,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            **_popen_kwargs,
+        )
+        return proc
+
+    def _spawn_windows_pty_local(
+        self,
+        session: ProcessSession,
+        command: str,
+        shell_type: str,
+        shell_path: str,
+        env_vars: dict,
+        cwd_file: str | None = None,
+    ):
+        """Windows PTY background spawn using PowerShell via winpty."""
+        from winpty import PtyProcess as _PtyProcessCls
+
+        ps_script = _build_powershell_background_script(
+            command=command,
+            cwd=session.cwd,
+            shell_type=shell_type,
+            cwd_file=cwd_file,
+        )
+        pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+        pty_env["PYTHONUNBUFFERED"] = "1"
+        pty_proc = _PtyProcessCls.spawn(
+            [
+                shell_path,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+            ],
+            cwd=session.cwd,
+            env=pty_env,
+            dimensions=(30, 120),
+        )
+        return pty_proc
+
     def spawn_local(
         self,
         command: str,
@@ -667,6 +797,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        cwd_file: str | None = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -677,6 +808,10 @@ class ProcessRegistry:
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
+            cwd_file: Optional path to write the final working directory to
+                      (PowerShell background path). When provided, the wrapper
+                      writes ``(Get-Location).Path`` to this file so subsequent
+                      foreground commands can pick up CWD changes.
         """
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
@@ -687,22 +822,36 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        if _IS_WINDOWS:
+            shell_type, shell_path = _resolve_shell()
+        else:
+            shell_type = shell_path = None
+
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
                 if _IS_WINDOWS:
-                    from winpty import PtyProcess as _PtyProcessCls
+                    pty_proc = self._spawn_windows_pty_local(
+                        session=session,
+                        command=command,
+                        shell_type=shell_type,
+                        shell_path=shell_path,
+                        env_vars=env_vars,
+                        cwd_file=cwd_file,
+                    )
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
-                user_shell = _find_shell()
-                pty_env = _sanitize_subprocess_env(os.environ, env_vars)
-                pty_env["PYTHONUNBUFFERED"] = "1"
-                pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
-                    cwd=session.cwd,
-                    env=pty_env,
-                    dimensions=(30, 120),
-                )
+
+                    user_shell = _find_shell()
+                    pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                    pty_env["PYTHONUNBUFFERED"] = "1"
+                    pty_proc = _PtyProcessCls.spawn(
+                        [user_shell, "-lic", f"set +m; {command}"],
+                        cwd=session.cwd,
+                        env=pty_env,
+                        dimensions=(30, 120),
+                    )
+
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
                 # Store the pty handle on the session for read/write
@@ -731,29 +880,21 @@ class ProcessRegistry:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
-        # Use the user's login shell for consistency with LocalEnvironment --
-        # ensures rc files are sourced and user tools are available.
-        user_shell = _find_shell()
-        # Force unbuffered output for Python scripts so progress is visible
-        # during background execution (libraries like tqdm/datasets buffer when
-        # stdout is a pipe, hiding output from process(action="poll")).
-        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
-        bg_env["PYTHONUNBUFFERED"] = "1"
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
-
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        if _IS_WINDOWS:
+            proc = self._spawn_windows_powershell_local(
+                session=session,
+                command=command,
+                shell_type=shell_type,
+                shell_path=shell_path,
+                env_vars=env_vars,
+                cwd_file=cwd_file,
+            )
+        else:
+            proc = self._spawn_posix_local(
+                session=session,
+                command=command,
+                env_vars=env_vars,
+            )
 
         session.process = proc
         session.pid = proc.pid
@@ -901,13 +1042,33 @@ class ProcessRegistry:
     # ----- Reader / Poller Threads -----
 
     def _reader_loop(self, session: ProcessSession):
-        """Background thread: read stdout from a local Popen process."""
+        """Background thread: read stdout from a local Popen process.
+
+        IMPORTANT: avoid ``TextIOWrapper.read(4096)`` here. On pipes that call can
+        block until EOF (or a large buffer fills), which makes "live" output land
+        in one burst at process exit. ``buffer.read1(4096)`` yields incremental
+        chunks as bytes become available, then we decode to text.
+        """
         first_chunk = True
         try:
+            stdout = session.process.stdout
+            if stdout is None:
+                return
+
+            raw_read = getattr(getattr(stdout, "buffer", None), "read1", None)
             while True:
-                chunk = session.process.stdout.read(4096)
-                if not chunk:
-                    break
+                if raw_read is not None:
+                    raw = raw_read(4096)
+                    if not raw:
+                        break
+                    chunk = raw.decode("utf-8", errors="replace")
+                else:
+                    # Fallback for mocked/alternate streams without a buffered raw
+                    # interface. This may be less "live", but keeps compatibility.
+                    chunk = stdout.read(4096)
+                    if not chunk:
+                        break
+
                 if first_chunk:
                     chunk = self._clean_shell_noise(chunk)
                     first_chunk = False
@@ -916,6 +1077,7 @@ class ProcessRegistry:
                     if len(session.output_buffer) > session.max_output_chars:
                         session.output_buffer = session.output_buffer[-session.max_output_chars:]
                 self._check_watch_patterns(session, chunk)
+                self._emit_output(session, chunk)
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
@@ -954,6 +1116,7 @@ class ProcessRegistry:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
                     if delta:
                         self._check_watch_patterns(session, delta)
+                        self._emit_output(session, delta)
 
                 # Check if process is still running
                 check = env.execute(
@@ -1002,6 +1165,7 @@ class ProcessRegistry:
                             if len(session.output_buffer) > session.max_output_chars:
                                 session.output_buffer = session.output_buffer[-session.max_output_chars:]
                         self._check_watch_patterns(session, text)
+                        self._emit_output(session, text)
                 except EOFError:
                     break
                 except Exception:
@@ -1105,14 +1269,33 @@ class ProcessRegistry:
         """
         return session_id in self._completion_consumed or session_id in self._poll_observed
 
-    def drain_notifications(self) -> "list[tuple[dict, str]]":
+    def drain_notifications(
+        self, session_key: str = "", owns_event=None,
+    ) -> "list[tuple[dict, str]]":
         """Pop all pending notification events and return formatted pairs.
 
         Returns a list of (raw_event, formatted_text) tuples.
         Skips completion events the agent already consumed via wait/log or
         observed inline via poll() (see ``_drain_should_skip``).
+
+        Async-delegation events carry a conversation payload, so draining one
+        into the wrong session is a cross-chat leak (#58684, #55578). Two
+        filter modes, strongest wins:
+
+        - ``owns_event(evt) -> bool``: positive-proof ownership callback.
+          When provided, an async-delegation event is consumed ONLY if the
+          callback returns True; everything else is re-queued for its owner.
+          The TUI passes its compression-chain-aware ownership check here so
+          a post-compression session still claims its own pre-compression
+          dispatches.
+        - ``session_key``: plain key equality (CLI and other single-session
+          callers). Non-matching async-delegation events are re-queued.
+
+        With neither set, all events are consumed (legacy single-session
+        behavior, backward compatible).
         """
-        results = []
+        results: "list[tuple[dict, str]]" = []
+        requeue: "list[dict]" = []
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
@@ -1121,9 +1304,28 @@ class ProcessRegistry:
             _evt_sid = evt.get("session_id", "")
             if evt.get("type") == "completion" and self._drain_should_skip(_evt_sid):
                 continue
+            # Filter async-delegation events so they are not delivered to the
+            # wrong session/thread (#58684). Positive-proof callback beats
+            # bare key equality when the caller can provide one.
+            if evt.get("type") == "async_delegation":
+                if owns_event is not None:
+                    try:
+                        owned = bool(owns_event(evt))
+                    except Exception:
+                        owned = False  # fail closed — never leak on a broken check
+                    if not owned:
+                        requeue.append(evt)
+                        continue
+                elif session_key:
+                    evt_session_key = evt.get("session_key", "") or ""
+                    if evt_session_key != session_key:
+                        requeue.append(evt)
+                        continue
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
+        for evt in requeue:
+            self.completion_queue.put(evt)
         return results
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
@@ -1390,24 +1592,10 @@ class ProcessRegistry:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
-                # Local process -- kill the process tree
-                try:
-                    if _IS_WINDOWS:
-                        session.process.terminate()
-                    else:
-                        import psutil
-                        try:
-                            parent = psutil.Process(session.process.pid)
-                            for child in parent.children(recursive=True):
-                                try:
-                                    child.terminate()
-                                except psutil.NoSuchProcess:
-                                    pass
-                            parent.terminate()
-                        except psutil.NoSuchProcess:
-                            pass
-                except (ProcessLookupError, PermissionError):
-                    session.process.kill()
+                # Local process -- kill the process tree. On Windows this
+                # must be taskkill /T /F; Popen.terminate() only kills the
+                # shell wrapper and leaves Git Bash descendants behind.
+                self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
@@ -1482,6 +1670,37 @@ class ProcessRegistry:
     def submit_stdin(self, session_id: str, data: str = "") -> dict:
         """Send data + newline to a running process's stdin (like pressing Enter)."""
         return self.write_stdin(session_id, data + "\n")
+
+    def request_close_terminal(self, session_id: str) -> dict:
+        """Ask the desktop GUI to close the read-only terminal tab mirroring this
+        background process.
+
+        This does NOT kill the process — it only drops the view. Output keeps
+        streaming into the (capped) buffer and the user can reopen the tab from
+        the status stack. Desktop-only: returns an error if no UI close sink is
+        wired (e.g. CLI / messaging)."""
+        sink = self.on_close
+        if sink is None:
+            return {
+                "status": "error",
+                "error": "close_terminal is only available in the Hermes desktop app.",
+            }
+        # The session may already be finished (or pruned) — the tab can still
+        # linger and be closed, so a missing session is not an error here.
+        session = self.get(session_id)
+        try:
+            sink(session, session_id)
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+        return {
+            "status": "ok",
+            "closed": session_id,
+            "note": (
+                "Closed the read-only terminal tab. The process was not killed; "
+                "its output remains available and the user can reopen the tab "
+                "from the status stack."
+            ),
+        }
 
     def close_stdin(self, session_id: str) -> dict:
         """Close a running process's stdin / send EOF without killing the process."""
@@ -1740,7 +1959,7 @@ class ProcessRegistry:
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = orjson.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
@@ -2125,28 +2344,25 @@ def _handle_process(args, **kw):
             session_key = get_current_session_key(default="") or ""
         except Exception:
             session_key = ""
-        return json.dumps(
-            {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
-            ensure_ascii=False,
-        )
+        return orjson.dumps({"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)}).decode('utf-8')
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
-            return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
+            return orjson.dumps(_redact_process_result(process_registry.poll(session_id))).decode('utf-8')
         elif action == "log":
-            return json.dumps(_redact_process_result(process_registry.read_log(
-                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
+            return orjson.dumps(_redact_process_result(process_registry.read_log(
+                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200)))).decode('utf-8')
         elif action == "wait":
-            return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
+            return orjson.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout")))).decode('utf-8')
         elif action == "kill":
-            return json.dumps(process_registry.kill_process(session_id), ensure_ascii=False)
+            return orjson.dumps(process_registry.kill_process(session_id)).decode('utf-8')
         elif action == "write":
-            return json.dumps(process_registry.write_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
+            return orjson.dumps(process_registry.write_stdin(session_id, str(args.get("data", "")))).decode('utf-8')
         elif action == "submit":
-            return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
+            return orjson.dumps(process_registry.submit_stdin(session_id, str(args.get("data", "")))).decode('utf-8')
         elif action == "close":
-            return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
+            return orjson.dumps(process_registry.close_stdin(session_id)).decode('utf-8')
     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
 
 

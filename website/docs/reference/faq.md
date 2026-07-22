@@ -146,7 +146,7 @@ The installer adds `~/.local/bin` to your PATH. If you use a non-standard shell 
 
 #### Python version too old
 
-**Cause:** Hermes requires Python 3.11 or newer.
+**Cause:** Hermes requires Python 3.14 or newer.
 
 **Solution:**
 ```bash
@@ -645,6 +645,10 @@ For one-off model switches without delegation, use `/model` in the CLI:
 # ... write your content ...
 /model openai/gpt-5.4                   # switch back
 ```
+
+:::warning
+Each `/model` switch resets the prompt cache — the cache key includes the model, so the first message after every switch re-reads the whole conversation at full input price. On long sessions, prefer delegation (subagents get their own fresh context) or a new session over repeated back-and-forth switching.
+:::
 
 See [Subagent Delegation](../user-guide/features/delegation.md) for more on how delegation works.
 

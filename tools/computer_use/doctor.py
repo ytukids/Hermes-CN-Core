@@ -15,7 +15,7 @@ Exit code conventions:
 
 from __future__ import annotations
 
-import json
+import orjson
 import os
 import shutil
 import subprocess
@@ -50,6 +50,23 @@ def _cua_child_env() -> Dict[str, str]:
         return cua_driver_child_env()
     except Exception:
         return dict(os.environ)
+
+
+def _sanitized_cua_env() -> Dict[str, str]:
+    """Telemetry-policy env with Hermes provider secrets stripped.
+
+    cua-driver is a third-party binary — it must never inherit provider
+    API keys (#53503/#55709/#58889 lineage). Falls back to the unsanitized
+    telemetry env if the sanitizer can't be imported, so doctor keeps
+    working in stripped-down environments.
+    """
+    env = _cua_child_env()
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
+
+        return _sanitize_subprocess_env(env)
+    except Exception:
+        return env
 
 
 def _drive_health_report(
@@ -87,14 +104,14 @@ def _drive_health_report(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
-        env=_cua_child_env(),
+        env=_sanitized_cua_env(),
     )
     try:
         # 1. initialize
-        proc.stdin.write(json.dumps({
+        proc.stdin.write(orjson.dumps({
             "jsonrpc": "2.0", "id": 1,
             "method": "initialize", "params": {},
-        }) + "\n")
+        }).decode('utf-8') + "\n")
         proc.stdin.flush()
         init_line = proc.stdout.readline()
         if not init_line:
@@ -105,11 +122,11 @@ def _drive_health_report(
             )
 
         # 2. tools/call health_report
-        proc.stdin.write(json.dumps({
+        proc.stdin.write(orjson.dumps({
             "jsonrpc": "2.0", "id": 2,
             "method": "tools/call",
             "params": {"name": "health_report", "arguments": args},
-        }) + "\n")
+        }).decode('utf-8') + "\n")
         proc.stdin.flush()
         call_line = proc.stdout.readline()
         if not call_line:
@@ -126,7 +143,7 @@ def _drive_health_report(
             proc.wait()
 
     try:
-        resp = json.loads(call_line)
+        resp = orjson.loads(call_line)
     except (ValueError, TypeError) as e:
         raise RuntimeError(f"health_report response was not valid JSON: {e}\nraw: {call_line[:200]}")
 
@@ -147,7 +164,7 @@ def _drive_health_report(
             text = item.get("text", "")
             try:
                 # Many health_report payloads ship JSON in the text item too.
-                parsed = json.loads(text)
+                parsed = orjson.loads(text)
                 if isinstance(parsed, dict) and "schema_version" in parsed:
                     return parsed
             except (ValueError, TypeError):
@@ -208,7 +225,7 @@ def _print_text_report(report: Dict[str, Any], color: bool) -> None:
         data = check.get("data")
         if isinstance(data, dict) and data:
             for key, value in data.items():
-                rendered = value if not isinstance(value, (dict, list)) else json.dumps(value)
+                rendered = value if not isinstance(value, (dict, list)) else orjson.dumps(value).decode('utf-8')
                 print(f"      {col_dim}{key}={rendered}{col_reset}")
     _ = schema  # acknowledge field for forward-compat readers
 
@@ -258,7 +275,7 @@ def run_doctor(
         return 2
 
     if json_output:
-        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write(orjson.dumps(report, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode('utf-8'))
         sys.stdout.write("\n")
     else:
         if color is None:

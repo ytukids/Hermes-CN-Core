@@ -69,7 +69,7 @@ Each dep has a `shutil.which(...)`-style check; if a binary is missing and the r
 Top-to-bottom, in order:
 
 1. **Bootstraps `uv`** — Astral's fast Python manager. Installed to `%USERPROFILE%\.local\bin`.
-2. **Installs Python 3.11** via `uv`. No existing Python needed.
+2. **Installs Python 3.14** via `uv`. No existing Python needed.
 3. **Installs Node.js 22** (winget if available, else a portable Node tarball unpacked under `%LOCALAPPDATA%\hermes\node`). Used for the browser tool and the WhatsApp bridge.
 4. **Installs portable Git** — if `git` is already on PATH the installer uses it; otherwise it downloads a trimmed, self-contained **PortableGit** (~45 MB, from the official `git-for-windows` release) to `%LOCALAPPDATA%\hermes\git`. No admin, no Windows installer registry, no interference with anything else on the box.
 5. **Clones the repo** to `%LOCALAPPDATA%\hermes\hermes-agent` and creates a virtualenv inside it.
@@ -103,11 +103,11 @@ The dashboard's `/chat` tab embeds a real terminal via a POSIX PTY (`ptyprocess`
 
 ## How Hermes runs shell commands on Windows
 
-Hermes's terminal tool runs commands through **Windows PowerShell 5.1** (`powershell.exe`), which ships with every Windows 10 and Windows 11 system — no extra install, no download, no Git Bash needed.
+Hermes's terminal tool runs commands through **PowerShell 7 (pwsh)** when available, falling back to **Windows PowerShell 5.1** (`powershell.exe`) — both ship with or are easily installed on every Windows 10 and Windows 11 system. When pwsh is detected, all modern PowerShell syntax (ternary `?:`, null-coalescing `??`, pipeline chains `&&`/`||`, null-conditional `?.`/`?[`) is supported natively without any compatibility layer.
 
-PowerShell 5.1 starts faster than Git Bash, handles Windows paths natively (no `/c/foo` translation), and avoids the entire POSIX-translation overhead. The agent is instructed to use PowerShell syntax (`Get-ChildItem`, `$env:VAR`, `Select-String`, `Get-Content`). If it accidentally uses PowerShell 7+ syntax (`?:`, `??`, `&&`, `||`, `?.`, `?[`), the `pwsh_transform` compatibility layer automatically down-levels it to 5.1-compatible `if/else` blocks.
+If pwsh is not installed, Hermes automatically falls back to Windows PowerShell 5.1 (`powershell.exe`), which ships with every Windows system — no extra install, no download, no Git Bash needed.
 
-Set `HERMES_SHELL_TYPE=powershell` (or leave at the default `auto`) in your `.env` to use PowerShell. `HERMES_SHELL_TYPE=bash` is not supported on Windows.
+Set `HERMES_SHELL_TYPE=pwsh` (to prefer PowerShell 7), `powershell` (to force Windows PowerShell 5.1), or `bash` (to use pre-installed Git Bash — requires Git for Windows from https://git-scm.com/download/win), or leave at the default `auto` in your `.env`.
 
 ## UTF-8 console on Windows
 

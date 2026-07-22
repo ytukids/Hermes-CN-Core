@@ -5,7 +5,7 @@ uses random identity. Camofox automatically maps each userId to a
 dedicated persistent Firefox profile on the server side.
 """
 
-import json
+import orjson
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -151,7 +151,7 @@ class TestManagedPersistenceMode:
 
         requests_seen = []
 
-        def _capture_post(url, json=None, timeout=None):
+        def _capture_post(url, json=None, timeout=None, headers=None):
             requests_seen.append(json)
             return _mock_response(
                 json_data={"tabId": "tab-1", "url": "https://example.com"}
@@ -159,7 +159,7 @@ class TestManagedPersistenceMode:
 
         with _enable_persistence(), \
              patch("tools.browser_camofox.requests.post", side_effect=_capture_post):
-            result = json.loads(camofox_navigate("https://example.com", task_id="task-1"))
+            result = orjson.loads(camofox_navigate("https://example.com", task_id="task-1"))
 
         assert result["success"] is True
         expected = get_camofox_identity("task-1")
@@ -171,7 +171,7 @@ class TestManagedPersistenceMode:
 
         requests_seen = []
 
-        def _capture_post(url, json=None, timeout=None):
+        def _capture_post(url, json=None, timeout=None, headers=None):
             requests_seen.append(json)
             return _mock_response(
                 json_data={"tabId": f"tab-{len(requests_seen)}", "url": "https://example.com"}
@@ -182,9 +182,9 @@ class TestManagedPersistenceMode:
             patch("tools.browser_camofox.requests.post", side_effect=_capture_post),
             patch("tools.browser_camofox.requests.delete", return_value=_mock_response()),
         ):
-            first = json.loads(camofox_navigate("https://example.com", task_id="task-1"))
+            first = orjson.loads(camofox_navigate("https://example.com", task_id="task-1"))
             camofox_close("task-1")
-            second = json.loads(camofox_navigate("https://example.com", task_id="task-1"))
+            second = orjson.loads(camofox_navigate("https://example.com", task_id="task-1"))
 
         assert first["success"] is True
         assert second["success"] is True
@@ -348,7 +348,7 @@ class TestVncUrlDiscovery:
         with patch("tools.browser_camofox.requests.post", return_value=_mock_response(
             json_data={"tabId": "t1", "url": "https://example.com"}
         )):
-            result = json.loads(camofox_navigate("https://example.com", task_id="vnc-test"))
+            result = orjson.loads(camofox_navigate("https://example.com", task_id="vnc-test"))
 
         assert result["vnc_url"] == "http://localhost:6080"
         assert "vnc_hint" in result

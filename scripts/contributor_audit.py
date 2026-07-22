@@ -16,8 +16,8 @@ Usage:
 """
 
 import argparse
-import json
-import re
+import orjson
+from agent.re_compat import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -41,12 +41,15 @@ IGNORED_PATTERNS = [
     re.compile(r"^Copilot$", re.IGNORECASE),
     re.compile(r"^Cursor(\s+Agent)?$", re.IGNORECASE),
     re.compile(r"^Codex$", re.IGNORECASE),
+    re.compile(r"^OpenAI Codex$", re.IGNORECASE),
+    re.compile(r"^CommandCode", re.IGNORECASE),
     re.compile(r"^github-advanced-security(\[bot\])?$", re.IGNORECASE),
     re.compile(r"^GitHub\s*Actions?$", re.IGNORECASE),
     re.compile(r"^github-actions(\[bot\])?$", re.IGNORECASE),
     re.compile(r"^dependabot", re.IGNORECASE),
     re.compile(r"^renovate", re.IGNORECASE),
     re.compile(r"^Hermes\s+(Agent|Audit)$", re.IGNORECASE),
+    re.compile(r"^nousbot(-eng)?$", re.IGNORECASE),
     re.compile(r"^Ubuntu$", re.IGNORECASE),
 ]
 
@@ -57,8 +60,11 @@ IGNORED_EMAILS = {
     "cursoragent@cursor.com",
     "hermes@nousresearch.com",
     "hermes-audit@example.com",
+    "nousbot@nousresearch.com",
     "hermes@habibilabs.dev",
     "omx@oh-my-codex.dev",
+    "codex@openai.com",
+    "noreply@commandcode.ai",
 }
 
 
@@ -112,14 +118,14 @@ def gh_pr_list():
         if result.returncode != 0:
             print(f"  [warn] gh pr list failed: {result.stderr.strip()}", file=sys.stderr)
             return []
-        return json.loads(result.stdout)
+        return orjson.loads(result.stdout)
     except FileNotFoundError:
         print("  [warn] 'gh' CLI not found — skipping salvaged PR scan.", file=sys.stderr)
         return []
     except subprocess.TimeoutExpired:
         print("  [warn] gh pr list timed out — skipping salvaged PR scan.", file=sys.stderr)
         return []
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         print("  [warn] gh pr list returned invalid JSON — skipping salvaged PR scan.", file=sys.stderr)
         return []
 
@@ -407,10 +413,10 @@ def main():
     if all_unknowns:
         print()
         print(f"=== Unknown Emails ({len(all_unknowns)}) ===")
-        print("These emails are not in AUTHOR_MAP and should be added:")
+        print("These emails have no mapping and should be added via:")
         print()
         for email, name in sorted(all_unknowns.items()):
-            print(f'  "{email}": "{name}",')
+            print(f"  python3 scripts/add_contributor.py {email} <github-username>  # {name}")
 
     # ---- Strict mode: fail CI if new unmapped emails are introduced ----
     if args.strict and all_unknowns:
@@ -435,10 +441,10 @@ def main():
         if new_unknowns:
             print()
             print(f"=== STRICT MODE FAILURE: {len(new_unknowns)} new unmapped email(s) ===")
-            print("Add these to AUTHOR_MAP in scripts/release.py before merging:")
+            print("Add mapping files before merging (do NOT edit AUTHOR_MAP):")
             print()
             for email, name in sorted(new_unknowns.items()):
-                print(f'    "{email}": "<github-username>",')
+                print(f"    python3 scripts/add_contributor.py {email} <github-username>  # {name}")
             print()
             print("To find the GitHub username:")
             print("  gh api 'search/users?q=EMAIL+in:email' --jq '.items[0].login'")

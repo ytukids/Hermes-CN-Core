@@ -10,8 +10,8 @@ All logic lives in shared do_* functions. The CLI entry point and slash command
 handler are thin wrappers that parse args and delegate.
 """
 
-import json
-import re
+import orjson
+from agent.re_compat import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -289,7 +289,7 @@ def do_search(query: str, source: str = "all", limit: int = 10,
             }
             for r in results
         ]
-        print(json.dumps(payload, indent=2))
+        print(orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode('utf-8'))
         return
 
     c.print(f"\n[bold]Searching for:[/] {query}")
@@ -516,7 +516,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         GitHubAuth, create_source_router, ensure_hub_dirs,
         quarantine_bundle, install_from_quarantine, HubLockFile,
     )
-    from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
+    from tools.skills_guard import scan_skill_cached, should_allow_install, format_scan_report
 
     c = console or _console
     ensure_hub_dirs()
@@ -648,8 +648,24 @@ def do_install(identifier: str, category: str = "", force: bool = False,
             or getattr(meta, "identifier", "")
             or identifier
         )
-    result = scan_skill(q_path, source=scan_source)
+    from tools.skills_hub import HUB_DIR, source_url_for_bundle
+    result, scan_provenance = scan_skill_cached(
+        q_path,
+        source=scan_source,
+        source_url=source_url_for_bundle(bundle),
+        cache_dir=HUB_DIR / "scan-cache",
+    )
     c.print(format_scan_report(result))
+    freshness = "fresh" if scan_provenance["fresh"] else "cached"
+    c.print(
+        f"[dim]Scan provenance: {freshness}; scanner "
+        f"{scan_provenance['scanner_version']}; hash {scan_provenance['bundle_hash']}[/]"
+    )
+    rules = ", ".join(scan_provenance["rules"]) or "none"
+    c.print(
+        f"[dim]Source: {scan_provenance['source_url']}; scanned "
+        f"{scan_provenance['scanned_at']}; rules: {rules}[/]"
+    )
 
     # Check install policy
     allowed, reason = should_allow_install(result, force=force)
@@ -1182,9 +1198,9 @@ def do_list_modified(console: Optional[Console] = None,
     modified = list_user_modified_bundled_skills()
 
     if as_json:
-        import json
+        import orjson
 
-        c.print(json.dumps([m["name"] for m in modified]))
+        c.print(orjson.dumps([m["name"] for m in modified]).decode('utf-8'))
         return
 
     if not modified:
@@ -1445,9 +1461,10 @@ def do_publish(skill_path: str, target: str = "github", repo: str = "",
     # Validate the skill
     import yaml
     skill_md = (path / "SKILL.md").read_text(encoding="utf-8")
+    skill_md = skill_md.lstrip("\ufeff")  # tolerate UTF-8 BOM (Windows editors)
     fm = {}
     if skill_md.startswith("---"):
-        import re
+        from agent.re_compat import re
         match = re.search(r'\n---\s*\n', skill_md[3:])
         if match:
             try:
@@ -1556,7 +1573,7 @@ def _github_publish(skill_path: Path, skill_name: str, target_repo: str,
         rel = str(f.relative_to(skill_path))
         upload_path = f"skills/{skill_name}/{rel}"
         try:
-            import base64
+            import pybase64 as base64
             content_b64 = base64.b64encode(f.read_bytes()).decode()
             httpx.put(
                 f"https://api.github.com/repos/{fork_repo}/contents/{upload_path}",
@@ -1621,7 +1638,7 @@ def do_snapshot_export(output_path: str, console: Optional[Console] = None) -> N
         "taps": tap_list,
     }
 
-    payload = json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n"
+    payload = orjson.dumps(snapshot, option=orjson.OPT_INDENT_2).decode('utf-8') + "\n"
     if output_path == "-":
         import sys
         sys.stdout.write(payload)
@@ -1644,8 +1661,8 @@ def do_snapshot_import(input_path: str, force: bool = False,
         return
 
     try:
-        snapshot = json.loads(inp.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        snapshot = orjson.loads(inp.read_text(encoding="utf-8"))
+    except orjson.JSONDecodeError:
         c.print(f"[bold red]Error:[/] Invalid JSON in {inp}\n")
         return
 

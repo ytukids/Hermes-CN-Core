@@ -294,7 +294,7 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 /config              Show config (CLI)
 /model [name]        Show or change model
 /personality [name]  Set personality
-/reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|show|hide)
+/reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|max|ultra|show|hide)
 /verbose             Cycle: off → new → all → verbose
 /voice [on|off|tts]  Voice mode
 /yolo                Toggle approval bypass
@@ -552,10 +552,10 @@ hermes config set privacy.redact_pii false   # disable (default)
 
 ### Command approval prompts
 
-By default (`approvals.mode: manual`), Hermes prompts the user before running shell commands flagged as destructive (`rm -rf`, `git reset --hard`, etc.). The modes are:
+By default (`approvals.mode: smart`), Hermes asks an auxiliary LLM to assess shell commands flagged as destructive (`rm -rf`, `git reset --hard`, etc.). The modes are:
 
-- `manual` — always prompt (default)
-- `smart` — use an auxiliary LLM to auto-approve low-risk commands, prompt on high-risk
+- `smart` — auto-approve a low-risk command once, deny high-risk commands, and prompt when uncertain (default)
+- `manual` — always prompt
 - `off` — skip all approval prompts (equivalent to `--yolo`)
 
 ```bash
@@ -706,7 +706,7 @@ here; full developer notes live in `AGENTS.md`, user-facing docs under
 
 Spawn a subagent with an isolated context + terminal session.
 
-- **Single:** `delegate_task(goal, context, toolsets)`.
+- **Single:** `delegate_task(goal, context)`.
 - **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
   parallel, capped by `delegation.max_concurrent_children` (default 3).
 - **Background:** `delegate_task(background=true)` returns a handle
@@ -834,8 +834,7 @@ Beyond the CLI and gateway, a few things worth knowing about:
 
 ## Windows-Specific Quirks
 
-Hermes runs natively on Windows (PowerShell, cmd, Windows Terminal, git-bash
-mintty, VS Code integrated terminal). Most of it just works, but a handful
+Hermes runs natively on Windows. The default shell for running commands is **PowerShell** (pwsh 7.x preferred, with automatic fallback to Windows PowerShell 5.1). Git Bash (git-bash mintty) is available as an optional shell when explicitly configured (`terminal.shell: bash` in config.yaml) with a pre-installed Git for Windows. Most of it just works, but a handful
 of differences between Win32 and POSIX have bitten us — document new ones
 here as you hit them so the next person (or the next session) doesn't
 rediscover them from scratch.

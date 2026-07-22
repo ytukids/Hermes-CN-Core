@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import orjson
 import os
 import time
 from pathlib import Path
@@ -109,7 +109,7 @@ class TestFetchSuccess:
         cache_file = model_catalog._cache_path()
         assert cache_file.exists()
         with open(cache_file) as fh:
-            assert json.load(fh) == manifest
+            assert orjson.loads(fh.read()) == manifest
 
     def test_second_call_uses_in_process_cache(self, isolated_home):
         from hermes_cli import model_catalog
@@ -136,7 +136,8 @@ class TestFetchFailure:
     def test_network_failure_returns_empty_when_no_cache(self, isolated_home):
         from hermes_cli import model_catalog
         with patch.object(model_catalog, "_fetch_manifest", return_value=None):
-            result = model_catalog.get_catalog(force_refresh=True)
+            with patch.object(model_catalog, "_seed_cache_from_bundled", return_value=False):
+                result = model_catalog.get_catalog(force_refresh=True)
         assert result == {}
 
     def test_network_failure_falls_back_to_disk_cache(self, isolated_home):
@@ -160,7 +161,7 @@ class TestFetchFailure:
         cache = model_catalog._cache_path()
         cache.parent.mkdir(parents=True, exist_ok=True)
         with open(cache, "w") as fh:
-            json.dump(manifest, fh)
+            fh.write(orjson.dumps(manifest).decode('utf-8'))
         old = time.time() - 30 * 24 * 3600  # 30 days ago
         import os as _os
         _os.utime(cache, (old, old))
@@ -199,7 +200,8 @@ class TestCatalogUrl:
         from hermes_cli import model_catalog
 
         with patch.object(model_catalog, "_fetch_manifest", return_value=None) as fetch:
-            result = model_catalog.get_catalog(force_refresh=True)
+            with patch.object(model_catalog, "_seed_cache_from_bundled", return_value=False):
+                result = model_catalog.get_catalog(force_refresh=True)
 
         assert result == {}
         assert fetch.call_count == 1
@@ -229,12 +231,76 @@ class TestCuratedAccessors:
     def test_openrouter_returns_none_when_catalog_empty(self, isolated_home):
         from hermes_cli import model_catalog
         with patch.object(model_catalog, "_fetch_manifest", return_value=None):
-            assert model_catalog.get_curated_openrouter_models() is None
+            with patch.object(model_catalog, "_seed_cache_from_bundled", return_value=False):
+                assert model_catalog.get_curated_openrouter_models() is None
 
     def test_nous_returns_none_when_catalog_empty(self, isolated_home):
         from hermes_cli import model_catalog
         with patch.object(model_catalog, "_fetch_manifest", return_value=None):
-            assert model_catalog.get_curated_nous_models() is None
+            with patch.object(model_catalog, "_seed_cache_from_bundled", return_value=False):
+                assert model_catalog.get_curated_nous_models() is None
+
+
+class TestDefaultModelFromCache:
+    """get_default_model_from_cache reads the '"default": true' label without
+    ever hitting the network."""
+
+    def _manifest_with_default(self) -> dict:
+        m = _valid_manifest()
+        m["providers"]["openrouter"]["models"][1]["default"] = True  # gpt-5.4
+        m["providers"]["nous"]["models"][1]["default"] = True  # kimi-k2.6
+        return m
+
+    def test_reads_label_from_disk_cache(self, isolated_home):
+        from hermes_cli import model_catalog
+        cache = isolated_home / "cache"
+        cache.mkdir()
+        (cache / "model_catalog.json").write_text(
+            json.dumps(self._manifest_with_default())
+        )
+        with patch.object(model_catalog, "_fetch_manifest") as fetch:
+            assert (
+                model_catalog.get_default_model_from_cache("openrouter")
+                == "openai/gpt-5.4"
+            )
+            assert (
+                model_catalog.get_default_model_from_cache("nous")
+                == "moonshotai/kimi-k2.6"
+            )
+            fetch.assert_not_called()
+
+    def test_no_label_returns_none(self, isolated_home):
+        from hermes_cli import model_catalog
+        cache = isolated_home / "cache"
+        cache.mkdir()
+        (cache / "model_catalog.json").write_text(json.dumps(_valid_manifest()))
+        with patch.object(model_catalog, "_fetch_manifest") as fetch:
+            assert model_catalog.get_default_model_from_cache("openrouter") is None
+            fetch.assert_not_called()
+
+    def test_no_cache_returns_none_without_network(self, isolated_home):
+        from hermes_cli import model_catalog
+        with patch.object(model_catalog, "_fetch_manifest") as fetch:
+            assert model_catalog.get_default_model_from_cache("openrouter") is None
+            fetch.assert_not_called()
+
+    def test_shipped_manifest_labels_glm52_default(self, isolated_home):
+        """Contract with the in-repo manifest: both provider blocks label the
+        same default entry the code constant points at."""
+        import hermes_cli.model_catalog as model_catalog
+        from hermes_cli.models import PREFERRED_SILENT_DEFAULT_MODEL
+
+        repo_root = Path(model_catalog.__file__).resolve().parent.parent
+        manifest = json.loads(
+            (repo_root / "website" / "static" / "api" / "model-catalog.json").read_text()
+        )
+        for provider in ("openrouter", "nous"):
+            block = manifest["providers"][provider]
+            labeled = [m["id"] for m in block["models"] if m.get("default")]
+            assert labeled == [PREFERRED_SILENT_DEFAULT_MODEL], (
+                f"{provider}: exactly one entry must be labeled default and it "
+                f"must match PREFERRED_SILENT_DEFAULT_MODEL"
+            )
 
 
 class TestDisabled:
@@ -302,7 +368,8 @@ class TestIntegrationWithModelsModule:
         from hermes_cli.models import get_curated_nous_model_ids, _PROVIDER_MODELS
 
         with patch.object(model_catalog, "_fetch_manifest", return_value=None):
-            result = get_curated_nous_model_ids()
+            with patch.object(model_catalog, "_seed_cache_from_bundled", return_value=False):
+                result = get_curated_nous_model_ids()
 
         assert result == list(_PROVIDER_MODELS["nous"])
 
@@ -339,12 +406,10 @@ class TestIntegrationWithModelsModule:
 
             active_home = Path(os.environ["HERMES_HOME"])
             (active_home / "auth.json").write_text(
-                json.dumps(
-                    {
+                orjson.dumps({
                         "providers": {"nous": {"access_token": "fake"}},
                         "credential_pool": {},
-                    }
-                )
+                    }).decode('utf-8')
             )
 
             # Stub the Portal recommendation union so the row is deterministic
@@ -391,12 +456,10 @@ class TestIntegrationWithModelsModule:
 
             active_home = Path(os.environ["HERMES_HOME"])
             (active_home / "auth.json").write_text(
-                json.dumps(
-                    {
+                orjson.dumps({
                         "providers": {"nous": {"access_token": "fake"}},
                         "credential_pool": {},
-                    }
-                )
+                    }).decode('utf-8')
             )
             with patch.object(
                 model_catalog, "_fetch_manifest", return_value=_valid_manifest()
@@ -483,7 +546,7 @@ class TestManifestMatchesInRepoLists:
         expected = mod.build_catalog()
 
         with open(manifest_path, encoding="utf-8") as fh:
-            actual = json.load(fh)
+            actual = orjson.loads(fh.read())
 
         assert self._strip_volatile(actual) == self._strip_volatile(expected), (
             "website/static/api/model-catalog.json is out of sync with "

@@ -10,7 +10,7 @@ Three layers of tests:
 
 import asyncio
 import inspect
-import json
+import orjson
 import os
 import sqlite3
 import time
@@ -117,7 +117,7 @@ def sample_sessions():
 
 @pytest.fixture
 def populated_sessions_dir(sessions_dir, sample_sessions):
-    (sessions_dir / "sessions.json").write_text(json.dumps(sample_sessions))
+    (sessions_dir / "sessions.json").write_text(orjson.dumps(sample_sessions).decode('utf-8'))
     return sessions_dir
 
 
@@ -156,12 +156,12 @@ def _create_test_db(db_path, session_id, messages):
     for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, (list, dict)):
-            content = json.dumps(content)
+            content = orjson.dumps(content).decode('utf-8')
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp, tool_calls) VALUES (?, ?, ?, ?, ?)",
             (session_id, msg["role"], content,
              msg.get("timestamp", "2026-03-29T12:00:00"),
-             json.dumps(msg["tool_calls"]) if msg.get("tool_calls") else None),
+             orjson.dumps(msg["tool_calls"]).decode('utf-8') if msg.get("tool_calls") else None),
         )
     conn.commit()
     conn.close()
@@ -200,7 +200,7 @@ def mock_session_db(tmp_path, populated_sessions_dir):
             for r in rows:
                 d = dict(r)
                 if d.get("tool_calls"):
-                    d["tool_calls"] = json.loads(d["tool_calls"])
+                    d["tool_calls"] = orjson.loads(d["tool_calls"])
                 result.append(d)
             return result
 
@@ -514,7 +514,7 @@ def _run_tool(server, name, args=None):
     result = asyncio.get_event_loop().run_until_complete(
         server._tool_manager.call_tool(name, args or {})
     )
-    return json.loads(result) if isinstance(result, str) else result
+    return orjson.loads(result) if isinstance(result, str) else result
 
 
 @pytest.fixture
@@ -798,7 +798,7 @@ class TestE2EMessagesSend:
 
     def test_send_delegates_to_tool(self, mcp_server_e2e, _event_loop, monkeypatch):
         server, _ = mcp_server_e2e
-        mock = MagicMock(return_value=json.dumps({"success": True, "platform": "telegram"}))
+        mock = MagicMock(return_value=orjson.dumps({"success": True, "platform": "telegram"}).decode('utf-8'))
         monkeypatch.setattr("tools.send_message_tool.send_message_tool", mock)
 
         result = _run_tool(server, "messages_send",
@@ -1033,7 +1033,7 @@ class TestEdgeCases:
             "platform": "telegram",
             "updated_at": "2026-03-29T12:00:00",
         }}
-        (sessions_dir / "sessions.json").write_text(json.dumps(data))
+        (sessions_dir / "sessions.json").write_text(orjson.dumps(data).decode('utf-8'))
         import mcp_serve
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
         entries = mcp_serve._load_sessions_index()
@@ -1080,7 +1080,7 @@ class TestEventBridgePollE2E:
                 "origin": {"platform": "telegram", "chat_id": "poll_test"},
             }
         }
-        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+        (sessions_dir / "sessions.json").write_text(orjson.dumps(sessions_data).decode('utf-8'))
 
         # Write messages to SQLite
         messages = [
@@ -1135,7 +1135,7 @@ class TestEventBridgePollE2E:
                 "origin": {"platform": "telegram", "chat_id": "skip"},
             }
         }
-        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+        (sessions_dir / "sessions.json").write_text(orjson.dumps(sessions_data).decode('utf-8'))
         _create_test_db(db_path, session_id, [
             {"role": "user", "content": "Hello", "timestamp": "2026-03-29T15:00:01"},
         ])
@@ -1187,7 +1187,7 @@ class TestEventBridgePollE2E:
                 "origin": {"platform": "telegram", "chat_id": "new"},
             }
         }
-        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+        (sessions_dir / "sessions.json").write_text(orjson.dumps(sessions_data).decode('utf-8'))
         _create_test_db(db_path, session_id, [
             {"role": "user", "content": "First", "timestamp": "2026-03-29T15:00:01"},
         ])
@@ -1224,13 +1224,76 @@ class TestEventBridgePollE2E:
 
         # Update sessions.json updated_at to trigger re-check
         sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
-        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+        (sessions_dir / "sessions.json").write_text(orjson.dumps(sessions_data).decode('utf-8'))
 
         # Second poll — should detect the new message
         bridge._poll_once(db)
         r2 = bridge.poll_events(after_cursor=r1["next_cursor"])
         assert len(r2["events"]) == 1
         assert r2["events"][0]["content"] == "New reply!"
+
+    def test_poll_picks_up_new_conversation_on_db_change(
+        self, tmp_path, monkeypatch
+    ):
+        """A brand-new conversation must be picked up on the tick where
+        state.db changes.
+
+        Since #9006 the routing index lives IN state.db (session rows carry
+        session_key/origin metadata), so a new conversation's registration and
+        its first message land in the same file — a single mtime check covers
+        both and the old dual-file (sessions.json + state.db) race (#8925) is
+        structurally impossible. This test asserts the index is refreshed on a
+        db-mtime bump, so a conversation the bridge has never seen before is
+        emitted on the same tick.
+        """
+        import mcp_serve
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+
+        # _poll_once reads <HERMES_HOME>/state.db for its mtime gate; the autouse
+        # fixture points HERMES_HOME at tmp_path.
+        db_path = tmp_path / "state.db"
+        db_path.write_text("placeholder")
+
+        session_id = "20260329_150000_late_register"
+        # The routing index now comes from _load_sessions_index() (state.db
+        # primary, sessions.json fallback). Stub it to return the new
+        # conversation, simulating the gateway having just written the
+        # session row + first message in one state.db transaction.
+        monkeypatch.setattr(
+            mcp_serve, "_load_sessions_index",
+            lambda: {
+                "agent:main:telegram:dm:late": {
+                    "session_id": session_id,
+                    "platform": "telegram",
+                    "origin": {"platform": "telegram", "chat_id": "late"},
+                }
+            },
+        )
+
+        class DB:
+            def get_messages(self, sid):
+                return [{
+                    "id": 1, "role": "user",
+                    "content": "Hello from a freshly-registered conversation",
+                    "timestamp": "2026-03-29T15:00:00",
+                }]
+
+        bridge = mcp_serve.EventBridge()
+        # Bridge has never seen this db state (mtime differs) and has an
+        # empty cached index — exactly the state after a new conversation's
+        # first write.
+        bridge._state_db_mtime = 0.0
+        assert bridge._cached_sessions_index == {}
+
+        bridge._poll_once(DB())
+
+        result = bridge.poll_events(after_cursor=0)
+        assert len(result["events"]) == 1
+        assert result["events"][0]["session_key"] == "agent:main:telegram:dm:late"
+        assert result["events"][0]["content"].startswith("Hello from a freshly")
 
     def test_poll_interval_is_200ms(self):
         """Verify the poll interval constant."""

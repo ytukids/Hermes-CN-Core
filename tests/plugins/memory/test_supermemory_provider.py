@@ -1,4 +1,4 @@
-import json
+import orjson
 import os
 import stat
 import threading
@@ -17,11 +17,13 @@ from plugins.memory.supermemory import (
 
 
 class FakeClient:
-    def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid"):
+    def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid",
+                 base_url: str = ""):
         self.api_key = api_key
         self.timeout = timeout
         self.container_tag = container_tag
         self.search_mode = search_mode
+        self.base_url = base_url
         self.add_calls = []
         self.search_results = []
         self.profile_response = {"static": [], "dynamic": [], "search_results": []}
@@ -71,18 +73,31 @@ def test_is_available_false_without_api_key(monkeypatch):
     assert p.is_available() is False
 
 
-def test_is_available_false_when_import_missing(monkeypatch):
+def test_is_available_true_when_import_missing_but_key_set(monkeypatch):
+    # Regression: is_available() must NOT gate on the supermemory SDK being
+    # importable. The SDK is lazy-installed at client construction (see
+    # _SupermemoryClient.__init__ -> tools.lazy_deps.ensure). Gating here is a
+    # chicken-and-egg trap: on a sealed Docker venv the package isn't present
+    # until ensure() runs, but ensure() only runs once the provider loads —
+    # which this gates. So with the key set and the SDK absent, the provider
+    # must still report available. Mirrors honcho/mem0 (config-presence only).
     monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
 
     import builtins
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
-        if name == "supermemory":
+        if name == "supermemory" or name.startswith("supermemory."):
             raise ImportError("missing")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
+    p = SupermemoryMemoryProvider()
+    assert p.is_available() is True
+
+
+def test_is_available_false_without_key(monkeypatch):
+    monkeypatch.delenv("SUPERMEMORY_API_KEY", raising=False)
     p = SupermemoryMemoryProvider()
     assert p.is_available() is False
 
@@ -257,7 +272,7 @@ def test_shutdown_joins_threads_and_flushes_buffer(provider, monkeypatch):
 
 
 def test_store_tool_returns_saved_payload(provider):
-    result = json.loads(provider.handle_tool_call("supermemory_store", {"content": "Jordan likes concise docs"}))
+    result = orjson.loads(provider.handle_tool_call("supermemory_store", {"content": "Jordan likes concise docs"}))
     assert result["saved"] is True
     assert result["id"] == "mem_123"
 
@@ -266,20 +281,20 @@ def test_search_tool_formats_results(provider):
     provider._client.search_results = [
         {"id": "m1", "memory": "Jordan likes concise docs", "similarity": 0.92}
     ]
-    result = json.loads(provider.handle_tool_call("supermemory_search", {"query": "concise docs"}))
+    result = orjson.loads(provider.handle_tool_call("supermemory_search", {"query": "concise docs"}))
     assert result["count"] == 1
     assert result["results"][0]["similarity"] == 92
 
 
 def test_forget_tool_by_id(provider):
-    result = json.loads(provider.handle_tool_call("supermemory_forget", {"id": "m1"}))
+    result = orjson.loads(provider.handle_tool_call("supermemory_forget", {"id": "m1"}))
     assert result == {"forgotten": True, "id": "m1"}
     assert provider._client.forgotten_ids == ["m1"]
 
 
 def test_forget_tool_by_query(provider):
     provider._client.forget_by_query_response = {"success": True, "message": "Forgot one", "id": "m7"}
-    result = json.loads(provider.handle_tool_call("supermemory_forget", {"query": "that thing"}))
+    result = orjson.loads(provider.handle_tool_call("supermemory_forget", {"query": "that thing"}))
     assert result["success"] is True
     assert result["id"] == "m7"
 
@@ -290,7 +305,7 @@ def test_profile_tool_formats_sections(provider):
         "dynamic": ["Working on Supermemory provider"],
         "search_results": [],
     }
-    result = json.loads(provider.handle_tool_call("supermemory_profile", {}))
+    result = orjson.loads(provider.handle_tool_call("supermemory_profile", {}))
     assert result["static_count"] == 1
     assert result["dynamic_count"] == 1
     assert "User Profile (Persistent)" in result["profile"]
@@ -299,7 +314,7 @@ def test_profile_tool_formats_sections(provider):
 def test_handle_tool_call_returns_error_when_unconfigured(monkeypatch):
     monkeypatch.delenv("SUPERMEMORY_API_KEY", raising=False)
     p = SupermemoryMemoryProvider()
-    result = json.loads(p.handle_tool_call("supermemory_search", {"query": "x"}))
+    result = orjson.loads(p.handle_tool_call("supermemory_search", {"query": "x"}))
     assert "error" in result
 
 
@@ -360,6 +375,107 @@ def test_invalid_search_mode_falls_back_to_default(monkeypatch, tmp_path):
     assert p._search_mode == "hybrid"
 
 
+# -- Base URL tests -------------------------------------------------------------
+
+
+def test_base_url_defaults_to_cloud(monkeypatch, tmp_path):
+    """Without config or env override, the client targets api.supermemory.ai."""
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.delenv("SUPERMEMORY_BASE_URL", raising=False)
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    p = SupermemoryMemoryProvider()
+    p.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+    assert p._base_url == "https://api.supermemory.ai"
+    assert p._client.base_url == "https://api.supermemory.ai"
+
+
+def test_base_url_env_var_override(monkeypatch, tmp_path):
+    """SUPERMEMORY_BASE_URL points the provider at a self-hosted server (trailing slash stripped)."""
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setenv("SUPERMEMORY_BASE_URL", "http://localhost:6767/")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    p = SupermemoryMemoryProvider()
+    p.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+    assert p._base_url == "http://localhost:6767"
+    assert p._client.base_url == "http://localhost:6767"
+
+
+def test_base_url_config_overrides_env(monkeypatch, tmp_path):
+    """base_url in supermemory.json takes precedence over the env var."""
+    monkeypatch.setenv("SUPERMEMORY_API_KEY", "test-key")
+    monkeypatch.setenv("SUPERMEMORY_BASE_URL", "http://env-host:6767")
+    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    _save_supermemory_config({"base_url": "http://config-host:6767/"}, str(tmp_path))
+    p = SupermemoryMemoryProvider()
+    p.initialize("s1", hermes_home=str(tmp_path), platform="cli")
+    assert p._base_url == "http://config-host:6767"
+    assert p._client.base_url == "http://config-host:6767"
+
+
+def test_client_passes_custom_base_url_to_sdk(monkeypatch):
+    """SDK operations and raw conversation ingest share one normalized base URL."""
+    import sys
+    import types
+
+    from plugins.memory.supermemory import _SupermemoryClient
+
+    captured = {}
+
+    class StubSupermemory:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    module = types.ModuleType("supermemory")
+    module.Supermemory = StubSupermemory
+    monkeypatch.setitem(sys.modules, "supermemory", module)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+
+    client = _SupermemoryClient(
+        api_key="test-key",
+        timeout=1.0,
+        container_tag="hermes",
+        base_url="http://localhost:6767/",
+    )
+
+    assert client._base_url == "http://localhost:6767"
+    assert captured["base_url"] == "http://localhost:6767"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_url"),
+    [
+        ("https://api.supermemory.ai", "https://api.supermemory.ai/v4/conversations"),
+        ("http://localhost:6767", "http://localhost:6767/v4/conversations"),
+    ],
+)
+def test_ingest_conversation_uses_client_base_url(monkeypatch, base_url, expected_url):
+    """Raw conversation ingest follows the same endpoint as SDK operations."""
+    from plugins.memory.supermemory import _SupermemoryClient
+
+    client = _SupermemoryClient.__new__(_SupermemoryClient)
+    client._api_key = "test-key"
+    client._container_tag = "hermes"
+    client._timeout = 1.0
+    client._base_url = base_url
+
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client.ingest_conversation("s1", [{"role": "user", "content": "hello there"}])
+    assert captured["url"] == expected_url
+
+
 # -- Multi-container tests ----------------------------------------------------
 
 
@@ -398,7 +514,7 @@ def test_multi_container_tool_store_with_custom_tag(monkeypatch, tmp_path):
     }, str(tmp_path))
     p = SupermemoryMemoryProvider()
     p.initialize("s1", hermes_home=str(tmp_path), platform="cli")
-    result = json.loads(p.handle_tool_call("supermemory_store", {
+    result = orjson.loads(p.handle_tool_call("supermemory_store", {
         "content": "test memory",
         "container_tag": "project-alpha",
     }))
@@ -417,7 +533,7 @@ def test_multi_container_rejects_unlisted_tag(monkeypatch, tmp_path):
     }, str(tmp_path))
     p = SupermemoryMemoryProvider()
     p.initialize("s1", hermes_home=str(tmp_path), platform="cli")
-    result = json.loads(p.handle_tool_call("supermemory_store", {
+    result = orjson.loads(p.handle_tool_call("supermemory_store", {
         "content": "test",
         "container_tag": "forbidden-tag",
     }))
@@ -520,9 +636,13 @@ def _stub_supermemory_importable(monkeypatch):
 
 def test_probe_supermemory_connection_success(monkeypatch, tmp_path):
     _stub_supermemory_importable(monkeypatch)
-    monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", FakeClient)
+    seen_base_urls = []
 
     class CountingClient(FakeClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            seen_base_urls.append(self.base_url)
+
         def get_profile(self, query=None, *, container_tag=None):
             return {
                 "static": ["Prefers TypeScript"],
@@ -531,10 +651,13 @@ def test_probe_supermemory_connection_success(monkeypatch, tmp_path):
             }
 
     monkeypatch.setattr("plugins.memory.supermemory._SupermemoryClient", CountingClient)
+    monkeypatch.setenv("SUPERMEMORY_BASE_URL", "http://env-host:6767")
+    _save_supermemory_config({"base_url": "http://localhost:6767/"}, str(tmp_path))
     status = _probe_supermemory_connection("test-key", str(tmp_path))
     assert status["ok"] is True
     assert status["profile_facts"] == 2
     assert status["auto_recall"] is True
+    assert seen_base_urls == ["http://localhost:6767"]
 
 
 def test_probe_supermemory_connection_client_error(monkeypatch, tmp_path):

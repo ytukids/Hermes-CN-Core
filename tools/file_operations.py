@@ -26,11 +26,14 @@ Usage:
 """
 
 import os
-import re
+from agent.re_compat import re
 import shutil
 import stat as _stat
 import subprocess
+import sys
 import tempfile
+import threading
+import zlib
 import difflib
 import fnmatch
 from abc import ABC, abstractmethod
@@ -42,6 +45,7 @@ from tools.binary_extensions import BINARY_EXTENSIONS
 from agent.file_safety import (
     build_write_denied_paths,
     build_write_denied_prefixes,
+    get_write_denied_error,
     is_write_denied as _shared_is_write_denied,
 )
 
@@ -64,6 +68,116 @@ def _parse_optional_int(value: Optional[str]) -> Optional[int]:
         return int((value or "").strip())
     except (ValueError, AttributeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# [CN-fork] P1 (concurrent tool dispatch): striped per-file write locks
+# ---------------------------------------------------------------------------
+#
+# The agent runs concurrent tool calls on a ThreadPoolExecutor, so two writers
+# can target the same path at once.  The in-process atomic write below is
+# crash-safe on its own (temp-file + ``os.replace``, an atomic rename on POSIX
+# *and* Windows), but the surrounding stat-mode / getsize steps — and any
+# concurrent reader — are only consistent when same-path writes don't
+# interleave.
+#
+# A single global lock would serialize ALL file I/O (the exact contention this
+# work set out to remove).  A per-path dict of locks removes cross-file
+# contention but grows unbounded over a long-lived gateway's lifetime.  Lock
+# *striping* gets both properties: a fixed pool of locks indexed by the path
+# hash.  Distinct files almost always land on distinct stripes and run fully in
+# parallel; the same file always maps to the same stripe and is serialized.
+# Memory is O(_FILE_LOCK_STRIPES) for the life of the process.
+_FILE_LOCK_STRIPES = 64
+_file_lock_stripes: tuple = tuple(threading.Lock() for _ in range(_FILE_LOCK_STRIPES))
+
+
+def _get_file_lock(path: str) -> "threading.Lock":
+    """Return the stripe lock guarding writes to ``path``.
+
+    Keyed on the normalized absolute path so two spellings of the same file
+    (``a/b.txt`` vs ``a/./b.txt``, or case variants on Windows) share a lock.
+    Different files may collide on a stripe — harmless, just a rare and brief
+    serialization — but the same file never splits across stripes.
+    """
+    try:
+        key = os.path.normcase(os.path.abspath(path))
+    except Exception:  # noqa: BLE001 - never let path canonicalization break a write
+        key = path
+    return _file_lock_stripes[hash(key) % _FILE_LOCK_STRIPES]
+
+
+# ---------------------------------------------------------------------------
+# In-process write verification (P-042 #4 — CRC-32 integrity check)
+# ---------------------------------------------------------------------------
+#
+# The local Windows in-process atomic write (P-033) encodes the content to a
+# temp file and ``os.replace()``s it over the target.  Before P-042 the only
+# integrity signal was the post-rename size stat at the write_file caller
+# (P-033b): it catches truncation / silent no-ops but not silent *corruption*
+# (a flipped byte still has the right length).  A streamed CRC-32 of the temp
+# file, compared against the CRC of the bytes we meant to write, closes that
+# gap cheaply — it re-reads the just-written temp (warm in the page cache) and
+# compares two 4-byte digests instead of building + normalizing a second full
+# copy of the content for a string ``==`` (what a naive "re-read and compare"
+# costs).  It runs *before* the atomic rename, so a mismatch aborts with the
+# original file still intact — never a corrupt swap.
+#
+# Gated by ``_WRITE_VERIFY_CRC`` (env ``HERMES_WRITE_VERIFY_CRC``) so a caller
+# that prizes raw throughput over the read-back can opt out; default ON because
+# the cost is negligible and the safety is real.  Resolved once at import
+# (writes are hot); tests flip the module attribute directly.
+
+
+def _resolve_write_verify_crc() -> bool:
+    val = os.environ.get("HERMES_WRITE_VERIFY_CRC")
+    if val is not None:
+        return val.strip().lower() not in ("0", "false", "no", "off", "")
+    return True
+
+
+_WRITE_VERIFY_CRC = _resolve_write_verify_crc()
+
+
+def _crc32_of_file(path: str, chunk_size: int = 1 << 20) -> "tuple[int, int]":
+    """Return ``(crc32, byte_count)`` for *path*, streamed so a large file is
+    never held in memory twice.  ``crc32`` is masked to 32 bits so it compares
+    equal to ``zlib.crc32(data) & 0xFFFFFFFF``."""
+    crc = 0
+    size = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
+            crc = zlib.crc32(chunk, crc)
+            size += len(chunk)
+    return crc & 0xFFFFFFFF, size
+
+
+# Opt-in (env ``HERMES_MARK_TEMP_FILES``): tag the ``.hermes-tmp`` staging file
+# of an atomic write ``FILE_ATTRIBUTE_TEMPORARY`` so Windows keeps it in cache /
+# AV deprioritises it, then clear the bit before the rename so the permanent
+# file it becomes is not left marked temporary.  OFF by default — zero syscalls
+# added on the hot path unless a deployment measures a Defender win and enables
+# it (mirrors the ``powershell_session_reuse`` opt-in).
+
+
+def _resolve_mark_temp_files() -> bool:
+    val = os.environ.get("HERMES_MARK_TEMP_FILES")
+    if val is not None:
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+_MARK_TEMP_FILES = _resolve_mark_temp_files()
+
+
+def _set_temp_attr(path: str, temporary: bool) -> bool:
+    """Best-effort ``FILE_ATTRIBUTE_TEMPORARY`` toggle (lazy import; never raises)."""
+    try:
+        from tools.environments.windows_env import set_file_temporary
+
+        return set_file_temporary(path, temporary)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +280,43 @@ def _strip_bom(text: str) -> tuple[str, bool]:
 def _has_bom(text: Optional[str]) -> bool:
     """True if ``text`` begins with a UTF-8 BOM."""
     return bool(text) and text.startswith(_UTF8_BOM)
+
+
+# [CN-fork] P-037: legacy fallback codecs for in-process whole-file reads.
+#
+# The P-033 in-process read primitives replaced PowerShell ``Get-Content``,
+# which decodes via the system code page.  Hard-coding ``utf-8`` turned every
+# non-ASCII byte of a GBK/cp936 file — the common case on Chinese Windows, this
+# fork's audience — into U+FFFD, and a read→patch→write round-trip then
+# *persisted* that corruption (write_file re-encodes as UTF-8): silent data
+# loss.  On Windows ``"mbcs"`` maps to the active ANSI code page (``GetACP()``,
+# e.g. cp936/GBK on zh-CN) regardless of PYTHONUTF8.  Exposed at module level so
+# tests can substitute a concrete codec (the ``"mbcs"`` alias exists only on
+# Windows).
+_INPROC_FALLBACK_ENCODINGS: tuple[str, ...] = ("mbcs",) if _IS_WINDOWS else ()
+
+
+def _decode_file_bytes(
+    data: bytes, fallbacks: Optional[tuple[str, ...]] = None
+) -> str:
+    """Decode raw file bytes to text, tolerating non-UTF-8 legacy encodings.
+
+    Try UTF-8 strictly first (the modern default; strict decoding doubles as a
+    cheap "is this UTF-8?" probe).  On failure, try each legacy fallback codec
+    (the Windows ANSI code page by default), and only as a last resort fall back
+    to lossy ``utf-8`` replacement so a genuinely binary blob still returns
+    *something* rather than raising.
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for enc in (_INPROC_FALLBACK_ENCODINGS if fallbacks is None else fallbacks):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _is_write_denied(path: str) -> bool:
@@ -729,7 +880,7 @@ def _looks_like_linter_unusable(base_cmd: str, output: str) -> bool:
 
 def _lint_json_inproc(content: str) -> tuple[bool, str]:
     """In-process JSON syntax check.  Returns (ok, error_message)."""
-    import json as _json
+    import orjson as _json
     try:
         _json.loads(content)
         return True, ""
@@ -743,6 +894,18 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
     """In-process YAML syntax check.  Returns (ok, error_message).
 
     Skipped gracefully if PyYAML isn't installed — YAML parsing is optional.
+
+    Deliberately a *syntax-only* scan (``yaml.parse``), not ``safe_load``:
+    loading rejects perfectly valid YAML that merely isn't a single plain
+    document — multi-document streams (``---``-separated Kubernetes
+    manifests raise ``ComposerError``) and application-defined tags
+    (CloudFormation ``!Sub``/``!Ref``, Ansible ``!vault`` raise
+    ``ConstructorError``).  Those are content conventions for whatever
+    consumes the file, not syntax errors, and this linter's verdict is
+    used as a fail-closed WRITE gate in ``write_file`` — a false positive
+    here refuses a legitimate write outright.  ``yaml.parse`` still
+    catches real scanner/parser failures (unclosed quotes, bad
+    indentation, tab-mangled block maps).
     """
     try:
         import yaml as _yaml
@@ -750,7 +913,8 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
         # PyYAML not available — skip silently, caller treats as no linter.
         return True, "__SKIP__"
     try:
-        _yaml.safe_load(content)
+        for _event in _yaml.parse(content):
+            pass
         return True, ""
     except _yaml.YAMLError as e:
         return False, f"YAMLError: {e}"
@@ -759,11 +923,11 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
 
 
 def _lint_toml_inproc(content: str) -> tuple[bool, str]:
-    """In-process TOML syntax check (stdlib tomllib, Python 3.11+)."""
+    """In-process TOML syntax check (stdlib tomllib, Python 3.14+)."""
     try:
         import tomllib as _toml
     except ImportError:
-        # Pre-3.11 fallback via tomli, if installed.
+        # Fallback via tomli for any environment that lacks tomllib (pre-3.11).
         try:
             import tomli as _toml  # type: ignore[no-redef]
         except ImportError:
@@ -805,6 +969,21 @@ LINTERS_INPROC = {
     '.yml': _lint_yaml_inproc,
     '.toml': _lint_toml_inproc,
 }
+
+# Subset of LINTERS_INPROC that the pre-write fail-closed gate in
+# ``write_file`` (see below) refuses on, rather than merely reporting.
+# Deliberately excludes ``.py``: unlike JSON/YAML/TOML (atomic structured
+# data blobs where "doesn't parse" always means "corrupt"), ``.py`` is
+# used throughout this codebase's own test fixtures as a generic
+# stand-in extension for arbitrary non-Python text content (e.g.
+# ``tests/tools/test_file_operations.py``'s
+# ``TestPatchReplacePostWriteVerification`` writes "hello world" /
+# "hi world" through a ``*.py`` path purely to exercise write-mechanics,
+# not Python validity). Hard-refusing on invalid Python would treat that
+# established, exercised pattern as an error and break it. Python source
+# keeps the existing (unchanged) post-write lint-delta *report* — still
+# visible to the caller, just not a write-blocking refusal.
+_FAIL_CLOSED_INPROC_EXTS = frozenset({'.json', '.yaml', '.yml', '.toml'})
 
 # Max limits for read operations
 MAX_LINES = 2000
@@ -950,6 +1129,13 @@ class ShellFileOperations(FileOperations):
         terminal's current directory — not the directory this file_ops was
         originally created in.  See test_file_ops_cwd_tracking.py.
         """
+        # On Windows, LocalEnvironment runs commands via PowerShell which
+        # doesn't understand POSIX ``/dev/null`` redirect syntax.  Translate
+        # the most common patterns to their PowerShell equivalents.
+        if sys.platform == "win32":
+            command = command.replace(">/dev/null 2>&1", "*>$null")
+            command = command.replace("2>/dev/null", "2>$null")
+            command = command.replace(">/dev/null", ">$null")
         kwargs = {}
         if timeout:
             kwargs['timeout'] = timeout
@@ -1059,7 +1245,19 @@ class ShellFileOperations(FileOperations):
         return path
     
     def _escape_shell_arg(self, arg: str) -> str:
-        """Escape a string for safe use in shell commands."""
+        """Escape a string for safe use in shell commands.
+
+        On Windows native drive paths (``C:\\Users\\x`` / ``C:/Users/x``)
+        and mixed MSYS leftovers (``/c/Users\\x``) are rewritten to the
+        Git Bash ``/c/Users/x`` form via ``_bash_safe_path``: bash eats
+        backslashes and MSYS otherwise mangles drive paths into the
+        ``Directory \\drivers\\etc does not exist`` failure class. Reuses
+        the env-layer translator so shell file ops and the terminal ``cd``
+        agree on the path form. No-op off Windows and for plain POSIX paths.
+        """
+        from tools.environments.local import _bash_safe_path
+
+        arg = _bash_safe_path(arg)
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
@@ -1120,7 +1318,7 @@ class ShellFileOperations(FileOperations):
             abs_path = self._abs_local(path)
             try:
                 with open(abs_path, "rb") as fh:
-                    return ExecuteResult(stdout=fh.read().decode("utf-8", errors="replace"), exit_code=0)
+                    return ExecuteResult(stdout=_decode_file_bytes(fh.read()), exit_code=0)
             except OSError as exc:
                 return ExecuteResult(stdout="" if suppress_stderr else str(exc), exit_code=1)
         redir = " 2>/dev/null" if suppress_stderr else ""
@@ -1132,7 +1330,7 @@ class ShellFileOperations(FileOperations):
             abs_path = self._abs_local(path)
             try:
                 with open(abs_path, "rb") as fh:
-                    text = fh.read().decode("utf-8", errors="replace")
+                    text = _decode_file_bytes(fh.read())
             except OSError as exc:
                 return ExecuteResult(stdout=str(exc), exit_code=1)
             lines = text.split("\n")
@@ -1180,39 +1378,79 @@ class ShellFileOperations(FileOperations):
     def _local_atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """In-process atomic write for the local Windows backend.
 
-        Streams to a temp file in the target's own directory, preserves the
+        Streams to a temp file in the target's own directory, verifies the
+        just-written bytes (CRC-32 + size, P-042) unless disabled, preserves the
         existing file's mode, then ``os.replace()`` (atomic same-dir rename) —
         the cross-platform equivalent of the POSIX ``mktemp``/``mv -f`` script.
-        On success ``stdout`` carries the verified on-disk byte count (read back
-        via ``getsize`` after the replace), so write_file never has to fabricate
-        a size (the root cause of the silent-success bug #54).
+        The integrity check runs BEFORE the rename, so a corrupt/short write
+        aborts with the original file intact instead of clobbering it.  On
+        success ``stdout`` carries the verified on-disk byte count (via
+        ``os.path.getsize`` after the replace), so write_file never has to
+        fabricate a size (the root cause of the silent-success bug #54).
         """
         abs_path = self._abs_local(path)
         parent = os.path.dirname(abs_path) or "."
+        data = content.encode("utf-8")
+        expected_crc = zlib.crc32(data) & 0xFFFFFFFF
+        expected_size = len(data)
+        # Serialize concurrent writers targeting the SAME file (striped, so
+        # distinct files still run fully in parallel). The temp-file +
+        # os.replace swap is atomic on its own; the lock keeps the surrounding
+        # stat-mode / getsize steps and any concurrent reader from observing a
+        # half-applied write when two calls hit the same path at once.
+        lock = _get_file_lock(abs_path)
         try:
-            os.makedirs(parent, exist_ok=True)
-            mode: Optional[int] = None
-            try:
-                mode = _stat.S_IMODE(os.stat(abs_path).st_mode)
-            except OSError:
-                mode = None
-            fd, tmp = tempfile.mkstemp(prefix=".hermes-tmp.", dir=parent)
-            try:
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(content.encode("utf-8"))
-                if mode is not None:
+            with lock:
+                os.makedirs(parent, exist_ok=True)
+                mode: Optional[int] = None
+                try:
+                    mode = _stat.S_IMODE(os.stat(abs_path).st_mode)
+                except OSError:
+                    mode = None
+                fd, tmp = tempfile.mkstemp(prefix=".hermes-tmp.", dir=parent)
+                if _MARK_TEMP_FILES:
+                    _set_temp_attr(tmp, True)
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(data)
+                    # Integrity gate (P-042): re-read the flushed temp and
+                    # confirm CRC-32 + length match what we meant to write.
+                    # Cheap (the temp is page-cache warm; two 4-byte digests)
+                    # and it catches a corrupt/short write BEFORE it can replace
+                    # the good original — the size stat at the caller can't see a
+                    # same-length bit flip.
+                    if _WRITE_VERIFY_CRC:
+                        actual_crc, actual_size = _crc32_of_file(tmp)
+                        if (
+                            actual_size != expected_size
+                            or actual_crc != expected_crc
+                        ):
+                            raise OSError(
+                                "write verification failed: CRC/size mismatch "
+                                f"for {abs_path} (expected {expected_crc:08x}/"
+                                f"{expected_size}B, got {actual_crc:08x}/"
+                                f"{actual_size}B)"
+                            )
+                    if mode is not None:
+                        try:
+                            os.chmod(tmp, mode)
+                        except OSError:
+                            pass
+                    if _MARK_TEMP_FILES:
+                        # Clear the hint so the renamed-into-place file (now
+                        # permanent user data) isn't left marked temporary.
+                        _set_temp_attr(tmp, False)
+                    os.replace(tmp, abs_path)
+                except BaseException:
                     try:
-                        os.chmod(tmp, mode)
+                        os.unlink(tmp)
                     except OSError:
                         pass
-                os.replace(tmp, abs_path)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            return ExecuteResult(stdout=str(os.path.getsize(abs_path)), exit_code=0)
+                    raise
+                if not os.path.exists(abs_path):
+                    raise OSError(f"File did not appear after atomic rename: {abs_path}")
+
+                return ExecuteResult(stdout=str(os.path.getsize(abs_path)), exit_code=0)
         except OSError as exc:
             return ExecuteResult(stdout=f"atomic write failed: {exc}", exit_code=1)
 
@@ -1529,8 +1767,9 @@ class ShellFileOperations(FileOperations):
 
     def _python_delete(self, path: str, recursive: bool) -> WriteResult:
         path = self._expand_path(path)
-        if _is_write_denied(path):
-            return WriteResult(error=f"Delete denied: {path} is a protected path")
+        denied = get_write_denied_error(path, verb="Delete")
+        if denied:
+            return WriteResult(error=denied)
 
         # We can't shell out to ``rm`` here — it doesn't exist on Windows
         # ``cmd.exe`` or PowerShell, so this code path is what's left when
@@ -1575,8 +1814,9 @@ class ShellFileOperations(FileOperations):
         src = self._expand_path(src)
         dst = self._expand_path(dst)
         for p in (src, dst):
-            if _is_write_denied(p):
-                return WriteResult(error=f"Move denied: {p} is a protected path")
+            denied = get_write_denied_error(p, verb="Move")
+            if denied:
+                return WriteResult(error=denied)
         result = self._exec(
             f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}"
         )
@@ -1596,12 +1836,21 @@ class ShellFileOperations(FileOperations):
         files. The content never appears in the shell command string —
         only the file path does.
 
-        After the write, runs a post-first / pre-lazy lint check via
-        ``_check_lint_delta()``.  If the new content is clean, the lint
-        call is O(one parse).  If the new content has errors, the pre-write
-        content is linted too and only errors newly introduced by this
-        write are surfaced — pre-existing problems are filtered out so
-        the agent isn't distracted chasing them.
+        Before anything touches disk, a fail-closed syntax gate runs
+        against the CANDIDATE content: if ``path``'s extension is in
+        ``_FAIL_CLOSED_INPROC_EXTS`` (JSON/YAML/TOML — structured data
+        formats where a parse failure always means corruption) and the
+        candidate content doesn't parse, the write is refused outright.
+        No temp file, no rename, nothing on disk changes.
+
+        After a write that clears the gate, runs a post-first / pre-lazy
+        lint check via ``_check_lint_delta()``.  If the new content is
+        clean, the lint call is O(one parse).  If the new content has
+        errors the gate didn't already catch (i.e. errors from a linter
+        outside ``_FAIL_CLOSED_INPROC_EXTS``, such as Python), the
+        pre-write content is linted too and only errors newly introduced
+        by this write are surfaced — pre-existing problems are filtered
+        out so the agent isn't distracted chasing them.
 
         Args:
             path: File path to write
@@ -1614,8 +1863,47 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
-            return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+        denied = get_write_denied_error(path)
+        if denied:
+            return WriteResult(error=denied)
+
+        # ── Fail-closed pre-write syntax gate ───────────────────────────
+        # Validate the CANDIDATE content BEFORE any bytes touch disk —
+        # previously this only ran as a post-write lint *report* that the
+        # caller could ignore (or that ``files_modified`` gating wouldn't
+        # catch, since a lint failure never set the top-level ``error``
+        # key). A structured-format write that doesn't even parse (mashed
+        # quotes, truncated generation, wrong indentation dialect) is a
+        # corrupt write, not a style nit — refuse it outright instead of
+        # writing first and reporting the damage afterward.
+        #
+        # Scope: only extensions in ``_FAIL_CLOSED_INPROC_EXTS`` (JSON/
+        # YAML/TOML). ``.py`` deliberately keeps its pre-existing,
+        # non-blocking lint-delta *report* instead of a hard refusal — see
+        # ``_FAIL_CLOSED_INPROC_EXTS``'s docstring above for why. Extensions
+        # with no in-process linter at all (including ones only covered by
+        # a shell linter) are completely unaffected — this gate never runs
+        # for them, so behavior there is unchanged.
+        #
+        # Checked against the raw ``content`` argument, before the
+        # BOM/CRLF preservation shims below run. Those shims exist purely
+        # to match the on-disk file's existing conventions; linting
+        # post-shim would false-positive a JSONDecodeError on a
+        # legitimately BOM-marked JSON file purely because this method
+        # re-adds the marker the read layer strips — see
+        # ``_file_has_bom``/``_UTF8_BOM`` below.
+        ext = os.path.splitext(path)[1].lower()
+        inproc_linter = LINTERS_INPROC.get(ext) if ext in _FAIL_CLOSED_INPROC_EXTS else None
+        if inproc_linter is not None:
+            _ok, _lint_err = inproc_linter(content)
+            if not _ok and _lint_err != "__SKIP__":
+                return WriteResult(
+                    error=(
+                        f"Refusing to write '{path}': candidate content fails "
+                        f"{ext} syntax validation ({_lint_err}). The file was "
+                        "NOT created or modified. Fix the content and retry."
+                    )
+                )
 
         # Capture pre-write content.  Two consumers want it:
         #
@@ -1632,7 +1920,6 @@ class ShellFileOperations(FileOperations):
         # the UNION of in-process lint coverage and LSP coverage.  For
         # extensions outside both sets (binaries, opaque formats),
         # skipping the read keeps the hot path fast.
-        ext = os.path.splitext(path)[1].lower()
         pre_content: Optional[str] = None
         want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
         if want_pre:
@@ -1703,21 +1990,26 @@ class ShellFileOperations(FileOperations):
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
 
-        # Bytes actually on disk. The in-process local writer (P-033) returns
-        # the verified post-replace size in stdout; POSIX/remote backends stat
-        # with ``wc -c``.  We do NOT fall back to ``len(content)`` on a *failed*
-        # stat after a "successful" write — that fabrication is exactly what
-        # masked the silent Windows write failure in #54 (PowerShell can't run
-        # the POSIX script, the wrapper exits 0, and ``wc -c`` returns
-        # non-numeric → len(content) faked a byte count for a file that was
-        # never written).  The in-process writer removes that path entirely.
-        bytes_written = _parse_optional_int(write_result.stdout)
-        if bytes_written is None:
-            bytes_written = _parse_optional_int(self._prim_stat_size(path).stdout)
-        if bytes_written is None:
-            # Last resort for an exotic backend whose stat is unavailable: the
-            # write itself reported success, so report the encoded length.
-            bytes_written = len(content.encode('utf-8'))
+        # Post-write verification: confirm the file exists and its size matches
+        # what we intended to write. This catches silent persistence failures
+        # (backend FS oddities, truncated pipe, race, PowerShell script no-op,
+        # etc.) without the cost of re-reading the entire file content.
+        expected_bytes = len(content.encode("utf-8"))
+        stat_result = self._prim_stat_size(path)
+        if stat_result.exit_code != 0:
+            return WriteResult(
+                error=f"Post-write verification failed: could not stat {path}"
+            )
+        bytes_written = _parse_optional_int(stat_result.stdout)
+        if bytes_written is None or bytes_written != expected_bytes:
+            return WriteResult(
+                error=(
+                    f"Post-write verification failed for {path}: on-disk size "
+                    f"({bytes_written} bytes) differs from intended write "
+                    f"({expected_bytes} bytes). The write did not persist. "
+                    "Re-read the file and try again."
+                )
+            )
 
         # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
@@ -1765,13 +2057,16 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
-            return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+        denied = get_write_denied_error(path)
+        if denied:
+            return PatchResult(error=denied)
 
-        # Read current content
-        read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        read_result = self._exec(read_cmd)
-        
+        # Read current content. Route through the in-process primitive so the
+        # read works on a local Windows backend (PowerShell 5.1 has no POSIX
+        # ``cat`` and ``2>/dev/null`` redirects to a literal ``\dev\null`` file);
+        # every other backend runs the identical ``cat … 2>/dev/null`` shell read.
+        read_result = self._prim_read_all(path)
+
         if read_result.exit_code != 0:
             return PatchResult(error=f"Failed to read file: {path}")
         
@@ -1821,8 +2116,7 @@ class ShellFileOperations(FileOperations):
         # failures (backend FS oddities, race with another task, truncated
         # pipe, etc.) that would otherwise return success-with-diff while the
         # file is unchanged on disk.
-        verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        verify_result = self._exec(verify_cmd)
+        verify_result = self._prim_read_all(path)
         if verify_result.exit_code != 0:
             return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
         # Normalize line endings before comparing.  On Windows, Python's
@@ -1927,8 +2221,7 @@ class ShellFileOperations(FileOperations):
         if inproc is not None:
             # Need content — either passed in or read from disk.
             if content is None:
-                read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-                read_result = self._exec(read_cmd)
+                read_result = self._prim_read_all(path)
                 if read_result.exit_code != 0:
                     return LintResult(skipped=True, message=f"Failed to read {path} for lint")
                 content = read_result.stdout
@@ -2334,7 +2627,8 @@ class ShellFileOperations(FileOperations):
         # on PATH, otherwise a portable in-process Python walk. This is the path
         # that makes search work on a stock Windows install (GitHub #334).
         if self._is_local_env():
-            if shutil.which("rg"):
+            from hermes_cli.dep_ensure import _find_rg
+            if _find_rg():
                 return self._search_files_rg(search_pattern, path, limit, offset)
             return self._search_files_python(
                 search_pattern, path, limit, offset, has_hidden_path_ancestor
@@ -2417,12 +2711,14 @@ class ShellFileOperations(FileOperations):
 
         Prefers ripgrepy on local backends; falls back to shell rg for remotes.
         """
-        if self._is_local_env() and shutil.which("rg"):
-            return self._search_files_rg_ripgrepy(pattern, path, limit, offset)
+        from hermes_cli.dep_ensure import _find_rg
+        rg_path = _find_rg()
+        if self._is_local_env() and rg_path:
+            return self._search_files_rg_ripgrepy(pattern, path, limit, offset, rg_path)
         return self._search_files_rg_shell(pattern, path, limit, offset)
 
     def _search_files_rg_ripgrepy(self, pattern: str, path: str, limit: int,
-                                   offset: int) -> SearchResult:
+                                   offset: int, rg_path: str) -> SearchResult:
         """Search for files using ripgrepy's command builder (local only).
 
         ripgrepy always appends ``(pattern, path)`` in ``run()``, which is
@@ -2440,7 +2736,7 @@ class ShellFileOperations(FileOperations):
 
         try:
             # Dummy pattern for init; --files ignores the pattern anyway.
-            rg = Ripgrepy(".", path)
+            rg = Ripgrepy(".", path, rg_path=rg_path)
         except RipGrepNotFound:
             return self._search_files_rg_shell(pattern, path, limit, offset)
 
@@ -2464,7 +2760,7 @@ class ShellFileOperations(FileOperations):
 
         if proc.returncode != 0:
             # --sortr may have failed on older rg; retry without it.
-            rg_unsorted = Ripgrepy(".", path)
+            rg_unsorted = Ripgrepy(".", path, rg_path=rg_path)
             rg_unsorted.files().glob(glob_pattern)
             cmd_unsorted = rg_unsorted.command + [path]
             try:
@@ -2552,7 +2848,8 @@ class ShellFileOperations(FileOperations):
         # Python scan — so content search works on a stock Windows install
         # without ripgrep/grep (GitHub #334).
         if self._is_local_env():
-            if shutil.which("rg"):
+            from hermes_cli.dep_ensure import _find_rg
+            if _find_rg():
                 result = self._search_with_rg(pattern, path, file_glob, limit, offset,
                                               output_mode, context)
             else:
@@ -2579,9 +2876,11 @@ class ShellFileOperations(FileOperations):
     def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search using ripgrep — prefers ripgrepy on local backends."""
-        if self._is_local_env() and shutil.which("rg"):
+        from hermes_cli.dep_ensure import _find_rg
+        rg_path = _find_rg()
+        if self._is_local_env() and rg_path:
             return self._search_with_rg_ripgrepy(
-                pattern, path, file_glob, limit, offset, output_mode, context
+                pattern, path, file_glob, limit, offset, output_mode, context, rg_path
             )
         return self._search_with_rg_shell(
             pattern, path, file_glob, limit, offset, output_mode, context
@@ -2589,7 +2888,7 @@ class ShellFileOperations(FileOperations):
 
     def _search_with_rg_ripgrepy(self, pattern: str, path: str, file_glob: Optional[str],
                                   limit: int, offset: int, output_mode: str,
-                                  context: int) -> SearchResult:
+                                  context: int, rg_path: str) -> SearchResult:
         """Search using ripgrepy (local backends only).
 
         We build the command via ripgrepy's chainable API but execute via
@@ -2601,7 +2900,7 @@ class ShellFileOperations(FileOperations):
         from ripgrepy import Ripgrepy, RipGrepNotFound
 
         try:
-            rg = Ripgrepy(pattern, path)
+            rg = Ripgrepy(pattern, path, rg_path=rg_path)
         except RipGrepNotFound:
             return self._search_with_rg_shell(
                 pattern, path, file_glob, limit, offset, output_mode, context
@@ -2824,9 +3123,13 @@ class ShellFileOperations(FileOperations):
                                has_hidden_ancestor: bool) -> tuple[List[str], bool]:
         """Walk *path* and return (file_paths, hit_scan_cap).
 
-        Prunes ``_FALLBACK_PRUNE_DIRS`` and (unless the root is already under a
-        hidden dir) hidden dirs/files. Stops once ``_FALLBACK_MAX_FILES_SCANNED``
-        paths have been collected, reporting that via the second return value.
+        Prunes ``_FALLBACK_PRUNE_DIRS`` and hidden dirs/files. The
+        ``has_hidden_ancestor`` flag only controls whether the search root
+        itself is allowed (it is passed in by the caller by deciding to enter
+        the root); hidden descendants are excluded either way, matching
+        ripgrep's default behavior and the POSIX ``find`` fallback path.
+        Stops once ``_FALLBACK_MAX_FILES_SCANNED`` paths have been collected,
+        reporting that via the second return value.
         """
         if os.path.isfile(path):
             return [path], False
@@ -2837,13 +3140,13 @@ class ShellFileOperations(FileOperations):
             for d in dirs:
                 if d in _FALLBACK_PRUNE_DIRS:
                     continue
-                if not has_hidden_ancestor and d.startswith('.'):
+                if d.startswith('.'):
                     continue
                 kept_dirs.append(d)
             dirs[:] = kept_dirs
 
             for f in files:
-                if not has_hidden_ancestor and f.startswith('.'):
+                if f.startswith('.'):
                     continue
                 paths.append(os.path.join(root, f))
                 if len(paths) >= _FALLBACK_MAX_FILES_SCANNED:

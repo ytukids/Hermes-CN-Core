@@ -12,7 +12,7 @@ Covers:
 """
 from __future__ import annotations
 
-import json
+import orjson
 from unittest.mock import MagicMock, patch
 
 
@@ -90,12 +90,12 @@ class TestXAIProviderIsAvailable:
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         auth_path = tmp_path / "auth.json"
-        auth_path.write_text(json.dumps({
+        auth_path.write_text(orjson.dumps({
             "version": 1,
             "providers": {
                 "xai-oauth": {"tokens": {"access_token": "ya29.fake-access-token"}},
             },
-        }))
+        }).decode('utf-8'))
 
         from plugins.web.xai.provider import XAIWebSearchProvider
         assert XAIWebSearchProvider().is_available() is True
@@ -111,10 +111,10 @@ class TestXAIProviderIsAvailable:
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         auth_path = tmp_path / "auth.json"
-        auth_path.write_text(json.dumps({
+        auth_path.write_text(orjson.dumps({
             "version": 1,
             "providers": {"xai-oauth": {"tokens": {"access_token": ""}}},
-        }))
+        }).decode('utf-8'))
 
         from plugins.web.xai.provider import XAIWebSearchProvider
         assert XAIWebSearchProvider().is_available() is False
@@ -147,13 +147,13 @@ class TestXAIProviderIsAvailable:
 
 
 class TestXAIProviderSearchJSONPath:
-    _GROK_JSON = json.dumps({
+    _GROK_JSON = orjson.dumps({
         "results": [
             {"title": "xAI", "url": "https://x.ai", "description": "The company."},
             {"title": "Grok docs", "url": "https://docs.x.ai", "description": "API reference."},
             {"title": "Grokipedia", "url": "https://grokipedia.com", "description": "Wiki."},
         ]
-    })
+    }).decode('utf-8')
 
     def test_happy_path_normalizes_results(self):
         from plugins.web.xai import provider as xai_provider
@@ -201,12 +201,12 @@ class TestXAIProviderSearchJSONPath:
     def test_drops_rows_without_url(self):
         from plugins.web.xai import provider as xai_provider
 
-        bad_json = json.dumps({
+        bad_json = orjson.dumps({
             "results": [
                 {"title": "no url", "description": "skip me"},
                 {"title": "good", "url": "https://ok.com", "description": "keep"},
             ]
-        })
+        }).decode('utf-8')
         with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
              patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
              patch("httpx.post", return_value=_mock_resp(_responses_payload(bad_json))):
@@ -322,7 +322,7 @@ class TestXAIProviderRequestShape:
             captured["url"] = url
             captured["headers"] = kwargs.get("headers", {})
             captured["json"] = kwargs.get("json", {})
-            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+            return _mock_resp(_responses_payload(orjson.dumps({"results": []}).decode('utf-8')))
 
         with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds("secret-key")), \
              patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
@@ -348,7 +348,7 @@ class TestXAIProviderRequestShape:
 
         def fake_post(url, **kwargs):
             captured["json"] = kwargs.get("json", {})
-            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+            return _mock_resp(_responses_payload(orjson.dumps({"results": []}).decode('utf-8')))
 
         with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
              patch.object(xai_provider, "_load_xai_web_config", return_value={"model": "grok-4.3-fast"}), \
@@ -364,7 +364,7 @@ class TestXAIProviderRequestShape:
 
         def fake_post(url, **kwargs):
             captured["json"] = kwargs.get("json", {})
-            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+            return _mock_resp(_responses_payload(orjson.dumps({"results": []}).decode('utf-8')))
 
         cfg = {"allowed_domains": ["x.ai", "grokipedia.com"]}
         with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
@@ -385,7 +385,7 @@ class TestXAIProviderRequestShape:
 
         def fake_post(url, **kwargs):
             captured["json"] = kwargs.get("json", {})
-            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+            return _mock_resp(_responses_payload(orjson.dumps({"results": []}).decode('utf-8')))
 
         cfg = {"excluded_domains": ["spam.com"]}
         with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
@@ -407,7 +407,7 @@ class TestXAIProviderRequestShape:
 
         def fake_post(url, **kwargs):
             captured["json"] = kwargs.get("json", {})
-            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+            return _mock_resp(_responses_payload(orjson.dumps({"results": []}).decode('utf-8')))
 
         cfg = {"allowed_domains": [f"d{i}.com" for i in range(10)]}
         with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
@@ -513,11 +513,12 @@ class TestXAIProviderSearchErrors:
             calls["posts"].append(kwargs.get("headers", {}).get("Authorization"))
             if len(calls["posts"]) == 1:
                 raise unauthorized
-            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+            return _mock_resp(_responses_payload(orjson.dumps({"results": []}).decode('utf-8')))
 
-        def fake_resolve(*, force_refresh=False):
+        def fake_resolve(*, force_refresh=False, api_key_hint=None):
             if force_refresh:
                 calls["refresh_count"] += 1
+                assert api_key_hint == "stale-token"
                 return {
                     "provider": "xai-oauth",
                     "api_key": "fresh-after-refresh",
@@ -554,11 +555,11 @@ class TestXAIProviderSearchErrors:
             calls["posts"] += 1
             raise unauthorized
 
-        def fake_resolve(*, force_refresh=False):
+        def fake_resolve(*, force_refresh=False, api_key_hint=None):
             if force_refresh:
                 calls["refreshed"] = True
             # provider=="xai" signals env-var path; retry must be skipped.
-            return {"provider": "xai", "api_key": "sk-env-var-key", "base_url": "https://api.x.ai/v1"}
+            return {"provider": "xai", "api_key": "«redacted:sk-…»", "base_url": "https://api.x.ai/v1"}
 
         with patch.object(xai_provider, "resolve_xai_http_credentials", side_effect=fake_resolve), \
              patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
@@ -587,9 +588,10 @@ class TestXAIProviderSearchErrors:
             calls["posts"] += 1
             raise unauthorized
 
-        def fake_resolve(*, force_refresh=False):
+        def fake_resolve(*, force_refresh=False, api_key_hint=None):
             if force_refresh:
                 calls["refresh_count"] += 1
+                assert api_key_hint == "same-dead-token"
             return {
                 "provider": "xai-oauth",
                 "api_key": "same-dead-token",
@@ -624,7 +626,7 @@ class TestXAIProviderSearchErrors:
             calls["posts"] += 1
             raise err
 
-        def fake_resolve(*, force_refresh=False):
+        def fake_resolve(*, force_refresh=False, api_key_hint=None):
             if force_refresh:
                 calls["refreshed"] = True
             return {"provider": "xai-oauth", "api_key": "tok", "base_url": "https://api.x.ai/v1"}
@@ -727,40 +729,127 @@ class TestXAIBackendWiring:
 
 class TestXAIProviderOAuthPath:
     """Verifies the provider works when credentials come from the OAuth
-    runtime resolver (``hermes auth`` sign-in) rather than an env-var key.
-    Patches at the ``hermes_cli.runtime_provider.resolve_runtime_provider``
-    boundary so the full ``tools.xai_http.resolve_xai_http_credentials``
-    chain is exercised end-to-end.
+    credential pool (``hermes auth`` sign-in) rather than an env-var key.
+    The full ``tools.xai_http.resolve_xai_http_credentials`` chain is exercised
+    against a temporary auth store.
     """
 
-    def test_search_uses_oauth_bearer_token_and_base_url(self, monkeypatch):
+    def test_search_uses_oauth_bearer_token_and_base_url(self, monkeypatch, tmp_path):
         from plugins.web.xai import provider as xai_provider
 
         # Force the env-var fallback to fail so resolution must go via OAuth.
         monkeypatch.delenv("XAI_API_KEY", raising=False)
-
-        oauth_runtime = {
-            "provider": "xai-oauth",
-            "api_mode": "codex_responses",
-            "base_url": "https://api.x.ai/v1",
-            "api_key": "ya29.fake-oauth-access-token",
-            "source": "hermes-auth-store",
-        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_XAI_BASE_URL", "https://proxy.x.ai/v1/")
+        (tmp_path / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "active_provider": "xai-oauth",
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "ya29.fake-oauth-access-token",
+                        "refresh_token": "fake-oauth-refresh-token",
+                    },
+                },
+            },
+        }))
 
         captured: dict = {}
 
         def fake_post(url, **kwargs):
             captured["url"] = url
             captured["headers"] = kwargs.get("headers", {})
-            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+            return _mock_resp(_responses_payload(orjson.dumps({"results": []}).decode('utf-8')))
 
-        with patch(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            return_value=oauth_runtime,
-        ), patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
+        with patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
              patch("httpx.post", side_effect=fake_post):
             result = xai_provider.XAIWebSearchProvider().search("q", limit=3)
 
         assert result["success"] is True
-        assert captured["url"] == "https://api.x.ai/v1/responses"
+        assert captured["url"] == "https://proxy.x.ai/v1/responses"
         assert captured["headers"].get("Authorization") == "Bearer ya29.fake-oauth-access-token"
+
+    def test_pool_only_direct_refresh_updates_main_runtime(self, monkeypatch, tmp_path):
+        """A direct 401 refresh must rotate the exact manual pool row.
+
+        xAI refresh tokens are one-time credentials. Persisting the refreshed
+        pair only to ``providers.xai-oauth`` leaves the manual row stale and
+        breaks the next main-runtime load.
+        """
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from tools.xai_http import resolve_xai_http_credentials
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        monkeypatch.delenv("XAI_OAUTH_ACCESS_TOKEN", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            "credential_pool_strategies:\n  xai-oauth: round_robin\n"
+        )
+        auth_path = tmp_path / "auth.json"
+        auth_path.write_text(json.dumps({
+            "version": 1,
+            "active_provider": "xai-oauth",
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [{
+                    "id": "manual-xai",
+                    "label": "pool-only",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:device_code",
+                    "access_token": "rejected-access",
+                    "refresh_token": "one-time-refresh",
+                    "base_url": "https://api.x.ai/v1",
+                }, {
+                    "id": "backup-xai",
+                    "label": "backup",
+                    "auth_type": "oauth",
+                    "priority": 1,
+                    "source": "manual:device_code",
+                    "access_token": "backup-access",
+                    "refresh_token": "backup-refresh",
+                    "base_url": "https://api.x.ai/v1",
+                }],
+            },
+        }))
+
+        refresh_calls = []
+
+        def fake_refresh(access_token, refresh_token, **_kwargs):
+            refresh_calls.append((access_token, refresh_token))
+            return {
+                "access_token": "fresh-access",
+                "refresh_token": "rotated-refresh",
+                "last_refresh": "2026-07-12T12:00:00Z",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.auth.refresh_xai_oauth_pure",
+            fake_refresh,
+        )
+
+        initial = resolve_xai_http_credentials()
+        assert initial["api_key"] == "rejected-access"
+
+        refreshed = resolve_xai_http_credentials(
+            force_refresh=True,
+            api_key_hint=initial["api_key"],
+        )
+        assert refreshed["api_key"] == "fresh-access"
+        assert refresh_calls == [("rejected-access", "one-time-refresh")]
+
+        stored = json.loads(auth_path.read_text())
+        entries = {
+            item["id"]: item
+            for item in stored["credential_pool"]["xai-oauth"]
+        }
+        entry = entries["manual-xai"]
+        assert entry["access_token"] == "fresh-access"
+        assert entry["refresh_token"] == "rotated-refresh"
+        assert entries["backup-xai"]["access_token"] == "backup-access"
+        assert entries["backup-xai"]["refresh_token"] == "backup-refresh"
+        assert "xai-oauth" not in stored.get("providers", {})
+
+        runtime = resolve_runtime_provider(requested="xai-oauth")
+        assert runtime["api_key"] == "backup-access"
+        assert refresh_calls == [("rejected-access", "one-time-refresh")]

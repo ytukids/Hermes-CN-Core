@@ -8,11 +8,12 @@ with ``terminal.read.respond``. This module is just schema + a thin dispatcher
 over the platform-injected callback.
 """
 
-import json
+import orjson
 import os
 from typing import Callable, Optional
 
 from tools.registry import registry, tool_error
+from utils import env_var_enabled
 
 
 def read_terminal_tool(
@@ -43,14 +44,14 @@ def read_terminal_tool(
 
     # Desktop answers with a JSON object; pass it through, else wrap the raw text.
     try:
-        return json.dumps(json.loads(raw), ensure_ascii=False)
+        return orjson.dumps(orjson.loads(raw)).decode('utf-8')
     except (TypeError, ValueError):
-        return json.dumps({"text": str(raw)}, ensure_ascii=False)
+        return orjson.dumps({"text": str(raw)}).decode('utf-8')
 
 
 def check_read_terminal_requirements() -> bool:
     """Desktop GUI only — HERMES_DESKTOP is set on the gateway the app spawns."""
-    return (os.getenv("HERMES_DESKTOP") or "").strip().lower() in ("1", "true", "yes")
+    return env_var_enabled("HERMES_DESKTOP")
 
 
 READ_TERMINAL_SCHEMA = {

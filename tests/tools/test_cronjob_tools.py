@@ -1,6 +1,6 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
-import json
+import orjson
 import pytest
 
 from tools.cronjob_tools import (
@@ -248,7 +248,7 @@ class TestUnifiedCronjobTool:
         monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
 
     def test_create_and_list(self):
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create",
                 prompt="Check server status",
@@ -258,7 +258,7 @@ class TestUnifiedCronjobTool:
         )
         assert created["success"] is True
 
-        listing = json.loads(cronjob(action="list"))
+        listing = orjson.loads(cronjob(action="list"))
         assert listing["success"] is True
         assert listing["count"] == 1
         assert listing["jobs"][0]["name"] == "Server Check"
@@ -279,7 +279,7 @@ class TestUnifiedCronjobTool:
             }
         ])
 
-        listing = json.loads(cronjob(action="list"))
+        listing = orjson.loads(cronjob(action="list"))
 
         assert listing["success"] is True
         assert listing["jobs"][0]["name"] == "abc123deadbe"
@@ -287,22 +287,22 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["schedule"] == "every 60m"
 
     def test_pause_and_resume(self):
-        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        created = orjson.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]
 
-        paused = json.loads(cronjob(action="pause", job_id=job_id))
+        paused = orjson.loads(cronjob(action="pause", job_id=job_id))
         assert paused["success"] is True
         assert paused["job"]["state"] == "paused"
 
-        resumed = json.loads(cronjob(action="resume", job_id=job_id))
+        resumed = orjson.loads(cronjob(action="resume", job_id=job_id))
         assert resumed["success"] is True
         assert resumed["job"]["state"] == "scheduled"
 
     def test_update_schedule_recomputes_display(self):
-        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        created = orjson.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]
 
-        updated = json.loads(
+        updated = orjson.loads(
             cronjob(action="update", job_id=job_id, schedule="every 2h", name="New Name")
         )
         assert updated["success"] is True
@@ -310,7 +310,7 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["schedule"] == "every 120m"
 
     def test_update_runtime_overrides_can_set_and_clear(self):
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create",
                 prompt="Check",
@@ -322,7 +322,7 @@ class TestUnifiedCronjobTool:
         )
         job_id = created["job_id"]
 
-        updated = json.loads(
+        updated = orjson.loads(
             cronjob(
                 action="update",
                 job_id=job_id,
@@ -336,8 +336,83 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["provider"] == "openrouter"
         assert updated["job"]["base_url"] is None
 
+    @staticmethod
+    def _patch_named_legit(monkeypatch):
+        import hermes_cli.runtime_provider as rp
+        monkeypatch.setattr(rp, "has_named_custom_provider", lambda n: True)
+        monkeypatch.setattr(
+            rp, "_get_named_custom_provider",
+            lambda n: {"name": "legit", "base_url": "https://legit.example/v1",
+                       "api_key": "sk-legit"},
+        )
+
+    @staticmethod
+    def _save_legacy_unsafe_job():
+        """Write a job with an unsafe named-provider + off-host base_url pair
+        DIRECTLY to the store, bypassing the create-time tool guard (mirrors a
+        job persisted before the guard existed)."""
+        from cron.jobs import save_jobs
+        save_jobs([
+            {
+                "id": "legacyunsafe1",
+                "name": "legacy",
+                "prompt": "x",
+                "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
+                "schedule_display": "every 5m",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "provider": "custom:legit",
+                "base_url": "https://evil.example/v1",
+            }
+        ])
+        return "legacyunsafe1"
+
+    def test_legacy_unsafe_job_blocked_on_unrelated_update(self, monkeypatch):
+        """F8 stored-job path: editing an UNRELATED field on a job that already
+        holds an unsafe provider/base_url pair must be rejected, so the pair
+        cannot be left active/schedulable by sidestepping validation."""
+        self._patch_named_legit(monkeypatch)
+        job_id = self._save_legacy_unsafe_job()
+
+        result = orjson.loads(cronjob(action="update", job_id=job_id, name="renamed"))
+        assert result["success"] is False
+        assert "not allowed" in orjson.dumps(result).decode('utf-8')
+
+        # The rejected update must not have mutated the stored job at all.
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["name"] == "legacy"
+        assert stored["base_url"] == "https://evil.example/v1"
+
+    def test_legacy_unsafe_job_remediated_by_clearing_base_url(self, monkeypatch):
+        """The operator can still fix a legacy unsafe job in a single update by
+        clearing base_url (the effective pair becomes safe)."""
+        self._patch_named_legit(monkeypatch)
+        job_id = self._save_legacy_unsafe_job()
+
+        result = orjson.loads(
+            cronjob(action="update", job_id=job_id, name="renamed", base_url="")
+        )
+        assert result["success"] is True
+        assert result["job"]["base_url"] is None
+        assert result["job"]["name"] == "renamed"
+
+    def test_legacy_unsafe_job_remediated_by_matching_host(self, monkeypatch):
+        """Repointing base_url at the named provider's own configured host also
+        remediates the job (no off-host exfil)."""
+        self._patch_named_legit(monkeypatch)
+        job_id = self._save_legacy_unsafe_job()
+
+        result = orjson.loads(
+            cronjob(action="update", job_id=job_id,
+                    base_url="https://legit.example/v1")
+        )
+        assert result["success"] is True
+        assert result["job"]["base_url"] == "https://legit.example/v1"
+
     def test_create_skill_backed_job(self):
-        result = json.loads(
+        result = orjson.loads(
             cronjob(
                 action="create",
                 skill="blogwatcher",
@@ -349,11 +424,11 @@ class TestUnifiedCronjobTool:
         assert result["success"] is True
         assert result["skill"] == "blogwatcher"
 
-        listing = json.loads(cronjob(action="list"))
+        listing = orjson.loads(cronjob(action="list"))
         assert listing["jobs"][0]["skill"] == "blogwatcher"
 
     def test_create_multi_skill_job(self):
-        result = json.loads(
+        result = orjson.loads(
             cronjob(
                 action="create",
                 skills=["blogwatcher", "maps"],
@@ -365,11 +440,11 @@ class TestUnifiedCronjobTool:
         assert result["success"] is True
         assert result["skills"] == ["blogwatcher", "maps"]
 
-        listing = json.loads(cronjob(action="list"))
+        listing = orjson.loads(cronjob(action="list"))
         assert listing["jobs"][0]["skills"] == ["blogwatcher", "maps"]
 
     def test_multi_skill_default_name_prefers_prompt_when_present(self):
-        result = json.loads(
+        result = orjson.loads(
             cronjob(
                 action="create",
                 skills=["blogwatcher", "maps"],
@@ -381,7 +456,7 @@ class TestUnifiedCronjobTool:
         assert result["name"] == "Use both skills and combine the result."
 
     def test_update_can_clear_skills(self):
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create",
                 skills=["blogwatcher", "maps"],
@@ -389,7 +464,7 @@ class TestUnifiedCronjobTool:
                 schedule="every 1h",
             )
         )
-        updated = json.loads(
+        updated = orjson.loads(
             cronjob(action="update", job_id=created["job_id"], skills=[])
         )
         assert updated["success"] is True
@@ -407,7 +482,7 @@ class TestUnifiedCronjobTool:
         """
         from cron.jobs import get_job
 
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create",
                 prompt="Daily briefing",
@@ -423,7 +498,7 @@ class TestUnifiedCronjobTool:
         """deliver=['telegram', 'discord'] is stored as 'telegram,discord'."""
         from cron.jobs import get_job
 
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create",
                 prompt="Daily briefing",
@@ -439,10 +514,10 @@ class TestUnifiedCronjobTool:
         """update with deliver=['telegram'] stores the canonical string."""
         from cron.jobs import get_job
 
-        created = json.loads(
+        created = orjson.loads(
             cronjob(action="create", prompt="x", schedule="every 1h")
         )
-        updated = json.loads(
+        updated = orjson.loads(
             cronjob(
                 action="update",
                 job_id=created["job_id"],
@@ -529,7 +604,7 @@ class TestLocalDeliveryNotice:
         clear_session_vars(tokens)
 
     def test_omitted_deliver_no_origin_emits_notice(self):
-        created = json.loads(
+        created = orjson.loads(
             cronjob(action="create", prompt="Output the time", schedule="every 2m")
         )
         assert created["success"] is True
@@ -539,7 +614,7 @@ class TestLocalDeliveryNotice:
         assert "deliver='telegram'" in created["message"]
 
     def test_explicit_origin_no_origin_emits_notice(self):
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create", prompt="x", schedule="every 2m", deliver="origin"
             )
@@ -549,7 +624,7 @@ class TestLocalDeliveryNotice:
 
     def test_explicit_local_no_notice(self):
         # The user explicitly asked for local — no surprise to flag.
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create", prompt="x", schedule="every 2m", deliver="local"
             )
@@ -559,7 +634,7 @@ class TestLocalDeliveryNotice:
 
     def test_explicit_platform_target_no_notice(self):
         # An explicit platform:chat target resolves to a real delivery target.
-        created = json.loads(
+        created = orjson.loads(
             cronjob(
                 action="create",
                 prompt="x",
@@ -576,8 +651,56 @@ class TestLocalDeliveryNotice:
         from gateway.session_context import set_session_vars
 
         set_session_vars(platform="telegram", chat_id="999")
-        created = json.loads(
+        created = orjson.loads(
             cronjob(action="create", prompt="x", schedule="every 2m")
         )
         assert created["deliver"] == "origin"
         assert "local-only cron job" not in created["message"]
+
+
+class TestValidateCronBaseUrl:
+    """The cron base_url guard must not let a NAMED custom provider's stored
+    credential be sent to an off-host endpoint (CWE-200/CWE-522)."""
+
+    @staticmethod
+    def _v(*args):
+        from tools.cronjob_tools import _validate_cron_base_url
+        return _validate_cron_base_url(*args)
+
+    @staticmethod
+    def _patch_named_legit(monkeypatch):
+        import hermes_cli.runtime_provider as rp
+        monkeypatch.setattr(rp, "has_named_custom_provider", lambda n: True)
+        monkeypatch.setattr(
+            rp, "_get_named_custom_provider",
+            lambda n: {"name": "legit", "base_url": "https://legit.example/v1", "api_key": "sk-legit"},
+        )
+
+    def test_named_custom_offhost_base_url_blocked(self, monkeypatch):
+        self._patch_named_legit(monkeypatch)
+        err = self._v("custom:legit", "https://evil.example/v1")
+        assert err and "not allowed" in err
+
+    def test_named_custom_matching_host_allowed(self, monkeypatch):
+        self._patch_named_legit(monkeypatch)
+        assert self._v("custom:legit", "https://legit.example/v1") is None
+        # subdomain of the configured host is still the provider's own endpoint
+        assert self._v("custom:legit", "https://eu.legit.example/v1") is None
+
+    def test_named_custom_lookalike_host_blocked(self, monkeypatch):
+        self._patch_named_legit(monkeypatch)
+        assert self._v("custom:legit", "https://legit.example.attacker.test/v1") is not None
+
+    def test_bare_custom_allows_any_base_url(self):
+        # Bare 'custom' is inline/host-derived BYOK — no stored secret to leak.
+        assert self._v("custom", "https://anything.example/v1") is None
+
+    def test_no_base_url_is_allowed(self):
+        assert self._v("custom:legit", None) is None
+
+    def test_named_registry_offhost_blocked(self):
+        # A named registry provider (stored key) + off-host override is refused.
+        assert self._v("anthropic", "https://evil.example/v1") is not None
+
+    def test_base_url_without_provider_rejected(self):
+        assert self._v(None, "https://x.example/v1") is not None

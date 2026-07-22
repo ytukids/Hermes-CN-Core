@@ -27,10 +27,10 @@ Configuration in config.yaml:
 """
 
 import asyncio
-import json
+import orjson
 import logging
 import os
-import re
+from agent.re_compat import re
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -430,7 +430,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             raw = os.getenv("DINGTALK_MENTION_PATTERNS", "").strip()
             if raw:
                 try:
-                    loaded = json.loads(raw)
+                    loaded = orjson.loads(raw)
                 except Exception:
                     loaded = [part.strip() for part in raw.splitlines() if part.strip()]
                     if not loaded:
@@ -1447,7 +1447,7 @@ class _IncomingHandler(
             # CallbackMessage.data is a dict containing the raw DingTalk payload
             data = message.data
             if isinstance(data, str):
-                data = json.loads(data)
+                data = orjson.loads(data)
 
             # Parse dict into ChatbotMessage using SDK's from_dict
             chatbot_msg = ChatbotMessage.from_dict(data)
@@ -1644,11 +1644,11 @@ def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
     take precedence over YAML (each assignment guarded by not os.getenv(...)).
     Returns None — everything flows through env.
     """
-    import json as _json
+    import orjson as _json
     if "require_mention" in dingtalk_cfg and not os.getenv("DINGTALK_REQUIRE_MENTION"):
         os.environ["DINGTALK_REQUIRE_MENTION"] = str(dingtalk_cfg["require_mention"]).lower()
     if "mention_patterns" in dingtalk_cfg and not os.getenv("DINGTALK_MENTION_PATTERNS"):
-        os.environ["DINGTALK_MENTION_PATTERNS"] = _json.dumps(dingtalk_cfg["mention_patterns"])
+        os.environ["DINGTALK_MENTION_PATTERNS"] = _json.dumps(dingtalk_cfg["mention_patterns"]).decode('utf-8')
     frc = dingtalk_cfg.get("free_response_chats")
     if frc is not None and not os.getenv("DINGTALK_FREE_RESPONSE_CHATS"):
         if isinstance(frc, list):
@@ -1660,6 +1660,31 @@ def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
             ac = ",".join(str(v) for v in ac)
         os.environ["DINGTALK_ALLOWED_CHATS"] = str(ac)
     allowed = dingtalk_cfg.get("allowed_users")
+    if allowed is None:
+        # Fall back to the documented nested paths (#44928). The docs
+        # (website/docs/user-guide/messaging/dingtalk.md) configure the
+        # allowlist at gateway.platforms.dingtalk.extra.allowed_users; the
+        # adapter reads it from PlatformConfig.extra, but gateway
+        # authorization (_is_user_authorized in gateway/authz_mixin.py)
+        # only consults DINGTALK_ALLOWED_USERS — without this bridge a
+        # nested-only allowlist passes the adapter and is then denied at
+        # the gateway. Check this block's own extra first (the dispatch
+        # loop passes the platforms block here when no top-level
+        # ``dingtalk:`` section exists), then both nested containers.
+        _extra = dingtalk_cfg.get("extra")
+        if isinstance(_extra, dict):
+            allowed = _extra.get("allowed_users")
+        if allowed is None:
+            _gw = yaml_cfg.get("gateway")
+            _gw_platforms = _gw.get("platforms") if isinstance(_gw, dict) else None
+            for _container in (_gw_platforms, yaml_cfg.get("platforms")):
+                if not isinstance(_container, dict):
+                    continue
+                _dt = _container.get("dingtalk")
+                _dt_extra = _dt.get("extra") if isinstance(_dt, dict) else None
+                if isinstance(_dt_extra, dict) and _dt_extra.get("allowed_users") is not None:
+                    allowed = _dt_extra.get("allowed_users")
+                    break
     if allowed is not None and not os.getenv("DINGTALK_ALLOWED_USERS"):
         if isinstance(allowed, list):
             allowed = ",".join(str(v) for v in allowed)

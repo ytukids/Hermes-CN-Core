@@ -8,7 +8,7 @@ covered in ``test_shell_hooks_consent.py``.
 
 from __future__ import annotations
 
-import json
+import orjson
 from pathlib import Path
 
 import pytest
@@ -97,6 +97,24 @@ class TestParseResponse:
         )
         assert r is None
 
+    def test_pre_verify_continue_canonical(self):
+        r = shell_hooks._parse_response(
+            "pre_verify", '{"action": "continue", "message": "run checks"}',
+        )
+        assert r == {"action": "continue", "message": "run checks"}
+
+    def test_pre_verify_block_is_continue_claude_style(self):
+        # Claude-Code Stop hooks: block the stop == keep going; reason → message.
+        r = shell_hooks._parse_response(
+            "pre_verify", '{"decision": "block", "reason": "run the formatter"}',
+        )
+        assert r == {"action": "continue", "message": "run the formatter"}
+
+    def test_pre_verify_without_message_is_noop(self):
+        # A continue with nothing to tell the model lets the turn finish.
+        assert shell_hooks._parse_response("pre_verify", '{"action": "continue"}') is None
+        assert shell_hooks._parse_response("pre_verify", '{"decision": "allow"}') is None
+
     def test_block_action_without_message_uses_default(self):
         """Block is honored even when message/reason is absent."""
         r = shell_hooks._parse_response("pre_tool_call", '{"action": "block"}')
@@ -137,7 +155,7 @@ class TestSerializePayload:
                 "tool_call_id": "c-1",
             },
         )
-        payload = json.loads(raw)
+        payload = orjson.loads(raw)
         assert payload["hook_event_name"] == "pre_tool_call"
         assert payload["tool_name"] == "terminal"
         assert payload["tool_input"] == {"command": "ls"}
@@ -151,14 +169,14 @@ class TestSerializePayload:
         raw = shell_hooks._serialize_payload(
             "pre_tool_call", {"args": ["not", "a", "dict"]},
         )
-        payload = json.loads(raw)
+        payload = orjson.loads(raw)
         assert payload["tool_input"] is None
 
     def test_parent_session_id_used_when_no_session_id(self):
         raw = shell_hooks._serialize_payload(
             "subagent_stop", {"parent_session_id": "p-1"},
         )
-        payload = json.loads(raw)
+        payload = orjson.loads(raw)
         assert payload["session_id"] == "p-1"
 
     def test_unserialisable_extras_stringified(self):
@@ -169,7 +187,7 @@ class TestSerializePayload:
         raw = shell_hooks._serialize_payload(
             "on_session_start", {"obj": Weird()},
         )
-        payload = json.loads(raw)
+        payload = orjson.loads(raw)
         assert payload["extra"]["obj"] == "<weird>"
 
 
@@ -373,7 +391,7 @@ class TestCallbackSubprocess:
             session_id="sess-77",
             task_id="task-77",
         )
-        payload = json.loads(capture.read_text())
+        payload = orjson.loads(capture.read_text())
         assert payload["hook_event_name"] == "pre_tool_call"
         assert payload["tool_name"] == "terminal"
         assert payload["tool_input"] == {"command": "echo hi"}

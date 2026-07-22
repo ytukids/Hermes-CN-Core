@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
-import re
+from agent.re_compat import re
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
@@ -355,7 +355,7 @@ def evaluate_credits_notices(
     if show_depleted and "credits.depleted" not in active:
         to_show.append(
             AgentNotice(
-                text="✕ Credit access paused · run /credits to top up",
+                text="✕ Credit access paused · run /topup to top up",
                 level="error",
                 kind=CREDITS_NOTICE_KIND,
                 key="credits.depleted",

@@ -12,9 +12,9 @@ Configuration in config.yaml:
           app_id: "your-app-id"            # or QQ_APP_ID env var
           client_secret: "your-secret"     # or QQ_CLIENT_SECRET env var
           markdown_support: true           # enable QQ markdown (msg_type 2)
-          dm_policy: "open"                # open | allowlist | disabled
+          dm_policy: "pairing"             # open | allowlist | disabled | pairing
           allow_from: ["openid_1"]
-          group_policy: "open"             # open | allowlist | disabled
+          group_policy: "pairing"          # open | allowlist | disabled | pairing
           group_allow_from: ["group_openid_1"]
           stt:                             # Voice-to-text config (optional)
             provider: "zai"                # zai (GLM-ASR), openai (Whisper), etc.
@@ -32,8 +32,8 @@ Reference: https://bot.q.qq.com/wiki/develop/api-v2/
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
+import pybase64 as base64
+import orjson
 import logging
 import mimetypes
 import os
@@ -60,6 +60,7 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -208,11 +209,11 @@ class QQAdapter(BasePlatformAdapter):
         self._markdown_support = bool(extra.get("markdown_support", True))
 
         # Auth/ACL policies
-        self._dm_policy = str(extra.get("dm_policy", "open")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy", "pairing")).strip().lower()
         self._allow_from = _coerce_list(
             extra.get("allow_from") or extra.get("allowFrom")
         )
-        self._group_policy = str(extra.get("group_policy", "open")).strip().lower()
+        self._group_policy = str(extra.get("group_policy", "pairing")).strip().lower()
         self._group_allow_from = _coerce_list(
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
         )
@@ -278,8 +279,16 @@ class QQAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
-        """Authenticate, obtain gateway URL, and open the WebSocket."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """
+        Authenticate, obtain gateway URL, and open the WebSocket.
+
+        Args:
+            is_reconnect: False on a cold first boot; True when the
+                reconnect watcher is re-establishing this platform after
+                an outage. QQBot has no server-side update queue so this
+                flag is accepted for interface conformance only.
+        """
         if not AIOHTTP_AVAILABLE:
             message = "QQ startup failed: aiohttp not installed"
             self._set_fatal_error("qq_missing_dependency", message, retryable=True)
@@ -898,7 +907,7 @@ class QQAdapter(BasePlatformAdapter):
     @staticmethod
     def _parse_json(raw: Any) -> Optional[Dict[str, Any]]:
         try:
-            payload = json.loads(raw)
+            payload = orjson.loads(raw)
         except Exception:
             logger.warning("[QQBot] Failed to parse JSON: %r", raw)
             return None
@@ -1214,7 +1223,7 @@ class QQAdapter(BasePlatformAdapter):
         user_openid = str(author.get("user_openid", ""))
         if not user_openid:
             return
-        if not self._is_dm_allowed(user_openid):
+        if not self._is_dm_intake_allowed(user_openid):
             return
 
         text = content
@@ -1454,7 +1463,7 @@ class QQAdapter(BasePlatformAdapter):
         # Without this check any member of any guild the bot is in could
         # bypass the configured allowlist via direct messages.
         author_id = str(author.get("id", ""))
-        if not self._is_dm_allowed(author_id):
+        if not self._is_dm_intake_allowed(author_id):
             logger.debug(
                 "[%s] Guild DM blocked by ACL: guild=%s user=%s",
                 self._log_tag, guild_id, author_id,
@@ -2104,6 +2113,9 @@ class QQAdapter(BasePlatformAdapter):
     async def _convert_ffmpeg_to_wav(self, src_path: str, wav_path: str) -> Optional[str]:
         """Convert audio file to WAV using ffmpeg."""
         try:
+            _subprocess_kwargs = {}
+            if IS_WINDOWS:
+                _subprocess_kwargs["creationflags"] = windows_hide_flags()
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
                 "-y",
@@ -2116,6 +2128,7 @@ class QQAdapter(BasePlatformAdapter):
                 wav_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                **_subprocess_kwargs,
             )
             await asyncio.wait_for(proc.wait(), timeout=30)
             if proc.returncode != 0:
@@ -2640,7 +2653,10 @@ class QQAdapter(BasePlatformAdapter):
         return await self.send_with_keyboard(
             chat_id,
             build_approval_text(req),
-            build_approval_keyboard(req.session_key),
+            build_approval_keyboard(
+                req.session_key,
+                allow_permanent=getattr(req, "allow_permanent", True),
+            ),
             reply_to=reply_to,
         )
 
@@ -2660,6 +2676,9 @@ class QQAdapter(BasePlatformAdapter):
             session_key: str,
             description: str = "dangerous command",
             metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         """Send a button-based exec-approval prompt for a dangerous command.
 
@@ -2669,6 +2688,9 @@ class QQAdapter(BasePlatformAdapter):
         adapter's interaction callback (:meth:`_default_interaction_dispatch`).
         """
         del metadata  # QQ doesn't have thread_id / DM targeting overrides.
+        del allow_session  # QQ's 3-button keyboard has no session tier (once/always/deny).
+        if smart_denied:
+            description += " Owner override applies to this one operation only."
 
         # Use the reply-to message for passive-message context when we have one.
         # QQ requires a msg_id on outbound messages to a user we've never
@@ -2677,10 +2699,11 @@ class QQAdapter(BasePlatformAdapter):
 
         req = ApprovalRequest(
             session_key=session_key,
-            title=f"Execute this command?",
+            title="Execute this command?",
             description=description,
             command_preview=command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
+            allow_permanent=allow_permanent and not smart_denied,
         )
         return await self.send_approval_request(
             chat_id, req, reply_to=msg_id,
@@ -3137,24 +3160,48 @@ class QQAdapter(BasePlatformAdapter):
     def _strip_at_mention(content: str) -> str:
         """Strip the @bot mention prefix from group message content."""
         # QQ group @-messages may have the bot's QQ/ID as prefix
-        import re
-
+        from agent.re_compat import re
         stripped = re.sub(r"^@\S+\s*", "", content.strip())
         return stripped
+
+    def _open_dm_opted_in(self) -> bool:
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+            return True
+        return os.getenv("QQ_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
 
     def _is_dm_allowed(self, user_id: str) -> bool:
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
             return self._entry_matches(self._allow_from, user_id)
-        return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
+
+    def _is_dm_intake_allowed(self, user_id: str) -> bool:
+        principal = str(user_id or "").strip()
+        if not principal:
+            return False
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return self._entry_matches(self._allow_from, principal)
+        if self._dm_policy == "pairing":
+            return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
 
     def _is_group_allowed(self, group_id: str, user_id: str) -> bool:
         if self._group_policy == "disabled":
             return False
         if self._group_policy == "allowlist":
             return self._entry_matches(self._group_allow_from, group_id)
-        return True
+        if self._group_policy == "pairing":
+            return False
+        if self._group_policy == "open":
+            return True
+        return False
 
     @staticmethod
     def _entry_matches(entries: List[str], target: str) -> bool:

@@ -13,8 +13,8 @@ calls ``build_system_prompt_parts`` / inspects ``agent.tools`` offline.
 
 from __future__ import annotations
 
-import json
-import re
+import orjson
+from agent.re_compat import re
 from typing import Any, Dict, List, Tuple
 
 # The skills index is wrapped in this tag pair inside the stable tier.
@@ -34,10 +34,16 @@ def _build_inspection_agent(platform: str) -> Any:
     """
     from run_agent import AIAgent
     from hermes_cli.config import load_config
+    from hermes_cli.tools_config import _get_platform_tools
 
     cfg = load_config()
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     model = model_cfg.get("default") or model_cfg.get("model") or ""
+
+    # Resolve platform-specific toolsets the same way the gateway does.
+    enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
+    agent_cfg = cfg.get("agent") or {}
+    disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
     return AIAgent(
         model=model,
@@ -46,6 +52,8 @@ def _build_inspection_agent(platform: str) -> Any:
         quiet_mode=True,
         save_trajectories=False,
         platform=platform,
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
     )
 
 
@@ -89,7 +97,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
 
     # Tool-schema JSON — the other half of the fixed per-call payload.
     tools = getattr(agent, "tools", None) or []
-    tools_json = json.dumps(tools, ensure_ascii=False)
+    tools_json = orjson.dumps(tools).decode('utf-8')
 
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
@@ -148,6 +156,6 @@ def cmd_prompt_size(args: Any) -> None:
         print(f"Could not compute prompt-size breakdown: {e}")
         return
     if as_json:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
+        print(orjson.dumps(data, option=orjson.OPT_INDENT_2).decode('utf-8'))
     else:
         print(render_breakdown(data))

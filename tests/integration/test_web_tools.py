@@ -18,7 +18,7 @@ Requirements:
 import pytest
 pytestmark = pytest.mark.integration
 
-import json
+import orjson
 import asyncio
 import sys
 import os
@@ -32,7 +32,6 @@ from tools.web_tools import (
     web_extract_tool,
     check_firecrawl_api_key,
     check_web_api_key,
-    check_auxiliary_model,
     _get_backend,
 )
 
@@ -129,12 +128,11 @@ class WebToolsTester:
             backend = _get_backend()
             self.log_result("Web Backend API Key", "passed", f"Using {backend} backend")
         
-        # Check auxiliary LLM provider (optional)
-        if not check_auxiliary_model():
-            self.log_result("Auxiliary LLM", "skipped", "No auxiliary LLM provider available (LLM tests will be skipped)")
-            self.test_llm = False
-        else:
-            self.log_result("Auxiliary LLM", "passed", "Found")
+        # Auxiliary LLM summarization was removed — web_extract is now
+        # truncate-and-store (no LLM). Keep the flag off so any residual
+        # LLM-path assertions stay skipped.
+        self.log_result("Auxiliary LLM", "skipped", "web_extract no longer uses an LLM (truncate-and-store)")
+        self.test_llm = False
         
         return True
     
@@ -162,8 +160,8 @@ class WebToolsTester:
                 
                 # Parse result
                 try:
-                    data = json.loads(result)
-                except json.JSONDecodeError as e:
+                    data = orjson.loads(result)
+                except orjson.JSONDecodeError as e:
                     self.log_result(f"Search: {query[:30]}...", "failed", f"Invalid JSON: {e}")
                     if self.verbose:
                         print(f"    Raw response (first 500 chars): {result[:500]}...")
@@ -248,7 +246,7 @@ class WebToolsTester:
                 "https://docs.firecrawl.dev/introduction",
                 "https://www.python.org/about/"
             ]
-            print(f"  Using default URLs for testing")
+            print("  Using default URLs for testing")
         else:
             print(f"  Using {len(urls)} URLs from search results")
         
@@ -261,18 +259,17 @@ class WebToolsTester:
                     print(f"    - {url}")
                 
                 if self.verbose:
-                    print(f"  Calling web_extract_tool(urls={test_urls}, format='markdown', use_llm_processing=False)")
+                    print(f"  Calling web_extract_tool(urls={test_urls}, format='markdown')")
                 
                 result = await web_extract_tool(
                     test_urls,
                     format="markdown",
-                    use_llm_processing=False
                 )
                 
                 # Parse result
                 try:
-                    data = json.loads(result)
-                except json.JSONDecodeError as e:
+                    data = orjson.loads(result)
+                except orjson.JSONDecodeError as e:
                     self.log_result("Extract (no LLM)", "failed", f"Invalid JSON: {e}")
                     if self.verbose:
                         print(f"    Raw response (first 500 chars): {result[:500]}...")
@@ -333,7 +330,7 @@ class WebToolsTester:
                         f"No valid content. {failed_results} errors, {len(results) - failed_results} empty"
                     )
                     if self.verbose:
-                        print(f"\n  Extraction details:")
+                        print("\n  Extraction details:")
                         for detail in extraction_details:
                             print(f"    {detail}")
                     
@@ -360,11 +357,10 @@ class WebToolsTester:
             result = await web_extract_tool(
                 [test_url],
                 format="markdown",
-                use_llm_processing=True,
-                min_length=1000  # Lower threshold for testing
+                char_limit=1000,  # small budget to force truncation in the test
             )
             
-            data = json.loads(result)
+            data = orjson.loads(result)
             
             if "error" in data:
                 self.log_result("Extract (with LLM)", "failed", data["error"])
@@ -391,14 +387,14 @@ class WebToolsTester:
                     )
                     
                     if self.verbose:
-                        print(f"\n    First 300 chars of processed content:")
+                        print("\n    First 300 chars of processed content:")
                         print(f"    {content[:300]}...")
                 else:
                     self.log_result("Extract (with LLM)", "failed", "No content after processing")
             else:
                 self.log_result("Extract (with LLM)", "failed", "No content field in result")
                 
-        except json.JSONDecodeError as e:
+        except orjson.JSONDecodeError as e:
             self.log_result("Extract (with LLM)", "failed", f"Invalid JSON: {e}")
         except Exception as e:
             self.log_result("Extract (with LLM)", "failed", str(e))
@@ -466,13 +462,13 @@ class WebToolsTester:
                 "web_backend": _get_backend() if check_web_api_key() else None,
                 "firecrawl_api_key": check_firecrawl_api_key(),
                 "parallel_api_key": bool(os.getenv("PARALLEL_API_KEY")),
-                "auxiliary_model": check_auxiliary_model(),
+                "auxiliary_model": False,
             }
         }
         
         try:
             with open(filename, 'w') as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
+                f.write(orjson.dumps(results, option=orjson.OPT_INDENT_2).decode('utf-8'))
             print_info(f"Test results saved to: {filename}")
         except Exception as e:
             print_warning(f"Failed to save results: {e}")

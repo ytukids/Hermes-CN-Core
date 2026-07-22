@@ -1,7 +1,7 @@
 """Tests for the Feishu gateway integration."""
 
 import asyncio
-import json
+import orjson
 import os
 import tempfile
 import time
@@ -19,6 +19,18 @@ try:
     _HAS_LARK_OAPI = True
 except ImportError:
     _HAS_LARK_OAPI = False
+
+
+class _FakeRequestContent:
+    def __init__(self, body: bytes):
+        self.body = body
+        self.read_sizes: list[int] = []
+
+    async def readexactly(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        if len(self.body) < size:
+            raise asyncio.IncompleteReadError(self.body, size)
+        return self.body[:size]
 
 
 def _mock_event_dispatcher_builder(mock_handler_class):
@@ -85,8 +97,7 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
         normalized = normalize_feishu_message(
             message_type="merge_forward",
-            raw_content=json.dumps(
-                {
+            raw_content=orjson.dumps({
                     "title": "Sprint recap",
                     "messages": [
                         {"sender_name": "Alice", "text": "Please review PR-128"},
@@ -100,8 +111,7 @@ class TestFeishuMessageNormalization(unittest.TestCase):
                             },
                         },
                     ],
-                }
-            ),
+                }).decode('utf-8'),
         )
 
         self.assertEqual(normalized.relation_kind, "merge_forward")
@@ -115,12 +125,10 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
         normalized = normalize_feishu_message(
             message_type="share_chat",
-            raw_content=json.dumps(
-                {
+            raw_content=orjson.dumps({
                     "chat_id": "oc_chat_shared",
                     "chat_name": "Backend Guild",
-                }
-            ),
+                }).decode('utf-8'),
         )
 
         self.assertEqual(normalized.relation_kind, "share_chat")
@@ -133,8 +141,7 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
         normalized = normalize_feishu_message(
             message_type="interactive",
-            raw_content=json.dumps(
-                {
+            raw_content=orjson.dumps({
                     "card": {
                         "header": {"title": {"tag": "plain_text", "content": "Build Failed"}},
                         "elements": [
@@ -149,8 +156,7 @@ class TestFeishuMessageNormalization(unittest.TestCase):
                             },
                         ],
                     }
-                }
-            ),
+                }).decode('utf-8'),
         )
 
         self.assertEqual(normalized.relation_kind, "interactive")
@@ -161,6 +167,16 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_websocket_sdk_accepts_channel_ua_tag(self):
+        """The shipped SDK must support the Channel signaling argument."""
+        import inspect
+
+        from lark_oapi.ws import Client as FeishuWSClient
+
+        signature = inspect.signature(FeishuWSClient)
+        self.assertIn("extra_ua_tags", signature.parameters)
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
@@ -178,7 +194,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         runner = AsyncMock()
         site = AsyncMock()
         web_module = SimpleNamespace(
-            Application=lambda: SimpleNamespace(router=SimpleNamespace(add_post=lambda *_args, **_kwargs: None)),
+            Application=lambda **_kwargs: SimpleNamespace(router=SimpleNamespace(add_post=lambda *_args, **_kwargs: None)),
             AppRunner=lambda _app: runner,
             TCPSite=lambda _runner, host, port: SimpleNamespace(start=site.start, host=host, port=port),
         )
@@ -251,6 +267,77 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             metadata={"platform": "feishu"},
         )
         release_lock.assert_called_once_with("feishu-app-id", "cli_app")
+
+    def test_disconnect_sends_websocket_close_frame(self):
+        """Regression test for #10202: disconnect() must call the WSS
+        client's ``_disconnect()`` coroutine so a WebSocket CLOSE frame
+        is sent to Feishu. Without this, Feishu's server continues
+        routing to the stale connection, silencing the channel.
+        """
+        import threading
+        from types import SimpleNamespace
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        # Real thread loop to schedule the close coroutine on.
+        ws_thread_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_loop() -> None:
+            asyncio.set_event_loop(ws_thread_loop)
+            ready.set()
+            ws_thread_loop.run_forever()
+
+        thread = threading.Thread(target=_run_loop, daemon=True)
+        thread.start()
+        ready.wait()
+
+        close_called = threading.Event()
+
+        async def _fake_disconnect() -> None:
+            close_called.set()
+
+        ws_client = SimpleNamespace(_disconnect=_fake_disconnect, _auto_reconnect=True)
+        adapter._ws_client = ws_client
+        adapter._ws_thread_loop = ws_thread_loop
+        adapter._ws_future = None
+
+        try:
+            asyncio.run(adapter.disconnect())
+        finally:
+            if not ws_thread_loop.is_closed():
+                ws_thread_loop.call_soon_threadsafe(ws_thread_loop.stop)
+            thread.join(timeout=2.0)
+            if not ws_thread_loop.is_closed():
+                ws_thread_loop.close()
+
+        self.assertTrue(
+            close_called.is_set(),
+            "disconnect() must schedule ws_client._disconnect() on the ws thread loop",
+        )
+        # _disable_websocket_auto_reconnect() must still run.
+        self.assertIsNone(adapter._ws_client)
+
+    def test_disconnect_tolerates_missing_internal_disconnect(self):
+        """If the lark_oapi client layout changes and ``_disconnect``
+        disappears, disconnect() must not raise — fall through to the
+        existing task-cancel path.
+        """
+        from types import SimpleNamespace
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        # No ``_disconnect`` attribute — ``hasattr`` guard should skip.
+        adapter._ws_client = SimpleNamespace(_auto_reconnect=True)
+        adapter._ws_thread_loop = None
+        adapter._ws_future = None
+
+        # Must not raise.
+        asyncio.run(adapter.disconnect())
+        self.assertIsNone(adapter._ws_client)
 
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
@@ -331,6 +418,65 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(sleeps, [1])
         self.assertEqual(fake_loop.calls, 2)
 
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_app",
+        "FEISHU_APP_SECRET": "secret_app",
+    }, clear=True)
+    def test_connect_websocket_sets_channel_ua_tag(self):
+        """Verify that FeishuWSClient receives extra_ua_tags=["channel"].
+
+        Without this UA tag the Feishu server does not push group @mention
+        events over the WebSocket transport.  See
+        https://github.com/NousResearch/hermes-agent/issues/50656
+        """
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        ws_client = SimpleNamespace()
+
+        with (
+            patch("plugins.platforms.feishu.adapter.FEISHU_AVAILABLE", True),
+            patch("plugins.platforms.feishu.adapter.FEISHU_WEBSOCKET_AVAILABLE", True),
+            patch("plugins.platforms.feishu.adapter.lark",
+                  SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
+            patch("plugins.platforms.feishu.adapter.EventDispatcherHandler") as mock_handler_class,
+            patch("plugins.platforms.feishu.adapter.FeishuWSClient") as mock_ws_client,
+            patch("plugins.platforms.feishu.adapter._run_official_feishu_ws_client"),
+            patch("plugins.platforms.feishu.adapter.acquire_scoped_lock", return_value=(True, None)),
+            patch("plugins.platforms.feishu.adapter.release_scoped_lock"),
+            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+        ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+
+            loop = asyncio.new_event_loop()
+            future = loop.create_future()
+            future.set_result(None)
+
+            class _Loop:
+                def run_in_executor(self, *_args, **_kwargs):
+                    return future
+                def is_closed(self):
+                    return False
+
+            try:
+                with patch("plugins.platforms.feishu.adapter.asyncio.get_running_loop",
+                           return_value=_Loop()):
+                    connected = asyncio.run(adapter.connect())
+            finally:
+                loop.close()
+
+        self.assertTrue(connected)
+        # Verify the Channel SDK UA tag is present — this is the fix for
+        # group @mention message delivery over WebSocket.
+        mock_ws_client.assert_called_once()
+        call_kwargs = mock_ws_client.call_args.kwargs
+        self.assertIn("extra_ua_tags", call_kwargs,
+                      "FeishuWSClient must receive extra_ua_tags for group @mention delivery")
+        self.assertEqual(call_kwargs["extra_ua_tags"], ["channel"],
+                         "extra_ua_tags must be ['channel'] to enable group event routing")
+
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_updates_existing_feishu_message(self):
         from gateway.config import PlatformConfig
@@ -370,7 +516,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(captured["request"].request_body.msg_type, "text")
         self.assertEqual(
             captured["request"].request_body.content,
-            json.dumps({"text": "📖 read_file: \"/tmp/image.png\""}, ensure_ascii=False),
+            orjson.dumps({"text": "📖 read_file: \"/tmp/image.png\""}).decode('utf-8'),
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -413,7 +559,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
-            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
+            orjson.dumps({"text": "可以用 粗体 和 斜体。"}).decode('utf-8'),
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -1220,15 +1366,13 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter = FeishuAdapter(PlatformConfig())
         message = SimpleNamespace(
             message_type="merge_forward",
-            content=json.dumps(
-                {
+            content=orjson.dumps({
                     "title": "Forwarded updates",
                     "messages": [
                         {"sender_name": "Alice", "text": "Investigating the incident"},
                         {"sender_name": "Bob", "text": "ETA 10 minutes"},
                     ],
-                }
-            ),
+                }).decode('utf-8'),
             message_id="om_merge_forward",
         )
 
@@ -1269,8 +1413,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter = FeishuAdapter(PlatformConfig())
         message = SimpleNamespace(
             message_type="interactive",
-            content=json.dumps(
-                {
+            content=orjson.dumps({
                     "card": {
                         "header": {"title": {"tag": "plain_text", "content": "Approval Request"}},
                         "elements": [
@@ -1283,8 +1426,7 @@ class TestAdapterBehavior(unittest.TestCase):
                             },
                         ],
                     }
-                }
-            ),
+                }).decode('utf-8'),
             message_id="om_interactive",
         )
 
@@ -1525,15 +1667,15 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter = FeishuAdapter(PlatformConfig())
         adapter._on_message_event = Mock()
 
-        body = json.dumps({
+        body = orjson.dumps({
             "header": {"event_type": "im.message.receive_v1"},
             "event": {"message": {"message_id": "om_test"}},
-        }).encode("utf-8")
+        })
         request = SimpleNamespace(
             remote="127.0.0.1",
             content_length=None,
             headers={},
-            read=AsyncMock(return_value=body),
+            content=_FakeRequestContent(body),
         )
 
         response = asyncio.run(adapter._handle_webhook_request(request))
@@ -1553,16 +1695,16 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        body = json.dumps({
+        body = orjson.dumps({
             "type": "url_verification",
             "token": "wrong-token",
             "challenge": "attacker-controlled-challenge",
-        }).encode("utf-8")
+        })
         request = SimpleNamespace(
             remote="203.0.113.10",
             content_length=None,
             headers={},
-            read=AsyncMock(return_value=body),
+            content=_FakeRequestContent(body),
         )
 
         response = asyncio.run(adapter._handle_webhook_request(request))
@@ -2226,7 +2368,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["upload_request"].request_body.file_type, "pdf")
         self.assertEqual(
             captured["message_request"].request_body.content,
-            '{"file_key": "file_123"}',
+            '{"file_key":"file_123"}',
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2278,8 +2420,8 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(captured["message_request"].request_body.msg_type, "post")
-        self.assertIn('"tag": "media"', captured["message_request"].request_body.content)
-        self.assertIn('"file_key": "file_123"', captured["message_request"].request_body.content)
+        self.assertIn('"tag":"media"', captured["message_request"].request_body.content)
+        self.assertIn('"file_key":"file_123"', captured["message_request"].request_body.content)
         self.assertIn("报告请看", captured["message_request"].request_body.content)
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2333,7 +2475,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["upload_request"].request_body.image_type, "message")
         self.assertEqual(
             captured["message_request"].request_body.content,
-            '{"image_key": "img_123"}',
+            '{"image_key":"img_123"}',
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2385,8 +2527,8 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(captured["message_request"].request_body.msg_type, "post")
-        self.assertIn('"tag": "img"', captured["message_request"].request_body.content)
-        self.assertIn('"image_key": "img_123"', captured["message_request"].request_body.content)
+        self.assertIn('"tag":"img"', captured["message_request"].request_body.content)
+        self.assertIn('"image_key":"img_123"', captured["message_request"].request_body.content)
         self.assertIn("截图说明", captured["message_request"].request_body.content)
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2438,7 +2580,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(captured["upload_request"].request_body.file_type, "mp4")
         self.assertEqual(captured["message_request"].request_body.msg_type, "media")
-        self.assertEqual(captured["message_request"].request_body.content, '{"file_key": "file_video_123"}')
+        self.assertEqual(captured["message_request"].request_body.content, '{"file_key":"file_video_123"}')
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_voice_uploads_opus_and_sends_audio_message(self):
@@ -2489,7 +2631,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(captured["upload_request"].request_body.file_type, "opus")
         self.assertEqual(captured["message_request"].request_body.msg_type, "audio")
-        self.assertEqual(captured["message_request"].request_body.content, '{"file_key": "file_audio_123"}')
+        self.assertEqual(captured["message_request"].request_body.content, '{"file_key":"file_audio_123"}')
 
     @patch.dict(os.environ, {}, clear=True)
     def test_build_post_payload_extracts_title_and_links(self):
@@ -2497,7 +2639,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(adapter._build_post_payload("# 标题\n访问 [文档](https://example.com)"))
+        payload = orjson.loads(adapter._build_post_payload("# 标题\n访问 [文档](https://example.com)"))
 
         elements = payload["zh_cn"]["content"][0]
         self.assertEqual(elements, [{"tag": "md", "text": "# 标题\n访问 [文档](https://example.com)"}])
@@ -2508,7 +2650,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
+        payload = orjson.loads(
             adapter._build_post_payload("支持 **粗体**、*斜体* 和 `代码`")
         )
 
@@ -2526,7 +2668,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
+        payload = orjson.loads(
             adapter._build_post_payload(
                 "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"
             )
@@ -2537,6 +2679,127 @@ class TestAdapterBehavior(unittest.TestCase):
             rows,
             [[{"tag": "md", "text": "---\n1. 第一项\n  2. 子项\n- 外层\n  - 内层\n<u>下划线</u> 和 ~~删除线~~"}]],
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_outbound_payload_uses_post_for_markdown_table(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        content = "| Name | Score |\n| --- | ---: |\n| Ada | 10 |"
+
+        msg_type, raw_payload = adapter._build_outbound_payload(content)
+
+        self.assertEqual(msg_type, "post")
+        payload = json.loads(raw_payload)
+        self.assertEqual(
+            payload["zh_cn"]["content"],
+            [[{"tag": "md", "text": content}]],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_post_for_every_chunk_of_multi_chunk_markdown(self):
+        """Regression for #26841: when a long Markdown message is split
+        across multiple chunks, every chunk must go out as
+        ``msg_type=post`` — including chunk 1.  The bug was that the
+        first chunk often had only plain prose (the per-chunk regex
+        didn't match) and was sent as ``text``, so users saw literal
+        ``**bold``/``## heading``/code fences while later chunks
+        rendered correctly.
+        """
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured.append(request)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        message_id=f"om_chunk_{len(captured)}",
+                    ),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # Force a deterministic split so the test doesn't depend on the
+        # exact 8000-char limit.  Chunk 1 is plain prose; chunk 2 has
+        # the markdown markers.  Without the fix, chunk 1 went out as
+        # ``msg_type=text``.
+        first_chunk = "Here is a short intro that has no markdown markers at all."
+        second_chunk = "## Heading\nAnd then some **bold** text."
+
+        with patch.object(
+            adapter, "truncate_message", return_value=[first_chunk, second_chunk],
+        ), patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content=first_chunk + "\n" + second_chunk,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(captured), 2)
+        msg_types = [r.request_body.msg_type for r in captured]
+        self.assertEqual(msg_types, ["post", "post"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_plain_text_message_not_upgraded_by_prefer_post(self):
+        """A message with no markdown at all must still go out as plain
+        ``msg_type=text`` — the whole-message ``prefer_post`` decision
+        only flips on when the formatted message matches the hint regex.
+        """
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured.append(request)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(
+                        message_id=f"om_chunk_{len(captured)}",
+                    ),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="just a plain sentence",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].request_body.msg_type, "text")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_inline_markdown(self):
@@ -2575,7 +2838,7 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
+        payload = orjson.loads(captured["request"].request_body.content)
         elements = payload["zh_cn"]["content"][0]
         self.assertEqual(elements, [{"tag": "md", "text": "可以用 **粗体** 和 *斜体*。"}])
 
@@ -2626,7 +2889,7 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
+        payload = orjson.loads(captured["request"].request_body.content)
         rows = payload["zh_cn"]["content"]
         self.assertEqual(
             rows,
@@ -2648,7 +2911,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
+        payload = orjson.loads(
             adapter._build_post_payload(
                 "before\n```python\n```oops\n```\nafter"
             )
@@ -2669,7 +2932,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
+        payload = orjson.loads(
             adapter._build_post_payload(
                 "before\n```python\nline with two spaces  \n```\nafter"
             )
@@ -2690,7 +2953,7 @@ class TestAdapterBehavior(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        payload = json.loads(
+        payload = orjson.loads(
             adapter._build_post_payload(
                 "before\n```python\nprint(1)\n```\nmiddle\n```json\n{}\n```\nafter"
             )
@@ -2749,7 +3012,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
-            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
+            orjson.dumps({"text": "可以用 粗体 和 斜体。"}).decode('utf-8'),
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2794,7 +3057,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
         self.assertEqual(
             captured["calls"][1].request_body.content,
-            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
+            orjson.dumps({"text": "可以用 粗体 和 斜体。"}).decode('utf-8'),
         )
 
     @patch.dict(os.environ, {}, clear=True)
@@ -2834,7 +3097,7 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
+        payload = orjson.loads(captured["request"].request_body.content)
         rows = payload["zh_cn"]["content"]
         self.assertEqual(
             rows,
@@ -2862,15 +3125,13 @@ class TestHydrateBotIdentity(unittest.TestCase):
     def test_hydration_populates_open_id_from_bot_info(self):
         adapter = self._make_adapter()
         adapter._client = Mock()
-        payload = json.dumps(
-            {
+        payload = orjson.dumps({
                 "code": 0,
                 "bot": {
                     "bot_name": "Hermes Bot",
                     "open_id": "ou_hermes_hydrated",
                 },
-            }
-        ).encode("utf-8")
+            })
         response = SimpleNamespace(raw=SimpleNamespace(content=payload))
         adapter._client.request = Mock(return_value=response)
 
@@ -2890,15 +3151,13 @@ class TestHydrateBotIdentity(unittest.TestCase):
     def test_hydration_refreshes_env_values_when_bot_info_available(self):
         adapter = self._make_adapter()
         adapter._client = Mock()
-        payload = json.dumps(
-            {
+        payload = orjson.dumps({
                 "code": 0,
                 "bot": {
                     "bot_name": "Hydrated Hermes",
                     "open_id": "ou_hydrated",
                 },
-            }
-        ).encode("utf-8")
+            })
         adapter._client.request = Mock(return_value=SimpleNamespace(raw=SimpleNamespace(content=payload)))
 
         asyncio.run(adapter._hydrate_bot_identity())
@@ -2915,15 +3174,13 @@ class TestHydrateBotIdentity(unittest.TestCase):
         """A stale env open_id should not break group mention gating after app migration."""
         adapter = self._make_adapter()
         adapter._client = Mock()
-        payload = json.dumps(
-            {
+        payload = orjson.dumps({
                 "code": 0,
                 "bot": {
                     "bot_name": "Hermes Bot",
                     "open_id": "ou_probe_DIFFERENT",
                 },
-            }
-        ).encode("utf-8")
+            })
         adapter._client.request = Mock(return_value=SimpleNamespace(raw=SimpleNamespace(content=payload)))
 
         asyncio.run(adapter._hydrate_bot_identity())
@@ -3190,6 +3447,30 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 413)
 
+    def test_webhook_request_rejects_oversized_chunked_body_while_reading(self):
+        from gateway.config import PlatformConfig
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from plugins.platforms.feishu.adapter import FeishuAdapter, _FEISHU_WEBHOOK_MAX_BODY_BYTES
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token = set_hermes_home_override(tmpdir)
+            try:
+                adapter = FeishuAdapter(PlatformConfig())
+            finally:
+                reset_hermes_home_override(token)
+            content = _FakeRequestContent(b"A" * (_FEISHU_WEBHOOK_MAX_BODY_BYTES + 2))
+            request = SimpleNamespace(
+                remote="127.0.0.1",
+                content_length=None,
+                headers={},
+                content=content,
+            )
+
+            response = asyncio.run(adapter._handle_webhook_request(request))
+
+            self.assertEqual(response.status, 413)
+            self.assertEqual(content.read_sizes, [_FEISHU_WEBHOOK_MAX_BODY_BYTES + 1])
+
     @patch.dict(os.environ, {}, clear=True)
     def test_webhook_request_rejects_invalid_json(self):
         from gateway.config import PlatformConfig
@@ -3199,7 +3480,7 @@ class TestWebhookSecurity(unittest.TestCase):
         request = SimpleNamespace(
             remote="127.0.0.1",
             content_length=None,
-            read=AsyncMock(return_value=b"not-json"),
+            content=_FakeRequestContent(b"not-json"),
         )
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 400)
@@ -3210,12 +3491,12 @@ class TestWebhookSecurity(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        body = json.dumps({"header": {"event_type": "im.message.receive_v1"}}).encode()
+        body = orjson.dumps({"header": {"event_type": "im.message.receive_v1"}})
         request = SimpleNamespace(
             remote="127.0.0.1",
             content_length=None,
             headers={"x-lark-request-timestamp": "123", "x-lark-request-nonce": "abc", "x-lark-signature": "bad"},
-            read=AsyncMock(return_value=body),
+            content=_FakeRequestContent(body),
         )
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 401)
@@ -3260,11 +3541,11 @@ class TestWebhookSecurity(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        body = json.dumps({"type": "url_verification", "challenge": "test_challenge_token"}).encode()
+        body = orjson.dumps({"type": "url_verification", "challenge": "test_challenge_token"})
         request = SimpleNamespace(
             remote="127.0.0.1",
             content_length=None,
-            read=AsyncMock(return_value=body),
+            content=_FakeRequestContent(body),
         )
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 200)
@@ -3313,15 +3594,13 @@ class TestDedupTTL(unittest.TestCase):
                 adapter = FeishuAdapter(PlatformConfig())
                 adapter._dedup_state_path.parent.mkdir(parents=True, exist_ok=True)
                 adapter._dedup_state_path.write_text(
-                    json.dumps(
-                        {
+                    orjson.dumps({
                             "message_ids": {
                                 "om_good": time.time(),
                                 "om_bad_str": "not-a-timestamp",
                                 "om_bad_null": None,
                             }
-                        }
-                    ),
+                        }).decode('utf-8'),
                     encoding="utf-8",
                 )
                 adapter._load_seen_message_ids()
@@ -3341,7 +3620,7 @@ class TestDedupTTL(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter._dedup_state_path = Path(tmpdir) / "dedup.json"
             adapter._persist_seen_message_ids()
-            saved = json.loads(adapter._dedup_state_path.read_text())
+            saved = orjson.loads(adapter._dedup_state_path.read_text())
         self.assertIsInstance(saved["message_ids"], dict)
         self.assertAlmostEqual(saved["message_ids"]["om_ts1"], ts, places=1)
 
@@ -3353,7 +3632,7 @@ class TestDedupTTL(unittest.TestCase):
         adapter = FeishuAdapter(PlatformConfig())
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "dedup.json"
-            path.write_text(json.dumps({"message_ids": ["om_a", "om_b"]}), encoding="utf-8")
+            path.write_text(orjson.dumps({"message_ids": ["om_a", "om_b"]}).decode('utf-8'), encoding="utf-8")
             adapter._dedup_state_path = path
             adapter._load_seen_message_ids()
         self.assertIn("om_a", adapter._seen_message_ids)
@@ -3504,12 +3783,12 @@ class TestBotNameResolution(unittest.TestCase):
 
     @staticmethod
     def _batch_payload(bots: Dict[str, str]):
-        import json as _json
+        import orjson as _json
         body = {
             oid: {"bot_id": oid, "name": name, "i18n_names": {"en_us": name}}
             for oid, name in bots.items()
         }
-        return _json.dumps({"code": 0, "msg": "", "data": {"bots": body, "failed_bots": {}}}).encode()
+        return _json.dumps({"code": 0, "msg": "", "data": {"bots": body, "failed_bots": {}}})
 
     def _build_adapter_with_bots(self, bots: Dict[str, str]):
         from gateway.config import PlatformConfig
@@ -4229,7 +4508,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
         )
         normalized = normalize_feishu_message(
             message_type="text",
-            raw_content=json.dumps({"text": "@_user_1 hello"}),
+            raw_content=orjson.dumps({"text": "@_user_1 hello"}).decode('utf-8'),
             mentions=[mention],
             bot=_FeishuBotIdentity(open_id="ou_bot"),
         )
@@ -4248,7 +4527,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
         )
         normalized = normalize_feishu_message(
             message_type="text",
-            raw_content=json.dumps({"text": "@_user_1 /help"}),
+            raw_content=orjson.dumps({"text": "@_user_1 /help"}).decode('utf-8'),
             mentions=[mention],
             bot=_FeishuBotIdentity(open_id="ou_bot"),
         )
@@ -4262,7 +4541,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
         mention = SimpleNamespace(key="@_all", id=None, name="")
         normalized = normalize_feishu_message(
             message_type="text",
-            raw_content=json.dumps({"text": "@_all meeting"}),
+            raw_content=orjson.dumps({"text": "@_all meeting"}).decode('utf-8'),
             mentions=[mention],
         )
         self.assertEqual(normalized.text_content, "@all meeting")
@@ -4277,7 +4556,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
 
         normalized = normalize_feishu_message(
             message_type="text",
-            raw_content=json.dumps({"text": "@_all hello"}),
+            raw_content=orjson.dumps({"text": "@_all hello"}).decode('utf-8'),
             mentions=None,
         )
         self.assertEqual(normalized.text_content, "@all hello")
@@ -4290,7 +4569,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
 
         normalized = normalize_feishu_message(
             message_type="text",
-            raw_content=json.dumps({"text": "plain hello"}),
+            raw_content=orjson.dumps({"text": "plain hello"}).decode('utf-8'),
             mentions=None,
         )
         self.assertEqual(normalized.mentions, [])
@@ -4300,7 +4579,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
 
         normalized = normalize_feishu_message(
             message_type="text",
-            raw_content=json.dumps({"text": "hello world"}),
+            raw_content=orjson.dumps({"text": "hello world"}).decode('utf-8'),
         )
         self.assertEqual(normalized.text_content, "hello world")
         self.assertEqual(normalized.mentions, [])
@@ -4310,7 +4589,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
         resolves to open_id via placeholder lookup, not direct tag fields."""
         from plugins.platforms.feishu.adapter import normalize_feishu_message, _FeishuBotIdentity
 
-        raw = json.dumps({
+        raw = orjson.dumps({
             "en_us": {
                 "content": [
                     [
@@ -4319,7 +4598,7 @@ class TestFeishuNormalizeWithMentions(unittest.TestCase):
                     ]
                 ]
             }
-        })
+        }).decode('utf-8')
         bot_mention = SimpleNamespace(
             key="@_user_1",
             id=SimpleNamespace(open_id="ou_bot", user_id=""),
@@ -4380,7 +4659,7 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
     def test_returns_five_tuple_with_mentions(self):
         adapter = self._build_adapter()
         message = SimpleNamespace(
-            content=json.dumps({"text": "@_user_1 hello"}),
+            content=orjson.dumps({"text": "@_user_1 hello"}).decode('utf-8'),
             message_type="text",
             message_id="m1",
             mentions=[
@@ -4402,7 +4681,7 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
     def test_returns_empty_mentions_when_missing(self):
         adapter = self._build_adapter()
         message = SimpleNamespace(
-            content=json.dumps({"text": "plain hello"}),
+            content=orjson.dumps({"text": "plain hello"}).decode('utf-8'),
             message_type="text",
             message_id="m2",
             mentions=None,
@@ -4442,7 +4721,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
             name="Hermes",
         )
         message = SimpleNamespace(
-            content=json.dumps({"text": "@_user_1 /help"}),
+            content=orjson.dumps({"text": "@_user_1 /help"}).decode('utf-8'),
             message_type="text",
             message_id="m1",
             mentions=[bot_mention],
@@ -4479,7 +4758,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
             name="Bob",
         )
         message = SimpleNamespace(
-            content=json.dumps({"text": "@_user_1 @_user_2 make a group"}),
+            content=orjson.dumps({"text": "@_user_1 @_user_2 make a group"}).decode('utf-8'),
             message_type="text",
             message_id="m2",
             mentions=[alice, bob],
@@ -4515,7 +4794,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
             name="Alice",
         )
         message = SimpleNamespace(
-            content=json.dumps({"text": "@_user_1 /model @_user_2"}),
+            content=orjson.dumps({"text": "@_user_1 /model @_user_2"}).decode('utf-8'),
             message_type="text",
             message_id="m3",
             mentions=[bot_mention, alice],
@@ -4545,7 +4824,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
             name="Hermes",
         )
         message = SimpleNamespace(
-            content=json.dumps({"text": "stop pinging @_user_1 please"}),
+            content=orjson.dumps({"text": "stop pinging @_user_1 please"}).decode('utf-8'),
             message_type="text",
             message_id="m4",
             mentions=[bot_mention],
@@ -4579,7 +4858,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
             name="Hermes",
         )
         message = SimpleNamespace(
-            content=json.dumps({"text": "@_user_1"}),
+            content=orjson.dumps({"text": "@_user_1"}).decode('utf-8'),
             message_type="text",
             message_id="m5",
             mentions=[bot_mention],
@@ -4620,7 +4899,7 @@ class TestFeishuFetchMessageText(unittest.TestCase):
             name="Alice",
         )
         parent = SimpleNamespace(
-            body=SimpleNamespace(content=json.dumps({"text": "@_user_1 hi"})),
+            body=SimpleNamespace(content=orjson.dumps({"text": "@_user_1 hi"}).decode('utf-8')),
             msg_type="text",
             mentions=[alice_mention],
         )
@@ -4650,7 +4929,7 @@ class TestFeishuFetchMessageText(unittest.TestCase):
         self.assertEqual(
             adapter._extract_text_from_raw_content(
                 msg_type="text",
-                raw_content=json.dumps({"text": "@_user_1 hello"}),
+                raw_content=orjson.dumps({"text": "@_user_1 hello"}).decode('utf-8'),
                 mentions=[alice_mention],
             ),
             "@Alice hello",
@@ -4669,7 +4948,7 @@ class TestFeishuFetchMessageText(unittest.TestCase):
             name="Hermes",
         )
         parent = SimpleNamespace(
-            body=SimpleNamespace(content=json.dumps({"text": "@_user_1 hi"})),
+            body=SimpleNamespace(content=orjson.dumps({"text": "@_user_1 hi"}).decode('utf-8')),
             msg_type="text",
             mentions=[bot_mention],
         )
@@ -4732,7 +5011,7 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
             for m in mentions
         ]
         message = SimpleNamespace(
-            content=json.dumps({"text": text}),
+            content=orjson.dumps({"text": text}).decode('utf-8'),
             message_type="text",
             message_id="m",
             mentions=raw_mentions,
@@ -4810,14 +5089,14 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
             id=SimpleNamespace(open_id="ou_alice", user_id=""),
             name="Alice",
         )
-        post_content = json.dumps({
+        post_content = orjson.dumps({
             "zh_cn": {
                 "content": [[
                     {"tag": "at", "user_id": "@_user_1", "user_name": "Alice"},
                     {"tag": "text", "text": " lookup this doc"},
                 ]]
             }
-        })
+        }).decode('utf-8')
         message = SimpleNamespace(
             content=post_content,
             message_type="post",
@@ -4853,7 +5132,7 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
             id=SimpleNamespace(open_id="ou_alice", user_id=""),
             name="Alice",
         )
-        post_content = json.dumps({
+        post_content = orjson.dumps({
             "zh_cn": {
                 "content": [[
                     {"tag": "at", "user_id": "@_user_1", "user_name": "Hermes"},
@@ -4861,7 +5140,7 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
                     {"tag": "text", "text": " review the spec with Alice"},
                 ]]
             }
-        })
+        }).decode('utf-8')
         message = SimpleNamespace(
             content=post_content,
             message_type="post",

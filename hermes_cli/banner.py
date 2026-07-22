@@ -3,7 +3,7 @@
 Pure display functions with no HermesCLI state dependency.
 """
 
-import json
+import orjson
 import logging
 import os
 import shutil
@@ -270,7 +270,7 @@ def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
         url = f"https://pypi.org/pypi/{package}/json"
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
+            data = orjson.loads(resp.read())
             return data.get("info", {}).get("version")
     except Exception:
         return None
@@ -322,8 +322,8 @@ def check_for_updates() -> Optional[int]:
     # both the Rich banner (build_welcome_banner) and the Ink badge
     # (branding.tsx, guarded on `typeof === 'number' && > 0`) show nothing.
     try:
-        from hermes_cli.config import detect_install_method
-        if detect_install_method() == "docker":
+        from hermes_cli.config import detect_install_method, get_project_root
+        if detect_install_method(get_project_root()) == "docker":
             return None
     except Exception:
         pass
@@ -336,7 +336,7 @@ def check_for_updates() -> Optional[int]:
     now = time.time()
     try:
         if cache_file.exists():
-            cached = json.loads(cache_file.read_text())
+            cached = orjson.loads(cache_file.read_text())
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
@@ -362,7 +362,7 @@ def check_for_updates() -> Optional[int]:
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
+            orjson.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}).decode('utf-8')
         )
     except Exception:
         pass
@@ -603,6 +603,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text as _RichText
     if get_toolset_for_tool is None:
         from model_tools import get_toolset_for_tool
 
@@ -804,18 +805,34 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         skills_by_category = {}
         total_skills = 0
 
+    # Dynamically size skills display based on terminal width.
+    # Rich grid with 2 columns; right column gets roughly 60% of terminal.
+    _term_cols = shutil.get_terminal_size().columns
+    _right_col_width = max(int(_term_cols * 0.6) - 10, 30)
+
     if not _skills_enabled:
         right_lines.append(f"[dim {dim}]Skills toolset disabled[/]")
     elif skills_by_category:
         for category in sorted(skills_by_category.keys()):
             skill_names = sorted(skills_by_category[category])
-            if len(skill_names) > 8:
-                display_names = skill_names[:8]
-                skills_str = ", ".join(display_names) + f" +{len(skill_names) - 8} more"
-            else:
-                skills_str = ", ".join(skill_names)
-            if len(skills_str) > 50:
-                skills_str = skills_str[:47] + "..."
+            # Account for "category: " prefix
+            _prefix_len = len(category) + 2
+            _avail = max(_right_col_width - _prefix_len, 20)
+            # Accumulate skills until we run out of space
+            parts, length = [], 0
+            for i, name in enumerate(skill_names):
+                _sep = ", " if parts else ""
+                _needed = len(_sep) + len(name)
+                # Estimate indicator size IF we were to add this skill then stop
+                _after = len(skill_names) - (i + 1)  # remaining after adding this
+                _ind_len = len(f", +{_after} more") if _after > 0 else 0
+                if parts and length + _needed + _ind_len > _avail:
+                    remaining = len(skill_names) - len(parts)
+                    parts.append(f"+{remaining} more")
+                    break
+                parts.append(name)
+                length += _needed
+            skills_str = ", ".join(parts)
             right_lines.append(f"[dim {dim}]{category}:[/] [{text}]{skills_str}[/]")
     else:
         right_lines.append(f"[dim {dim}]No skills installed[/]")
@@ -873,17 +890,23 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     except Exception:
         pass  # Never break the banner over an update check
 
-    # Pip-install warning — `pip install hermes-agent` is not the supported
-    # install path (it exists on PyPI for internal/CI reasons, not end users).
-    # Such installs miss the git checkout + installer-managed deps, so updates,
-    # self-update, and issue triage don't behave correctly. Warn, don't block.
+    # Unsupported install-method warning — pip/PyPI and Homebrew are no
+    # longer an officially supported distribution method (see
+    # website/docs/getting-started/platform-support.md). Such installs miss
+    # the git checkout + installer-managed deps, so updates, self-update, and
+    # issue triage don't behave correctly. Warn, don't block. NixOS is fully
+    # supported and never hits this.
     try:
-        from hermes_cli.config import detect_install_method
-        if detect_install_method() == "pip":
+        from hermes_cli.config import (
+            detect_install_method,
+            format_unsupported_install_warning,
+            is_unsupported_install_method,
+            get_project_root
+        )
+        _install_method = detect_install_method(get_project_root())
+        if is_unsupported_install_method(_install_method):
             right_lines.append(
-                "[bold yellow]⚠ pip install not officially supported[/]"
-                "[dim yellow] — exists for reasons other than user install; "
-                "expect instability and an inability to support issues[/]"
+                f"[bold yellow]⚠ {format_unsupported_install_warning(_install_method)}[/]"
             )
     except Exception:
         pass  # Never break the banner over the install-method check
@@ -897,7 +920,20 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     release_info = get_latest_release_tag()
     if release_info:
         _tag, _url = release_info
-        title_markup = f"[bold {title_color}][link={_url}]{version_label}[/link][/]"
+        # Build a Text object with manual OSC-8 hyperlink wrapping.
+        # Rich's built-in [link=...] markup is suppressed on Windows
+        # because legacy_windows=True prevents Style.render() from
+        # emitting the \x1b]8;... escape sequence. By constructing the
+        # title as a Text object with raw escape codes in unstyled
+        # segments, we bypass that limitation entirely.
+        osc8_open = f"\x1b]8;id=0;{_url}\x1b\\"
+        osc8_close = "\x1b]8;;\x1b\\"
+        inner = _RichText.from_markup(f"[bold {title_color}]{version_label}[/]")
+        title_markup = _RichText.assemble(
+            (osc8_open, ""),
+            inner,
+            (osc8_close, ""),
+        )
     else:
         title_markup = f"[bold {title_color}]{version_label}[/]"
     outer_panel = Panel(

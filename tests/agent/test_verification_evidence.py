@@ -1,4 +1,4 @@
-import json
+import orjson
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -14,7 +14,7 @@ from agent.verification_evidence import (
 
 def _node_project(root: Path) -> None:
     (root / "package.json").write_text(
-        json.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "dev": "vite"}})
+        orjson.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "dev": "vite"}}).decode('utf-8')
     )
     (root / "pnpm-lock.yaml").write_text("")
     scripts = root / "scripts"
@@ -287,7 +287,7 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
 
     from tools.file_tools import write_file_tool
 
-    result = json.loads(
+    result = orjson.loads(
         write_file_tool(
             str(target),
             "export const ok = true\n",
@@ -391,3 +391,36 @@ def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
     status = verification_status(session_id="old-session", cwd=tmp_path)
     assert status["status"] == "unverified"
     assert status["changed_paths"] == []
+
+
+def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):
+    """Ad-hoc verification scripts with Windows backslash paths must be
+    matched by ``_find_ad_hoc_match`` trying ``posix=False`` in addition to
+    the default ``posix=True``. (#53553 / #65919)
+
+    On Linux, ``Path`` doesn't parse Windows backslash paths, so we mock
+    ``_is_temp_script_path`` to simulate the Windows environment where the
+    path resolves correctly. The test verifies the posix=False splitting
+    fallback — the actual fix from #53553.
+    """
+    from agent.verification_evidence import _find_ad_hoc_match
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+
+    # On Windows, shlex.split(posix=True) eats backslashes as escape chars;
+    # posix=False preserves them. Mock _is_temp_script_path so the test
+    # focuses on the splitting fallback without needing a real Windows FS.
+    def mock_is_temp_script(token, root):
+        return "hermes-ad-hoc" in token and ".py" in token
+
+    monkeypatch.setattr(
+        "agent.verification_evidence._is_temp_script_path",
+        mock_is_temp_script,
+    )
+
+    win_script = r"C:\Users\test\AppData\Local\Temp\hermes-ad-hoc-check.py"
+    result = _find_ad_hoc_match(f"python {win_script}", tmp_path)
+    assert result is not None, (
+        "Windows backslash path should be matched via posix=False fallback"
+    )

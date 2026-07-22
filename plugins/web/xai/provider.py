@@ -32,9 +32,9 @@ to ``XAI_API_KEY`` (resolved through ``~/.hermes/.env``, then
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
-import re
+from agent.re_compat import re
 from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
@@ -270,7 +270,10 @@ class XAIWebSearchProvider(WebSearchProvider):
                         "refresh and retrying once.",
                     )
                     try:
-                        refreshed = resolve_xai_http_credentials(force_refresh=True)
+                        refreshed = resolve_xai_http_credentials(
+                            force_refresh=True,
+                            api_key_hint=api_key,
+                        )
                         refreshed_key = str(refreshed.get("api_key") or "").strip()
                         if refreshed_key and refreshed_key != api_key:
                             api_key = refreshed_key
@@ -465,8 +468,8 @@ class XAIWebSearchProvider(WebSearchProvider):
 
         for candidate in candidates:
             try:
-                parsed = json.loads(candidate)
-            except (json.JSONDecodeError, ValueError):
+                parsed = orjson.loads(candidate)
+            except (orjson.JSONDecodeError, ValueError):
                 continue
             if not isinstance(parsed, dict):
                 continue

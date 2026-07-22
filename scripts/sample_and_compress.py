@@ -15,7 +15,7 @@ Usage:
     python scripts/sample_and_compress.py --output_name=compressed_16k
 """
 
-import json
+import orjson
 import random
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
@@ -211,7 +211,7 @@ def sample_from_datasets(
         source = entry.get("_source_dataset", "unknown").split("/")[-1]
         source_counts[source] = source_counts.get(source, 0) + 1
     
-    print(f"\n📌 Sample distribution by source:")
+    print("\n📌 Sample distribution by source:")
     for source, count in sorted(source_counts.items()):
         print(f"      {source}: {count:,}")
     
@@ -250,7 +250,7 @@ def save_samples_for_compression(
         output_file = output_dir / f"batch_{i}.jsonl"
         with open(output_file, 'w', encoding='utf-8') as f:
             for entry in batch:
-                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                f.write(orjson.dumps(entry).decode('utf-8') + '\n')
     
     print(f"   ✅ Saved {num_batches} batch files")
 
@@ -269,7 +269,7 @@ def run_compression(input_dir: Path, output_dir: Path, config_path: str):
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from trajectory_compressor import TrajectoryCompressor, CompressionConfig
     
-    print(f"\n🗜️  Running trajectory compression...")
+    print("\n🗜️  Running trajectory compression...")
     print(f"   Input: {input_dir}")
     print(f"   Output: {output_dir}")
     print(f"   Config: {config_path}")
@@ -302,12 +302,12 @@ def merge_output_to_single_jsonl(input_dir: Path, output_file: Path):
             for line in f:
                 line = line.strip()
                 if line:
-                    all_entries.append(json.loads(line))
+                    all_entries.append(orjson.loads(line))
     
     # Write merged file
     with open(output_file, 'w', encoding='utf-8') as f:
         for entry in all_entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            f.write(orjson.dumps(entry).decode('utf-8') + '\n')
     
     print(f"   ✅ Merged {len(all_entries):,} entries into {output_file.name}")
     return output_file
@@ -348,7 +348,7 @@ def main(
     else:
         dataset_list = DEFAULT_DATASETS
     
-    print(f"\n📋 Configuration:")
+    print("\n📋 Configuration:")
     print(f"   Total samples: {total_samples:,}")
     print(f"   Min tokens filter: {min_tokens:,}")
     print(f"   Parallel workers: {num_proc}")
@@ -401,7 +401,7 @@ def main(
     print(f"\n📁 Raw samples:        {sampled_dir}")
     print(f"📁 Compressed batches: {compressed_dir}")
     print(f"📁 Final output:       {final_output}")
-    print(f"\nTo upload to HuggingFace:")
+    print("\nTo upload to HuggingFace:")
     print(f"   huggingface-cli upload NousResearch/{output_name} {final_output}")
 
 

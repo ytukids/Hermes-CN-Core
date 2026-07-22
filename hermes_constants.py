@@ -11,6 +11,7 @@ import sys
 import sysconfig
 from contextvars import ContextVar, Token
 from pathlib import Path
+from agent.re_compat import re
 
 
 _profile_fallback_warned: bool = False
@@ -403,8 +404,7 @@ def hermes_managed_node_tree_present(home: Path | None = None) -> bool:
 
 
 def _heal_managed_node_windows() -> bool:
-    """Redownload the portable Node zip into ``%HERMES_HOME%\\node`` on Windows."""
-    import re
+    """Redownload the portable Node zip into ``%HERMES_HOME%\node`` on Windows."""
     import tempfile
     import urllib.request
     import zipfile
@@ -847,21 +847,29 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
         env["HOME"] = home
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
-def parse_reasoning_effort(effort: str) -> dict | None:
+def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh".
+    Valid levels: "none", "off", "minimal", "low", "medium", "high", "xhigh", "max".
     Returns None when the input is empty or unrecognized (caller uses default).
-    Returns {"enabled": False} for "none".
+    Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
+    YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``
+    in config.yaml and YAML hands us a bool, which must mean disabled, not
+    "fall back to the default and keep thinking").
     Returns {"enabled": True, "effort": <level>} for valid effort levels.
     """
-    if not effort or not effort.strip():
+    if effort is False:
+        return {"enabled": False}
+    if effort is None or effort is True:
+        return None
+    effort = str(effort)
+    if not effort.strip():
         return None
     effort = effort.strip().lower()
-    if effort == "none":
+    if effort in {"none", "off", "false", "disabled"}:
         return {"enabled": False}
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
@@ -977,6 +985,29 @@ def get_skills_dir() -> Path:
 def get_env_path() -> Path:
     """Return the path to the ``.env`` file under HERMES_HOME."""
     return get_hermes_home() / ".env"
+
+
+def get_managed_tools_dir() -> Path:
+    """Return the Hermes-managed external tools directory.
+
+    External binaries that Hermes downloads itself (ripgrep, rtk, coreutils,
+    tirith, ...) live here so a broken global PATH copy cannot brick search,
+    terminal post-processing, or security checks.  The canonical location is
+    ``<HERMES_HOME>/tools``; the legacy ``<HERMES_HOME>/bin`` directory is
+    still accepted as a fallback so existing installs keep working without
+    migration.
+
+    Callers should treat the returned directory as the first place to look for
+    a managed binary.  Install scripts download new binaries into this path.
+    """
+    home = get_hermes_home()
+    tools_dir = home / "tools"
+    legacy_bin = home / "bin"
+    # If the legacy bin dir already has content and the new tools dir does not,
+    # keep using it for backward compatibility.  Otherwise prefer tools/.
+    if legacy_bin.exists() and not tools_dir.exists():
+        return legacy_bin
+    return tools_dir
 
 
 # ─── Network Preferences ─────────────────────────────────────────────────────

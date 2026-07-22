@@ -21,7 +21,7 @@ Design spec: ``website/docs/developer-guide/browser-supervisor.md``.
 from __future__ import annotations
 
 import asyncio
-import json
+import orjson
 import logging
 import threading
 import time
@@ -32,6 +32,32 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_cdp_error_text(exc: object) -> str:
+    """Redact any CDP endpoint credentials from an error's string form.
+
+    ``websockets`` bakes the raw target URL into its exception messages
+    (``InvalidURI``, connection errors, TLS failures all embed the full
+    ``self.cdp_url`` — including a ``?token=`` query credential or
+    ``user:pass@`` userinfo). Every supervisor egress point that turns such an
+    exception into log text or a re-raised message MUST route through here so
+    those credentials never reach Hermes logs or tracebacks. Falls back to a
+    fixed sentinel if redaction itself raises, erring toward masking.
+    """
+    try:
+        from agent.redact import redact_cdp_url
+
+        return redact_cdp_url(str(exc))
+    except Exception:
+        return "<error redacted>"
+
+
+def _redact_supervisor_text(value: str) -> str:
+    """Redact page-originated text before exposing supervisor snapshots."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(value, force=True)
 
 
 # ── Config defaults ───────────────────────────────────────────────────────────
@@ -147,8 +173,8 @@ class PendingDialog:
         return {
             "id": self.id,
             "type": self.type,
-            "message": self.message,
-            "default_prompt": self.default_prompt,
+            "message": _redact_supervisor_text(self.message),
+            "default_prompt": _redact_supervisor_text(self.default_prompt),
             "opened_at": self.opened_at,
             "frame_id": self.frame_id,
         }
@@ -175,7 +201,7 @@ class DialogRecord:
         return {
             "id": self.id,
             "type": self.type,
-            "message": self.message,
+            "message": _redact_supervisor_text(self.message),
             "opened_at": self.opened_at,
             "closed_at": self.closed_at,
             "closed_by": self.closed_by,
@@ -341,14 +367,26 @@ class CDPSupervisor:
         self._thread.start()
         if not self._ready_event.wait(timeout=timeout):
             self.stop()
+            try:
+                from agent.redact import redact_cdp_url
+                _safe_url = redact_cdp_url(self.cdp_url)
+            except Exception:
+                _safe_url = "<cdp_url redacted>"
             raise TimeoutError(
                 f"CDP supervisor did not attach within {timeout}s "
-                f"(cdp_url={self.cdp_url[:80]}...)"
+                f"(cdp_url={_safe_url[:80]}...)"
             )
         if self._start_error is not None:
             err = self._start_error
             self.stop()
-            raise err
+            # ``err`` is a raw ``websockets`` exception whose message embeds the
+            # full cdp_url (token / userinfo). Re-raise a redacted RuntimeError
+            # and suppress the raw cause (``from None``) so no credential leaks
+            # via the message OR the traceback chain. Type is not load-bearing:
+            # the sole caller (_ensure_cdp_supervisor) only logs it.
+            raise RuntimeError(
+                f"CDP supervisor failed to start: {_redact_cdp_error_text(err)}"
+            ) from None
 
     def stop(self, timeout: float = 5.0) -> None:
         """Cancel the supervisor task and join the thread."""
@@ -626,7 +664,7 @@ class CDPSupervisor:
                     return
                 logger.warning(
                     "CDP supervisor %s: connect failed (attempt %s): %s",
-                    self.task_id, attempt, e,
+                    self.task_id, attempt, _redact_cdp_error_text(e),
                 )
                 await asyncio.sleep(min(backoff, 10.0))
                 backoff = min(backoff * 2, 10.0)
@@ -663,7 +701,7 @@ class CDPSupervisor:
                     "CDP supervisor %s: session dropped after %.1fs: %s",
                     self.task_id,
                     time.time() - last_success_at,
-                    e,
+                    _redact_cdp_error_text(e),
                 )
             finally:
                 with self._state_lock:
@@ -802,7 +840,7 @@ class CDPSupervisor:
             payload["sessionId"] = session_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_calls[call_id] = fut
-        await self._ws.send(json.dumps(payload))
+        await self._ws.send(orjson.dumps(payload).decode('utf-8'))
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         finally:
@@ -816,7 +854,7 @@ class CDPSupervisor:
                 if self._stop_requested:
                     break
                 try:
-                    msg = json.loads(raw)
+                    msg = orjson.loads(raw)
                 except Exception:
                     logger.debug("CDP supervisor: non-JSON frame dropped")
                     continue
@@ -1133,9 +1171,9 @@ class CDPSupervisor:
             "prompt_text": prompt_text if dialog.type == "prompt" else "",
             "dialog_id": dialog.id,
         }
-        body = json.dumps(payload).encode()
+        body = orjson.dumps(payload)
         try:
-            import base64 as _b64
+            import pybase64 as _b64
             await self._cdp(
                 "Fetch.fulfillRequest",
                 {

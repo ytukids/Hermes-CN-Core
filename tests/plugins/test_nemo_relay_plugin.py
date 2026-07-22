@@ -6,7 +6,7 @@ import asyncio
 import builtins
 import gc
 import importlib
-import json
+import orjson
 import sys
 import warnings
 from pathlib import Path
@@ -143,7 +143,7 @@ class _FakeAtifExporter:
         return True
 
     def export_json(self):
-        return json.dumps({"session_id": self.session_id, "agent_name": self.agent_name})
+        return orjson.dumps({"session_id": self.session_id, "agent_name": self.agent_name}).decode('utf-8')
 
 
 def _fresh_plugin(monkeypatch, fake):
@@ -465,11 +465,11 @@ enabled = true
 
 [components.config.atof]
 enabled = true
-output_directory = "{atof_dir}"
+output_directory = "{atof_dir.as_posix()}"
 
 [components.config.atif]
 enabled = true
-output_directory = "{atif_dir}"
+output_directory = "{atif_dir.as_posix()}"
 """,
         encoding="utf-8",
     )

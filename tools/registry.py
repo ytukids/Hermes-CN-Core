@@ -15,9 +15,13 @@ Import chain (circular-import safe):
 """
 
 import ast
+import xxhash
 import importlib
+import orjson
 import json
 import logging
+import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -47,8 +51,19 @@ def _module_registers_tools(module_path: Path) -> bool:
     """
     try:
         source = module_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    # Fast substring pre-filter: a module that never even mentions
+    # ``registry.register`` cannot contain the call, so skip the (relatively
+    # expensive) ``ast.parse`` entirely. On this tree most helper modules do
+    # not self-register, so this roughly halves the discovery/index scan cost.
+    if "registry.register" not in source:
+        return False
+
+    try:
         tree = ast.parse(source, filename=str(module_path))
-    except (OSError, SyntaxError):
+    except SyntaxError:
         return False
 
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
@@ -74,18 +89,256 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     return imported
 
 
+# ---------------------------------------------------------------------------
+# Lazy tool index (deferred module imports)
+#
+# Importing every ``tools/*.py`` at startup is the single largest chunk of the
+# ``from run_agent import AIAgent`` import cascade (~700 ms on Windows/py3.14:
+# ~185 ms of AST discovery + ~340 ms of module bodies, dominated by
+# ``browser_tool`` pulling in its heavy deps). Almost none of it is needed for
+# a given agent, whose toolset selection usually touches a handful of modules.
+#
+# Instead of importing eagerly, we build a *metadata index* by statically
+# parsing each tool file's top-level ``registry.register(...)`` calls and
+# pulling out the literal ``name`` and ``toolset`` (module-level string
+# constants are resolved too). That yields ``tool name -> module`` and
+# ``toolset -> modules`` maps with **no imports**. The real module import is
+# deferred until a tool from it is first requested (get_definitions / dispatch
+# / get_entry) or an all-tools query runs. The index is cached on disk keyed by
+# a fingerprint of the tool files, so warm process starts skip even the scan.
+# ---------------------------------------------------------------------------
+
+_TOOL_INDEX_VERSION = 1
+_SKIP_TOOL_FILES = {"__init__.py", "registry.py", "mcp_tool.py"}
+
+
+def _empty_tool_index() -> dict:
+    return {
+        "version": _TOOL_INDEX_VERSION,
+        "tool_to_module": {},
+        "tool_to_toolset": {},
+        "module_to_tools": {},
+        "toolset_to_modules": {},
+        "opaque_modules": [],
+        "modules": [],
+    }
+
+
+def _iter_tool_files(tools_path: Path) -> List[Path]:
+    try:
+        return sorted(tools_path.glob("*.py"))
+    except OSError:
+        return []
+
+
+def _module_string_constants(tree: ast.Module) -> Dict[str, str]:
+    """Collect top-level ``NAME = "literal"`` string constants so a
+    ``toolset=_CONST`` reference can be resolved without importing the module.
+    """
+    consts: Dict[str, str] = {}
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            for tgt in stmt.targets:
+                if isinstance(tgt, ast.Name):
+                    consts[tgt.id] = stmt.value.value
+    return consts
+
+
+def _resolve_register_arg(node: ast.AST, consts: Dict[str, str]):
+    """Return the string value of a ``register()`` argument node, resolving
+    module-level string constants, or None when it is not statically known."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        return consts.get(node.id)
+    return None
+
+
+def build_tool_index(tools_dir: Optional[Path] = None) -> dict:
+    """Statically scan tool modules and return a lazy-import metadata index.
+
+    Never imports the modules. A module whose ``register()`` *name* argument is
+    not a static string literal is recorded in ``opaque_modules`` so callers
+    can fall back to importing it when a name lookup misses (correctness is
+    never sacrificed for laziness).
+    """
+    tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
+    index = _empty_tool_index()
+    for path in _iter_tool_files(tools_path):
+        if path.name in _SKIP_TOOL_FILES:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "registry.register" not in source:
+            continue
+        try:
+            tree = ast.parse(source, filename=str(path))
+        except SyntaxError:
+            continue
+        modname = f"tools.{path.stem}"
+        consts = _module_string_constants(tree)
+        registers_here = False
+        opaque = False
+        for stmt in tree.body:
+            if not _is_registry_register_call(stmt):
+                continue
+            registers_here = True
+            call = stmt.value  # type: ignore[attr-defined]
+            name = None
+            toolset = None
+            for kw in call.keywords:
+                if kw.arg == "name":
+                    name = _resolve_register_arg(kw.value, consts)
+                elif kw.arg == "toolset":
+                    toolset = _resolve_register_arg(kw.value, consts)
+            if name is None and call.args:
+                name = _resolve_register_arg(call.args[0], consts)
+            if toolset is None and len(call.args) >= 2:
+                toolset = _resolve_register_arg(call.args[1], consts)
+            if isinstance(name, str):
+                index["tool_to_module"][name] = modname
+                index["module_to_tools"].setdefault(modname, []).append(name)
+                if isinstance(toolset, str):
+                    index["tool_to_toolset"][name] = toolset
+                    mods = index["toolset_to_modules"].setdefault(toolset, [])
+                    if modname not in mods:
+                        mods.append(modname)
+            else:
+                # Non-literal tool name: cannot map statically. Import eagerly
+                # during discovery so the tool never silently disappears.
+                opaque = True
+        if registers_here:
+            index["modules"].append(modname)
+        if opaque and modname not in index["opaque_modules"]:
+            index["opaque_modules"].append(modname)
+    return index
+
+
+def _tool_index_fingerprint(tools_path: Path) -> Optional[str]:
+    """Cheap content fingerprint of the tool tree (name + mtime + size per
+    file). Any add/remove/edit of a tool file changes it, so a cached index
+    can never go stale."""
+    parts: List[str] = []
+    for path in _iter_tool_files(tools_path):
+        if path.name in _SKIP_TOOL_FILES:
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
+    if not parts:
+        return None
+    payload = "|".join(parts).encode("utf-8")
+    return f"{_TOOL_INDEX_VERSION}:{xxhash.xxh64(payload).hexdigest()}"
+
+
+def _tool_index_cache_file() -> Optional[Path]:
+    """Return the on-disk cache path (profile-aware) or None when unavailable.
+
+    Purely an optimization: any failure here just means the index is rebuilt
+    in-memory. Set ``HERMES_DISABLE_TOOL_INDEX_CACHE`` to opt out entirely.
+    """
+    if os.environ.get("HERMES_DISABLE_TOOL_INDEX_CACHE"):
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        cache_dir = Path(get_hermes_home()) / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / "tool_index.json"
+    except Exception:
+        return None
+
+
+def load_or_build_tool_index(tools_dir: Optional[Path] = None) -> dict:
+    """Return the lazy tool index, served from the on-disk cache when the
+    fingerprint matches, otherwise scanned fresh and written back.
+
+    Never raises: on any cache/scan error it falls back to an in-memory build
+    (or an empty index as the last resort).
+    """
+    tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
+    try:
+        fingerprint = _tool_index_fingerprint(tools_path)
+    except Exception:
+        fingerprint = None
+
+    cache_file = _tool_index_cache_file() if fingerprint else None
+    if cache_file is not None:
+        try:
+            cached = orjson.loads(cache_file.read_text(encoding="utf-8"))
+            if (
+                cached.get("fingerprint") == fingerprint
+                and isinstance(cached.get("index"), dict)
+                and cached["index"].get("version") == _TOOL_INDEX_VERSION
+            ):
+                return cached["index"]
+        except (OSError, ValueError, TypeError):
+            pass
+
+    try:
+        index = build_tool_index(tools_path)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Tool index scan failed: %s", e)
+        return _empty_tool_index()
+
+    if cache_file is not None and fingerprint is not None:
+        tmp: Optional[Path] = None
+        try:
+            tmp = cache_file.with_name(f"{cache_file.name}.{os.getpid()}.tmp")
+            tmp.write_text(
+                orjson.dumps({"fingerprint": fingerprint, "index": index}).decode('utf-8'),
+                encoding="utf-8",
+            )
+            os.replace(tmp, cache_file)
+        except OSError:
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+    return index
+
+
 class ToolEntry:
-    """Metadata for a single registered tool."""
+    """Metadata for a single registered tool.
+
+    GC-friendliness invariant (.plans/14-GC-Collection-Overhead.md): this is a
+    ``__slots__`` class so every entry avoids a per-instance ``__dict__`` —
+    lower memory and less for the cyclic collector to scan across the ~250
+    long-lived tool entries.  Just as important, an entry holds **no reference
+    back to the registry** (or to any object that references the registry), so
+    ``registry.register()`` never forms a reference cycle: dropping an entry
+    from :attr:`ToolRegistry._tools` (deregister / re-register) reclaims it by
+    plain refcounting, without waiting on a generational GC pass.  Do NOT store
+    an entry as a ``weakref`` here — ``_tools`` is the sole owner, so a weak
+    reference would let a freshly-registered tool be collected immediately.
+    ``test_no_circular_refs`` pins this contract.
+    """
 
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "_schema_json",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None):
+        # Lazily-computed cache of orjson.dumps(schema).decode('utf-8'). Populated on first
+        # get_schema_json() request, never at register() time (that would add
+        # a json.dumps per tool to the import cascade the lazy design avoids).
+        # Bound to this entry, so a re-register() (fresh entry + generation
+        # bump) invalidates it for free.
+        self._schema_json = None
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -209,6 +462,12 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}
+        # Durable map: plugin module namespace (handler.__globals__["__name__"])
+        # -> operator opt-in for built-in override. Populated at plugin load and
+        # never cleared, so a plugin's override authorization is bound to the
+        # code that defined the handler, independent of WHEN the register() call
+        # happens (sync during load, or a delayed/threaded callback afterwards).
+        self._plugin_override_policy: Dict[str, bool] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
@@ -222,6 +481,122 @@ class ToolRegistry:
         # long as the generation hasn't changed.
         self._generation: int = 0
 
+        # ── Lazy built-in discovery state ────────────────────────────────
+        # Disabled by default so a bare ``ToolRegistry()`` (used throughout
+        # the tests) behaves exactly as before — it only knows about tools
+        # explicitly registered on it. The process-wide singleton opts in via
+        # ``enable_lazy_builtins()`` (called from model_tools at import), which
+        # merely records the tools dir; the actual AST scan + module imports
+        # are deferred until the first query that needs them.
+        self._lazy_enabled: bool = False
+        self._lazy_builtins_dir: Optional[Path] = None
+        self._lazy_index: Optional[dict] = None
+        self._lazy_loaded_modules: Set[str] = set()
+        self._lazy_all_loaded: bool = False
+        self._lazy_opaque_loaded: bool = False
+        # Orchestrates lazy imports without holding self._lock across arbitrary
+        # module-body code (which itself re-enters register() -> self._lock).
+        self._lazy_lock = threading.RLock()
+
+    # ------------------------------------------------------------------
+    # Lazy built-in discovery
+    # ------------------------------------------------------------------
+
+    def enable_lazy_builtins(self, tools_dir: Optional[Path] = None) -> None:
+        """Opt this registry into deferred built-in tool discovery.
+
+        Cheap: records the tools directory and flips a flag. The metadata
+        index is scanned lazily on first use and individual tool modules are
+        imported on demand. Called once on the module-level ``registry``
+        singleton by ``model_tools`` at import time.
+        """
+        with self._lazy_lock:
+            self._lazy_builtins_dir = (
+                Path(tools_dir) if tools_dir is not None
+                else Path(__file__).resolve().parent
+            )
+            self._lazy_enabled = True
+
+    def _ensure_index(self) -> dict:
+        """Build/load the lazy metadata index once. Returns an (empty when
+        disabled) index dict."""
+        if not self._lazy_enabled:
+            return _empty_tool_index()
+        index = self._lazy_index
+        if index is not None:
+            return index
+        with self._lazy_lock:
+            if self._lazy_index is None:
+                try:
+                    self._lazy_index = load_or_build_tool_index(self._lazy_builtins_dir)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning("Lazy tool index unavailable: %s", e)
+                    self._lazy_index = _empty_tool_index()
+            return self._lazy_index
+
+    def _lazy_import_module(self, modname: str) -> None:
+        """Import a tool module exactly once. Import runs OUTSIDE self._lock so
+        the register() calls it triggers acquire the lock independently."""
+        with self._lazy_lock:
+            if modname in self._lazy_loaded_modules:
+                return
+            # Mark before importing so a re-entrant lookup during the import
+            # can't kick off a second attempt.
+            self._lazy_loaded_modules.add(modname)
+        try:
+            importlib.import_module(modname)
+        except Exception as e:
+            logger.warning("Lazy import of tool module %s failed: %s", modname, e)
+
+    def _load_opaque_modules(self) -> None:
+        """Import modules whose tool names couldn't be statically indexed.
+        No-op for the built-in tree (every tool registers a literal name)."""
+        if self._lazy_opaque_loaded:
+            return
+        index = self._ensure_index()
+        for modname in index.get("opaque_modules", ()):
+            self._lazy_import_module(modname)
+        self._lazy_opaque_loaded = True
+
+    def _ensure_tool_loaded(self, name: str) -> None:
+        """Import the module that provides tool ``name`` if not already live."""
+        if not self._lazy_enabled or name in self._tools:
+            return
+        index = self._ensure_index()
+        modname = index["tool_to_module"].get(name)
+        if modname is not None:
+            self._lazy_import_module(modname)
+        if name not in self._tools and index.get("opaque_modules"):
+            self._load_opaque_modules()
+
+    def _ensure_toolset_loaded(self, toolset: str) -> None:
+        """Import every module that contributes a tool to ``toolset``."""
+        if not self._lazy_enabled:
+            return
+        index = self._ensure_index()
+        for modname in index["toolset_to_modules"].get(toolset, ()):
+            self._lazy_import_module(modname)
+        if index.get("opaque_modules"):
+            self._load_opaque_modules()
+
+    def _ensure_all_loaded(self) -> None:
+        """Import every self-registering built-in tool module. Used by
+        aggregate queries that must see the whole catalog (parity with the
+        old eager discovery). Runs at most once."""
+        if not self._lazy_enabled or self._lazy_all_loaded:
+            return
+        index = self._ensure_index()
+        for modname in index["modules"]:
+            self._lazy_import_module(modname)
+        self._load_opaque_modules()
+        self._lazy_all_loaded = True
+
+    def _lazy_tool_names(self) -> Set[str]:
+        """All statically-known built-in tool names (no imports)."""
+        if not self._lazy_enabled:
+            return set()
+        return set(self._ensure_index()["tool_to_module"].keys())
+
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
@@ -231,31 +606,44 @@ class ToolRegistry:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
 
-    def _snapshot_toolset_checks(self) -> Dict[str, Callable]:
-        """Return a stable snapshot of toolset availability checks."""
-        return self._snapshot_state()[1]
+    def _toolset_has_exposable_tools(
+        self,
+        toolset: str,
+        entries: List[ToolEntry],
+    ) -> bool:
+        """Return True when at least one tool in *toolset* would be exposed.
 
-    def _evaluate_toolset_check(self, toolset: str, check: Callable | None) -> bool:
-        """Run a toolset check, treating missing or failing checks as unavailable/available."""
-        if not check:
-            return True
-        try:
-            return bool(check())
-        except Exception:
-            logger.debug("Toolset %s check raised; marking unavailable", toolset)
-            return False
+        Mirrors :meth:`get_tool_definitions` per-tool filtering so doctor,
+        banners, and other toolset-level surfaces agree with runtime exposure.
+        Mixed toolsets (e.g. ``terminal`` plus desktop-only ``read_terminal``)
+        must not be gated solely by the first registered ``check_fn``.
+        """
+        check_results: Dict[Callable, bool] = {}
+        for entry in entries:
+            if entry.toolset != toolset:
+                continue
+            if not entry.check_fn:
+                return True
+            if entry.check_fn not in check_results:
+                check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+            if check_results[entry.check_fn]:
+                return True
+        return False
 
     def get_entry(self, name: str) -> Optional[ToolEntry]:
         """Return a registered tool entry by name, or None."""
+        self._ensure_tool_loaded(name)
         with self._lock:
             return self._tools.get(name)
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
+        self._ensure_all_loaded()
         return sorted({entry.toolset for entry in self._snapshot_entries()})
 
     def get_tool_names_for_toolset(self, toolset: str) -> List[str]:
         """Return sorted tool names registered under a given toolset."""
+        self._ensure_toolset_loaded(toolset)
         return sorted(
             entry.name for entry in self._snapshot_entries()
             if entry.toolset == toolset
@@ -286,6 +674,55 @@ class ToolRegistry:
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
+
+    def register_plugin_override_policy(self, module_namespace: str, allowed: bool) -> None:
+        """Bind a plugin module namespace to its operator opt-in for built-in
+        override. Called once per plugin at load time. Durable: never cleared,
+        so later (even threaded/delayed) register() calls from that module are
+        still gated by the same policy.
+        """
+        with self._lock:
+            self._plugin_override_policy[module_namespace] = bool(allowed)
+
+    def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
+        """Return the plugin module namespace that defined *handler*, or None
+        if it was not defined in a loaded plugin module.
+
+        Authorization is bound to where the handler was DEFINED
+        (``handler.__globals__["__name__"]``), which is fixed at definition
+        time and cannot drift with the call site, thread, or timing. Lambdas
+        and nested functions inherit the defining module's globals, so a
+        plugin cannot launder an override through a callback. Built-in/MCP
+        handlers live outside the plugin namespace and return None (unchanged
+        behavior).
+        """
+        try:
+            mod = handler.__globals__.get("__name__", "")  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+        if mod in self._plugin_override_policy:
+            return mod
+        # Also gate plugin modules currently loading but not yet policy-recorded
+        # (defensive: a handler defined in the plugin namespace is plugin code).
+        if isinstance(mod, str) and mod.startswith("hermes_plugins."):
+            return mod
+        return None
+
+    @staticmethod
+    def _caller_module() -> str:
+        """Best-effort module name of whoever called the registry method that
+        invoked this helper (two frames up: this helper, then the registry
+        method itself, then the actual caller).
+
+        ``deregister()`` takes only a tool name — unlike ``register()`` it has
+        no handler argument to bind authorization to via ``_plugin_owner_of``.
+        Frame inspection is the only way to know who is asking.
+        """
+        try:
+            frame = sys._getframe(2)
+            return frame.f_globals.get("__name__", "") or ""
+        except Exception:
+            return ""
 
     def register(
         self,
@@ -325,7 +762,22 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                 elif override:
-                    # Explicit plugin opt-in: replace the existing tool.
+                    _owner = self._plugin_owner_of(handler)
+                    if _owner is not None and not self._plugin_override_policy.get(_owner, False):
+                        logger.error(
+                            "Tool registration REJECTED: plugin %r attempted to "
+                            "override built-in tool %r (existing toolset %r) without "
+                            "operator opt-in. Set "
+                            "plugins.entries.<plugin_id>.allow_tool_override: true "
+                            "in config.yaml to allow it.",
+                            _owner, name, existing.toolset,
+                        )
+                        raise PermissionError(
+                            f"Plugin module {_owner!r} cannot override built-in "
+                            f"tool {name!r} without operator opt-in "
+                            f"(allow_tool_override)."
+                        )
+                    # Explicit opt-in (or non-plugin caller): replace the tool.
                     # Logged at INFO so the override is auditable in agent.log.
                     logger.info(
                         "Tool '%s': toolset '%s' overriding existing toolset '%s' "
@@ -356,6 +808,12 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )
+            # Availability is now derived per-tool (_toolset_has_exposable_tools),
+            # so this map no longer gates a toolset. It is still consumed by
+            # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which
+            # banner.py reads (presence only, never called) to classify an
+            # already-unavailable toolset as lazy-init vs disabled. Keep the
+            # write path for that classification.
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
@@ -366,11 +824,52 @@ class ToolRegistry:
         Also cleans up the toolset check if no other tools remain in the
         same toolset.  Used by MCP dynamic tool discovery to nuke-and-repave
         when a server sends ``notifications/tools/list_changed``.
+
+        Gated by the same operator opt-in policy ``register(override=True)``
+        enforces. Without this, a plugin could bypass that gate entirely by
+        deregistering a tool it doesn't own and then calling plain
+        ``register()`` over the now-empty slot — ``register()`` only runs its
+        override check when an ``existing`` entry is present, so removing it
+        first skips the check altogether. MCP toolsets (``mcp-*``) are exempt:
+        dynamic tool discovery legitimately nukes-and-repaves its own tools on
+        every refresh and has no plugin-override concept.
         """
         with self._lock:
-            entry = self._tools.pop(name, None)
+            entry = self._tools.get(name)
             if entry is None:
                 return
+            if not entry.toolset.startswith("mcp-"):
+                caller_mod = self._caller_module()
+                owner = self._plugin_owner_of(entry.handler)
+                # Ownership check: bind to the plugin package root
+                # (``hermes_plugins.{name}``), not the exact module string.
+                # A handler defined in ``hermes_plugins.pkg.handlers`` is
+                # still owned by the ``hermes_plugins.pkg`` package — exact
+                # string equality would wrongly block root-module cleanup code
+                # from removing tools registered by a submodule of the same
+                # plugin (egilewski review on #55840).
+                caller_root = ".".join(caller_mod.split(".")[:2])
+                owner_root = ".".join(owner.split(".")[:2]) if owner else ""
+                same_plugin = bool(owner and caller_root == owner_root)
+                if (
+                    caller_mod.startswith("hermes_plugins.")
+                    and not same_plugin
+                    and not self._plugin_override_policy.get(caller_root, False)
+                ):
+                    logger.error(
+                        "Tool deregistration REJECTED: plugin %r attempted to "
+                        "remove tool %r (toolset %r) it does not own, without "
+                        "operator opt-in. Set "
+                        "plugins.entries.%s.allow_tool_override: true in "
+                        "config.yaml to allow it.",
+                        caller_mod, name, entry.toolset, caller_mod,
+                    )
+                    raise PermissionError(
+                        f"Plugin module {caller_mod!r} cannot deregister tool "
+                        f"{name!r} (toolset {entry.toolset!r}) without operator "
+                        f"opt-in (allow_tool_override)."
+                    )
+            del self._tools[name]
             # Drop the toolset check and aliases if this was the last tool in
             # that toolset.
             toolset_still_exists = any(
@@ -401,12 +900,26 @@ class ToolRegistry:
         still take effect in near-real-time without forcing a full cache
         flush on every call.
         """
+        # Lazily import only the modules that provide the requested tools —
+        # this is what keeps ``get_tool_definitions(enabled_toolsets=[...])``
+        # from dragging in the whole tool tree (browser, image gen, etc.).
+        if self._lazy_enabled:
+            for name in tool_names:
+                self._ensure_tool_loaded(name)
         result = []
         # Per-call cache on top of the 30 s TTL — handles repeat probes of the
         # same check_fn within one definitions pass without re-reading the
         # TTL clock.
         check_results: Dict[Callable, bool] = {}
-        entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
+        # Snapshot only the REQUESTED entries under a brief lock, instead of
+        # materializing a {name: entry} map of the entire (~250-tool) registry
+        # on every call. A toolset selection usually asks for a handful of
+        # tools, so this both shrinks the allocation and shortens the lock hold
+        # (the check_fn probes below still run outside the lock). Equivalent to
+        # the old full-snapshot + per-name .get(): absent names simply aren't in
+        # the map and are skipped identically.
+        with self._lock:
+            entries_by_name = {n: self._tools[n] for n in tool_names if n in self._tools}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
@@ -452,7 +965,7 @@ class ToolRegistry:
         """
         entry = self.get_entry(name)
         if not entry:
-            return json.dumps({"error": f"Unknown tool: {name}"})
+            return orjson.dumps({"error": f"Unknown tool: {name}"}).decode('utf-8')
         try:
             if entry.is_async:
                 from model_tools import _run_async
@@ -469,7 +982,7 @@ class ToolRegistry:
                 sanitized = _sanitize_tool_error(raw)
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
-            return json.dumps({"error": sanitized})
+            return orjson.dumps({"error": sanitized}).decode('utf-8')
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)
@@ -487,6 +1000,7 @@ class ToolRegistry:
 
     def get_all_tool_names(self) -> List[str]:
         """Return sorted list of all registered tool names."""
+        self._ensure_all_loaded()
         return sorted(entry.name for entry in self._snapshot_entries())
 
     def get_schema(self, name: str) -> Optional[dict]:
@@ -498,10 +1012,43 @@ class ToolRegistry:
         entry = self.get_entry(name)
         return entry.schema if entry else None
 
+    def get_schema_json(self, name: str) -> Optional[str]:
+        """Return a tool's raw schema pre-serialized as a JSON string, cached.
+
+        Tool schemas are deterministic after registration, so the ``json.dumps``
+        result can be reused across callers that need a serialized schema
+        (token estimation, tool_search, prompt formatting for models without
+        native tool-calling) instead of re-serializing on every hot-path call.
+
+        Computed lazily on first request and memoized on the ToolEntry — NOT at
+        ``register()`` time, which would add one ``json.dumps`` per tool to the
+        import cascade the lazy-discovery design deliberately avoids. A
+        re-``register()`` builds a fresh entry (and bumps ``_generation``), so
+        the cache invalidates transparently. Mirrors :meth:`get_schema`: this is
+        the STATIC registered schema, so per-call ``dynamic_schema_overrides``
+        are intentionally not reflected. Output matches
+        ``orjson.dumps(get_schema(name)).decode('utf-8')`` exactly, so
+        ``orjson.loads(get_schema_json(name)) == get_schema(name)``.
+        """
+        entry = self.get_entry(name)
+        if entry is None:
+            return None
+        cached = entry._schema_json
+        if cached is None:
+            # Benign race: two threads may compute the same value concurrently;
+            # both write an identical string, so no lock is needed.
+            cached = orjson.dumps(entry.schema).decode('utf-8')
+            entry._schema_json = cached
+        return cached
+
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         """Return the toolset a tool belongs to, or None."""
         entry = self.get_entry(name)
-        return entry.toolset if entry else None
+        if entry:
+            return entry.toolset
+        if self._lazy_enabled:
+            return self._ensure_index()["tool_to_toolset"].get(name)
+        return None
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:
         """Return the emoji for a tool, or *default* if unset."""
@@ -510,38 +1057,39 @@ class ToolRegistry:
 
     def get_tool_to_toolset_map(self) -> Dict[str, str]:
         """Return ``{tool_name: toolset_name}`` for every registered tool."""
+        self._ensure_all_loaded()
         return {entry.name: entry.toolset for entry in self._snapshot_entries()}
 
     def is_toolset_available(self, toolset: str) -> bool:
-        """Check if a toolset's requirements are met.
+        """Check if a toolset has at least one exposable tool.
 
-        Returns False (rather than crashing) when the check function raises
+        Returns False (rather than crashing) when a per-tool check raises
         an unexpected exception (e.g. network error, missing import, bad config).
         """
-        with self._lock:
-            check = self._toolset_checks.get(toolset)
-        return self._evaluate_toolset_check(toolset, check)
+        self._ensure_toolset_loaded(toolset)
+        entries, _ = self._snapshot_state()
+        return self._toolset_has_exposable_tools(toolset, entries)
 
     def check_toolset_requirements(self) -> Dict[str, bool]:
         """Return ``{toolset: available_bool}`` for every toolset."""
-        entries, toolset_checks = self._snapshot_state()
+        self._ensure_all_loaded()
+        entries, _ = self._snapshot_state()
         toolsets = sorted({entry.toolset for entry in entries})
         return {
-            toolset: self._evaluate_toolset_check(toolset, toolset_checks.get(toolset))
+            toolset: self._toolset_has_exposable_tools(toolset, entries)
             for toolset in toolsets
         }
 
     def get_available_toolsets(self) -> Dict[str, dict]:
         """Return toolset metadata for UI display."""
+        self._ensure_all_loaded()
         toolsets: Dict[str, dict] = {}
-        entries, toolset_checks = self._snapshot_state()
+        entries, _ = self._snapshot_state()
         for entry in entries:
             ts = entry.toolset
             if ts not in toolsets:
                 toolsets[ts] = {
-                    "available": self._evaluate_toolset_check(
-                        ts, toolset_checks.get(ts)
-                    ),
+                    "available": self._toolset_has_exposable_tools(ts, entries),
                     "tools": [],
                     "description": "",
                     "requirements": [],
@@ -555,6 +1103,7 @@ class ToolRegistry:
 
     def get_toolset_requirements(self) -> Dict[str, dict]:
         """Build a TOOLSET_REQUIREMENTS-compatible dict for backward compat."""
+        self._ensure_all_loaded()
         result: Dict[str, dict] = {}
         entries, toolset_checks = self._snapshot_state()
         for entry in entries:
@@ -576,22 +1125,19 @@ class ToolRegistry:
 
     def check_tool_availability(self, quiet: bool = False):
         """Return (available_toolsets, unavailable_info) like the old function."""
+        self._ensure_all_loaded()
         available = []
         unavailable = []
-        seen = set()
-        entries, toolset_checks = self._snapshot_state()
-        for entry in entries:
-            ts = entry.toolset
-            if ts in seen:
-                continue
-            seen.add(ts)
-            if self._evaluate_toolset_check(ts, toolset_checks.get(ts)):
+        entries, _ = self._snapshot_state()
+        for ts in sorted({entry.toolset for entry in entries}):
+            ts_entries = [entry for entry in entries if entry.toolset == ts]
+            if self._toolset_has_exposable_tools(ts, entries):
                 available.append(ts)
             else:
                 unavailable.append({
                     "name": ts,
-                    "env_vars": entry.requires_env,
-                    "tools": [e.name for e in entries if e.toolset == ts],
+                    "env_vars": ts_entries[0].requires_env if ts_entries else [],
+                    "tools": [entry.name for entry in ts_entries],
                 })
         return available, unavailable
 
@@ -604,7 +1150,7 @@ registry = ToolRegistry()
 # Helpers for tool response serialization
 # ---------------------------------------------------------------------------
 # Every tool handler must return a JSON string.  These helpers eliminate the
-# boilerplate ``json.dumps({"error": msg}, ensure_ascii=False)`` that appears
+# boilerplate ``orjson.dumps({"error": msg}).decode('utf-8')`` that appears
 # hundreds of times across tool files.
 #
 # Usage:
@@ -627,7 +1173,7 @@ def tool_error(message, **extra) -> str:
     result = {"error": str(message)}
     if extra:
         result.update(extra)
-    return json.dumps(result, ensure_ascii=False)
+    return orjson.dumps(result).decode('utf-8')
 
 
 def tool_result(data=None, **kwargs) -> str:
@@ -641,5 +1187,5 @@ def tool_result(data=None, **kwargs) -> str:
     '{"key": "value"}'
     """
     if data is not None:
-        return json.dumps(data, ensure_ascii=False)
-    return json.dumps(kwargs, ensure_ascii=False)
+        return orjson.dumps(data).decode('utf-8')
+    return orjson.dumps(kwargs).decode('utf-8')

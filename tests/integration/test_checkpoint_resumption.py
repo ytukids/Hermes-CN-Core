@@ -21,7 +21,7 @@ Usage:
 import pytest
 pytestmark = pytest.mark.integration
 
-import json
+import orjson
 import shutil
 import sys
 import time
@@ -46,7 +46,7 @@ def create_test_dataset(num_prompts: int = 20) -> Path:
                 "prompt": f"Test prompt {i}: What is 2+2? Just answer briefly.",
                 "test_id": i
             }
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.write(orjson.dumps(entry).decode('utf-8') + "\n")
     
     print(f"✅ Created test dataset: {dataset_file} ({num_prompts} prompts)")
     return dataset_file
@@ -81,7 +81,7 @@ def monitor_checkpoint_during_run(checkpoint_file: Path, duration: int = 30) -> 
                 
                 try:
                     with open(checkpoint_file, 'r') as f:
-                        checkpoint_data = json.load(f)
+                        checkpoint_data = orjson.loads(f.read())
                     
                     snapshot = {
                         "elapsed_seconds": round(elapsed, 2),
@@ -140,11 +140,11 @@ def test_current_implementation():
     
     # Start monitoring in a separate process would be ideal, but for simplicity
     # we'll just check before and after
-    print(f"\n▶️  Starting batch run...")
+    print("\n▶️  Starting batch run...")
     print(f"   Dataset: {dataset_file}")
-    print(f"   Batch size: 3 (4 batches total)")
-    print(f"   Workers: 2")
-    print(f"   Expected behavior: If incremental, checkpoint should update during run")
+    print("   Batch size: 3 (4 batches total)")
+    print("   Workers: 2")
+    print("   Expected behavior: If incremental, checkpoint should update during run")
     
     start_time = time.time()
     
@@ -232,7 +232,7 @@ def test_interruption_and_resume():
     
     checkpoint_file = output_dir / "checkpoint.json"
     
-    print(f"\n▶️  Starting first run (will process 5 prompts, then simulate interruption)...")
+    print("\n▶️  Starting first run (will process 5 prompts, then simulate interruption)...")
     
     temp_dataset = Path("tests/test_data/checkpoint_test_resume_partial.jsonl")
     try:
@@ -261,13 +261,13 @@ def test_interruption_and_resume():
             return False
         
         with open(checkpoint_file, 'r') as f:
-            checkpoint_data = json.load(f)
+            checkpoint_data = orjson.loads(f.read())
         
         initial_completed = len(checkpoint_data.get("completed_prompts", []))
         print(f"✅ First run completed: {initial_completed} prompts saved to checkpoint")
         
         # Now try to resume with full dataset
-        print(f"\n▶️  Starting resume run with full dataset (15 prompts)...")
+        print("\n▶️  Starting resume run with full dataset (15 prompts)...")
         
         runner2 = BatchRunner(
             dataset_file=str(dataset_file),
@@ -284,7 +284,7 @@ def test_interruption_and_resume():
         
         # Check final checkpoint
         with open(checkpoint_file, 'r') as f:
-            final_checkpoint = json.load(f)
+            final_checkpoint = orjson.loads(f.read())
         
         final_completed = len(final_checkpoint.get("completed_prompts", []))
         
@@ -293,7 +293,7 @@ def test_interruption_and_resume():
         print("=" * 70)
         print(f"Initial completed: {initial_completed}")
         print(f"Final completed: {final_completed}")
-        print(f"Expected: 15")
+        print("Expected: 15")
         
         if final_completed == 15:
             print("\n✅ PASS: Resume successfully completed all prompts")

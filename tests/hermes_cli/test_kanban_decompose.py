@@ -7,7 +7,7 @@ and the assignee-fallback logic.
 
 from __future__ import annotations
 
-import json as jsonlib
+import orjson as jsonlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -41,18 +41,19 @@ def _mock_client_returning(content: str):
 
 
 def _patch_aux_client(content: str, *, model: str = "test-model"):
-    client = _mock_client_returning(content)
+    # decompose_task now routes through call_llm (see #35566) — mock it at
+    # the source module so task config, extra_body, and retries stay out of
+    # unit-test scope.
     return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(content),
     )
 
 
 def _patch_extra_body():
-    return patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body",
-        return_value={},
-    )
+    # No-op shim retained for call-site compatibility: extra_body plumbing
+    # now lives inside call_llm, which _patch_aux_client already mocks.
+    return patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={})
 
 
 def _patch_list_profiles(names: list[str]):
@@ -85,7 +86,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
             {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
             {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
         ],
-    })
+    }).decode('utf-8')
 
     patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
     for p in patches:
@@ -121,7 +122,7 @@ def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
         "rationale": "single unit",
         "title": "Tightened title",
         "body": "**Goal**\nDo the thing.",
-    })
+    }).decode('utf-8')
 
     patches = _patch_list_profiles(["orchestrator", "fallback"])
     for p in patches:
@@ -163,7 +164,7 @@ def test_decompose_fanout_false_preserves_existing_assignee(kanban_home):
         "title": "Tightened title",
         "body": "Keep existing lane.",
         "assignee": "fallback",
-    })
+    }).decode('utf-8')
 
     patches = _patch_list_profiles(["orchestrator", "engineer", "fallback"])
     for p in patches:
@@ -196,7 +197,7 @@ def test_decompose_fanout_false_uses_valid_llm_assignee(kanban_home):
         "title": "Tightened title",
         "body": "Route to specialist.",
         "assignee": "engineer",
-    })
+    }).decode('utf-8')
 
     patches = _patch_list_profiles(["orchestrator", "engineer", "fallback"])
     for p in patches:
@@ -228,7 +229,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
         "title": "Tightened title",
         "body": "Route to fallback.",
         "assignee": "made_up",
-    })
+    }).decode('utf-8')
 
     patches = _patch_list_profiles(["orchestrator", "fallback"])
     for p in patches:
@@ -261,7 +262,7 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
         "tasks": [
             {"title": "do X", "body": "", "assignee": "made_up", "parents": []},
         ],
-    })
+    }).decode('utf-8')
 
     patches = _patch_list_profiles(["orchestrator", "fallback"])
     for p in patches:
@@ -334,9 +335,11 @@ def test_decompose_no_aux_client_configured(kanban_home):
     for p in patches:
         p.start()
     try:
+        # call_llm raises RuntimeError when no provider is configured; the
+        # decomposer must convert that into a failed outcome, not a crash.
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(None, ""),
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("No LLM provider configured"),
         ):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
@@ -344,4 +347,5 @@ def test_decompose_no_aux_client_configured(kanban_home):
             p.stop()
 
     assert outcome.ok is False
-    assert "no auxiliary client" in outcome.reason
+    # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
+    assert "LLM error" in outcome.reason

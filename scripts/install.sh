@@ -58,7 +58,7 @@ else
     INSTALL_DIR=""
     INSTALL_DIR_EXPLICIT=false
 fi
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.14"
 NODE_VERSION="22"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
@@ -168,7 +168,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Hermes Agent Installer"
+            echo "                   Supported: node, browser, ripgrep, ffmpeg, coreutils (macOS only), rtk"Hermes Agent Installer"
             echo ""
             echo "Usage: install.sh [OPTIONS]"
             echo ""
@@ -204,7 +204,7 @@ while [[ $# -gt 0 ]]; do
             echo "  small and ensures the command is on PATH for all shells."
             echo "  Existing installs at \$HERMES_HOME/hermes-agent are preserved in-place."
             echo "  --ensure DEPS  Install only specified deps (comma-separated)"
-            echo "                   Supported: node, browser, ripgrep, ffmpeg"
+            echo "                   Supported: node, browser, ripgrep, ffmpeg, coreutils (macOS only), rtk"
             echo "                   Does NOT clone repo or create venv"
             echo "  --postinstall  Run post-install setup only (for pip users)"
             echo "                   Installs optional deps + runs hermes setup"
@@ -237,6 +237,11 @@ if [ "$ISOLATED_LAYOUT" = true ]; then
 fi
 
 export HERMES_HOME
+
+# Hermes-managed external tools directory.  Downloaded binaries (ripgrep, rtk,
+# coreutils, ...) live here so broken global PATH copies cannot brick runtime.
+MANAGED_TOOLS_DIR="${HERMES_HOME}/tools"
+export MANAGED_TOOLS_DIR
 
 # Keep Playwright browser binaries under Hermes data by default so local browser
 # tooling follows the same profile/custom-root isolation as the rest of Hermes.
@@ -1037,6 +1042,7 @@ install_system_packages() {
     # Detect what's missing
     HAS_RIPGREP=false
     HAS_FFMPEG=false
+    HAS_RTK=false
     local need_ripgrep=false
     local need_ffmpeg=false
 
@@ -1055,6 +1061,27 @@ install_system_packages() {
         HAS_FFMPEG=true
     else
         need_ffmpeg=true
+    fi
+
+    log_info "Checking rtk (reasoning toolkit, for token-kill)..."
+    if [ -x "${MANAGED_TOOLS_DIR}/rtk" ]; then
+        log_success "rtk found in ${MANAGED_TOOLS_DIR}"
+        HAS_RTK=true
+    elif command -v rtk &> /dev/null; then
+        log_success "$(rtk --version 2>/dev/null || echo rtk) found"
+        HAS_RTK=true
+    elif [ -x "${HERMES_HOME}/bin/rtk" ]; then
+        export PATH="${HERMES_HOME}/bin:$PATH"
+        log_success "rtk found in ${HERMES_HOME}/bin"
+        HAS_RTK=true
+    else
+        log_info "rtk not found; downloading..."
+        if _install_rtk_direct; then
+            HAS_RTK=true
+        else
+            log_warn "rtk not installed (token-kill will be unavailable)"
+            log_info "Install manually from: https://github.com/rtk-ai/rtk/releases"
+        fi
     fi
 
     # Termux always needs the Android build toolchain for the tested pip path,
@@ -1102,7 +1129,19 @@ install_system_packages() {
 
     # ── macOS: brew ──
     if [ "$OS" = "macos" ]; then
-        if command -v brew &> /dev/null; then
+        # On macOS, add coreutils to the brew install list if not already present
+        if command -v gcat &>/dev/null || command -v cat &>/dev/null; then
+            :  # coreutils already available
+        else
+            log_info "Checking GNU coreutils (POSIX CLI tools)..."
+            # On macOS, the system cat is BSD-based; GNU coreutils provides
+            # gcat, gcp, etc. with a 'g' prefix via Homebrew.
+            if command -v brew &>/dev/null; then
+                pkgs+=("coreutils")
+            fi
+        fi
+        
+        if command -v brew &>/dev/null; then
             log_info "Installing ${pkgs[*]} via Homebrew..."
             if brew install "${pkgs[@]}"; then
                 [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
@@ -1194,6 +1233,14 @@ install_system_packages() {
         fi
     fi
 
+    # ── Fallback for ripgrep: direct GitHub download to managed tools dir ──
+    if [ "$need_ripgrep" = true ] && [ "$HAS_RIPGREP" = false ]; then
+        log_info "Trying direct download of ripgrep to ${MANAGED_TOOLS_DIR}..."
+        if _install_ripgrep_direct; then
+            HAS_RIPGREP=true
+        fi
+    fi
+
     # ── Show manual instructions for anything still missing ──
     if [ "$HAS_RIPGREP" = false ] && [ "$need_ripgrep" = true ]; then
         log_warn "ripgrep not installed (file search will use grep fallback)"
@@ -1203,6 +1250,99 @@ install_system_packages() {
         log_warn "ffmpeg not installed (TTS voice messages will be limited)"
         show_manual_install_hint "ffmpeg"
     fi
+}
+
+# ── Hermes-managed external tools (ripgrep, rtk, ...) ──
+RIPGREP_VERSION="14.1.1"
+RTK_VERSION="0.43.0"
+
+_install_ripgrep_direct() {
+    local arch_suffix
+    case "$(uname -m)" in
+        x86_64|amd64) arch_suffix="x86_64" ;;
+        aarch64|arm64) arch_suffix="aarch64" ;;
+        *) log_warn "Unsupported architecture for ripgrep"; return 1 ;;
+    esac
+
+    local os_suffix
+    case "$(uname -s)" in
+        Darwin) os_suffix="apple-darwin" ;;
+        Linux)  os_suffix="unknown-linux-gnu" ;;
+        *) log_warn "Unsupported OS for ripgrep"; return 1 ;;
+    esac
+
+    local arch="${arch_suffix}-${os_suffix}"
+    local tarball="ripgrep-${RIPGREP_VERSION}-${arch}.tar.gz"
+    local url="https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${tarball}"
+    local tmpdir
+    tmpdir=$(mktemp -d) || return 1
+    local dest="${MANAGED_TOOLS_DIR}"
+    mkdir -p "$dest"
+
+    log_info "Downloading ripgrep ${RIPGREP_VERSION}..."
+    if curl -fsSL "$url" -o "${tmpdir}/${tarball}"; then
+        tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir"
+        local binary="${tmpdir}/ripgrep-${RIPGREP_VERSION}-${arch}/rg"
+        if [ -f "$binary" ]; then
+            cp "$binary" "${dest}/rg"
+            chmod +x "${dest}/rg"
+            rm -rf "$tmpdir"
+            if "${dest}/rg" --version >/dev/null 2>&1; then
+                log_success "ripgrep ${RIPGREP_VERSION} installed to ${dest}/rg"
+                return 0
+            fi
+        else
+            log_warn "Could not find rg binary in extracted tarball"
+        fi
+    fi
+    rm -rf "$tmpdir"
+    return 1
+}
+
+_install_rtk_direct() {
+    local arch_suffix
+    case "$(uname -m)" in
+        x86_64|amd64) arch_suffix="x86_64" ;;
+        aarch64|arm64) arch_suffix="aarch64" ;;
+        *) log_warn "Unsupported architecture for rtk"; return 1 ;;
+    esac
+
+    local os_suffix
+    case "$(uname -s)" in
+        Darwin) os_suffix="apple-darwin" ;;
+        Linux)  os_suffix="unknown-linux-gnu" ;;
+        *) log_warn "Unsupported OS for rtk"; return 1 ;;
+    esac
+
+    local arch="${arch_suffix}-${os_suffix}"
+    local tarball="rtk-${RTK_VERSION}-${arch}.tar.gz"
+    local url="https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/${tarball}"
+    local tmpdir
+    tmpdir=$(mktemp -d) || return 1
+    local dest="${MANAGED_TOOLS_DIR}"
+    mkdir -p "$dest"
+
+    log_info "Downloading rtk ${RTK_VERSION}..."
+    if curl -fsSL "$url" -o "${tmpdir}/${tarball}"; then
+        tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir"
+        if [ -f "${tmpdir}/rtk-${RTK_VERSION}-${arch}/rtk" ]; then
+            cp "${tmpdir}/rtk-${RTK_VERSION}-${arch}/rtk" "${dest}/rtk"
+        elif [ -f "${tmpdir}/rtk" ]; then
+            cp "${tmpdir}/rtk" "${dest}/rtk"
+        else
+            log_warn "Could not find rtk binary in extracted tarball"
+            rm -rf "$tmpdir"
+            return 1
+        fi
+        chmod +x "${dest}/rtk"
+        rm -rf "$tmpdir"
+        if "${dest}/rtk" --version >/dev/null 2>&1; then
+            log_success "rtk ${RTK_VERSION} installed to ${dest}/rtk"
+            return 0
+        fi
+    fi
+    rm -rf "$tmpdir"
+    return 1
 }
 
 show_manual_install_hint() {
@@ -1278,7 +1418,14 @@ clone_repo() {
             git remote set-branches origin "$BRANCH" 2>/dev/null || true
             git fetch origin "$BRANCH"
             git checkout "$BRANCH"
-            git pull --ff-only origin "$BRANCH"
+            # Managed installs should follow origin/$BRANCH exactly. If the
+            # checkout has diverged (or has local-only commits), ff-only pull
+            # cannot succeed — mirror ``hermes update`` and reset to the
+            # fetched remote so bootstrap/install can recover.
+            if ! git pull --ff-only origin "$BRANCH"; then
+                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
+                git reset --hard "origin/$BRANCH"
+            fi
 
             if [ -n "$autostash_ref" ]; then
                 local restore_now="yes"
@@ -1296,14 +1443,38 @@ clone_repo() {
 
                 if [ "$restore_now" = "yes" ]; then
                     log_info "Restoring local changes..."
-                    if git stash apply "$autostash_ref"; then
+                    local restore_output=""
+                    local restore_ok="yes"
+                    if restore_output="$(git stash apply "$autostash_ref" 2>&1)"; then
+                        restore_ok="yes"
+                    else
+                        restore_ok="no"
+                    fi
+                    local conflicted_files=""
+                    conflicted_files="$(git diff --name-only --diff-filter=U || true)"
+                    if [ "$restore_ok" = "yes" ] && [ -z "$conflicted_files" ]; then
                         git stash drop "$autostash_ref" >/dev/null
                         log_warn "Local changes were restored on top of the updated codebase."
                         log_warn "Review git diff / git status if Hermes behaves unexpectedly."
                     else
-                        log_error "Update succeeded, but restoring local changes failed. Your changes are still preserved in git stash."
-                        log_info "Resolve manually with: git stash apply $autostash_ref"
-                        exit 1
+                        log_error "Update pulled new code, but restoring local changes hit conflicts."
+                        if [ -n "$restore_output" ]; then
+                            printf '%s\n' "$restore_output"
+                        fi
+                        if [ -n "$conflicted_files" ]; then
+                            printf '\nConflicted files:\n'
+                            while IFS= read -r file; do
+                                [ -n "$file" ] && printf '  • %s\n' "$file"
+                            done <<EOF
+$conflicted_files
+EOF
+                        fi
+                        printf '\n'
+                        log_info "Your stashed changes are preserved — nothing is lost."
+                        log_info "  Stash ref: $autostash_ref"
+                        git reset --hard HEAD >/dev/null 2>&1 || true
+                        log_info "Working tree reset to clean state."
+                        log_info "Restore your changes later with: git stash apply $autostash_ref"
                     fi
                 else
                     log_info "Skipped restoring local changes."
@@ -1562,7 +1733,7 @@ install_deps() {
     local _BROKEN_EXTRAS=()  # populate when an extra becomes unresolvable
 
     # Parse [project.optional-dependencies].all from pyproject.toml.
-    # tomllib is stdlib on Python 3.11+ which uv's bootstrap guarantees.
+    # tomllib is stdlib on Python 3.14+ which uv's bootstrap guarantees.
     # Falls back to a hand list if parse fails — defensive only.
     local _ALL_EXTRAS_CSV
     _ALL_EXTRAS_CSV="$(
@@ -2600,10 +2771,8 @@ ensure_mode() {
                 fi
                 ;;
             ripgrep)
-                if ! command -v rg &>/dev/null; then
-                    HAS_RIPGREP=false
-                    HAS_FFMPEG=true
-                    install_system_packages
+                if [ ! -x "${MANAGED_TOOLS_DIR}/rg" ] && ! command -v rg &>/dev/null && [ ! -x "${HERMES_HOME}/bin/rg" ]; then
+                    _install_ripgrep_direct || log_warn "ripgrep could not be installed"
                 fi
                 ;;
             ffmpeg)
@@ -2612,6 +2781,16 @@ ensure_mode() {
                     HAS_RIPGREP=true
                     install_system_packages
                 fi
+                ;;
+            rtk)
+                if [ ! -x "${MANAGED_TOOLS_DIR}/rtk" ] && [ ! -x "${HERMES_HOME}/bin/rtk" ] && ! command -v rtk &> /dev/null; then
+                    _install_rtk_direct || log_warn "rtk could not be installed"
+                fi
+                ;;
+            coreutils)
+                # On Linux/macOS, coreutils is provided by the system;
+                # on macOS we can also install GNU coreutils via brew.
+                log_info "Coreutils are provided by the system on Linux/macOS."
                 ;;
             *)
                 log_warn "Unknown dependency: $dep"
@@ -2747,7 +2926,7 @@ _electron_dir() {
     fi
 }
 
-# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.cjs).
+# True when dist/ holds a usable Electron binary (#38673 / run-electron-builder.mjs).
 _electron_dist_ok() {
     local install_dir="$1"
     local electron_dir

@@ -21,7 +21,7 @@ dispatcher.reclaim must not produce a double-run-close or other
 inconsistency.
 """
 
-import json
+import orjson
 import multiprocessing as mp
 import os
 import random
@@ -92,7 +92,7 @@ def worker_loop(worker_id: int, hermes_home: str, result_file: str) -> None:
             conn.close()
 
     with open(result_file, "w") as f:
-        json.dump(events, f)
+        f.write(orjson.dumps(events).decode('utf-8'))
 
 
 def reclaimer_loop(hermes_home: str, result_file: str) -> None:
@@ -117,7 +117,7 @@ def reclaimer_loop(hermes_home: str, result_file: str) -> None:
             conn.close()
         time.sleep(0.2)
     with open(result_file, "w") as f:
-        json.dump(events, f)
+        f.write(orjson.dumps(events).decode('utf-8'))
 
 
 def main():
@@ -134,7 +134,7 @@ def main():
                        tenant="reclaim-race")
     conn.close()
     print(f"Seeded {NUM_TASKS} tasks. TTL={TTL}s, work_duration={WORK_DURATION_S}s")
-    print(f"(worker work > TTL guarantees reclaims)")
+    print("(worker work > TTL guarantees reclaims)")
 
     ctx = mp.get_context("spawn")
     worker_results = [f"/tmp/rc_worker_{i}.json" for i in range(NUM_WORKERS)]
@@ -159,11 +159,11 @@ def main():
     for f in worker_results:
         if os.path.isfile(f):
             with open(f) as fh:
-                all_events.extend(json.load(fh))
+                all_events.extend(orjson.loads(fh.read()))
     reclaim_events = []
     if os.path.isfile(reclaim_result):
         with open(reclaim_result) as fh:
-            reclaim_events = json.load(fh)
+            reclaim_events = orjson.loads(fh.read())
 
     op_counts = {}
     for e in all_events:

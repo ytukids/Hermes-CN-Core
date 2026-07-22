@@ -7,7 +7,7 @@ written a transcript row yet.
 
 from __future__ import annotations
 
-import json
+import orjson
 import logging
 import os
 import time
@@ -145,7 +145,7 @@ class _FileLock:
 def _read_entries(path: Path) -> list[dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+            data = orjson.loads(fh.read())
     except FileNotFoundError:
         return []
     except Exception:
@@ -161,7 +161,7 @@ def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"entries": entries}, fh, sort_keys=True)
+        fh.write(orjson.dumps({"entries": entries}, option=orjson.OPT_SORT_KEYS).decode('utf-8'))
     os.replace(tmp, path)
 
 
@@ -202,10 +202,17 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
         return False
     expected_start = _optional_float(process_start_time)
     if expected_start is None:
-        return True
+        # No recorded start time — cannot verify this PID belongs to the
+        # original process.  Only trust our own PID to avoid permanent
+        # false-positive blocking of new sessions after a crash.
+        return pid_int == os.getpid()
     current_start = _process_start_time(pid_int)
     if current_start is None:
-        return True
+        # Cannot read current start time — cannot verify the PID.  Only
+        # trust our own PID; otherwise a stale lease from a crashed process
+        # whose PID was reused will never be pruned and will permanently
+        # block new sessions once max_concurrent_sessions is configured.
+        return pid_int == os.getpid()
     return abs(current_start - expected_start) < 0.001
 
 

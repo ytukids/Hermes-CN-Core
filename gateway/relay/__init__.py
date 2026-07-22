@@ -36,7 +36,8 @@ def relay_url() -> Optional[str]:
         from gateway.run import _load_gateway_config  # late import to avoid cycle
 
         cfg = _load_gateway_config()
-        url = (cfg.get("gateway") or {}).get("relay_url", "").strip()
+        url = (cfg.get("gateway") or {}).get("relay_url")
+        url = (url or "").strip()
         if url:
             return url.rstrip("/")
     except Exception:  # noqa: BLE001 - config absence/parse must never crash registration
@@ -82,14 +83,14 @@ def _relay_bot_ids_map() -> dict:
     """Parse ``GATEWAY_RELAY_BOT_IDS`` (JSON keyed map). Never raises — a malformed
     map yields ``{}`` so a bad config degrades to empty bot ids (the connector
     rejects an unprovisioned platform) rather than crashing boot."""
-    import json
+    import orjson
     import logging
 
     raw = os.environ.get("GATEWAY_RELAY_BOT_IDS", "").strip()
     if not raw:
         return {}
     try:
-        parsed = json.loads(raw)
+        parsed = orjson.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:  # noqa: BLE001 - a bad map must not crash boot
         logging.getLogger("gateway.relay").warning(
@@ -172,7 +173,7 @@ def relay_endpoint() -> Optional[str]:
 
 
 def relay_route_keys() -> list[str]:
-    """Discriminators (guild_ids / chat_ids / paths) this gateway's tenant owns.
+    """Discriminators (scope_ids / chat_ids / paths) this gateway's tenant owns.
 
     Gateway-provided config, paired with ``relay_endpoint()``: the connector
     writes one route row per (routeKey -> tenant, endpoint), so route keys only
@@ -386,7 +387,7 @@ def _post_provision(
     ``{secret, deliveryKey, tenant, gatewayId, routeKeys}``. Raises RuntimeError
     with a user-facing message on any non-2xx / transport failure.
     """
-    import json
+    import orjson
     import urllib.error
     import urllib.request
 
@@ -405,7 +406,7 @@ def _post_provision(
     # stores null and simply can't wake this instance (buffering still works).
     if wake_url:
         body["wakeUrl"] = wake_url
-    data = json.dumps(body).encode("utf-8")
+    data = orjson.dumps(body)
     req = urllib.request.Request(
         provision_url,
         data=data,
@@ -418,11 +419,11 @@ def _post_provision(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode())
+            payload = orjson.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = (json.loads(exc.read().decode()) or {}).get("error", "")
+            detail = (orjson.loads(exc.read().decode()) or {}).get("error", "")
         except Exception:
             pass
         raise RuntimeError(
@@ -434,6 +435,80 @@ def _post_provision(
     if not isinstance(payload, dict) or not payload.get("secret"):
         raise RuntimeError("connector returned an unexpected response (no secret)")
     return payload
+
+
+def _resolve_relay_identity_token() -> str:
+    """Resolve the caller-identity bearer token the connector introspects to a tenant.
+
+    Canonical resolver shared by the runtime self-provision path and the
+    ``hermes gateway enroll`` CLI. Two modes, in precedence order:
+
+      1. **Generic OIDC client-credentials** (air-gapped / self-hosted-IdP, NO
+         Nous Portal): when ``gateway.idp.token_url`` (or
+         ``GATEWAY_RELAY_IDP_TOKEN_URL``) is configured, obtain a workload access
+         token via the OAuth2 ``client_credentials`` grant against the operator's
+         own IdP (Entra; Authentik in the sandbox). The connector's Seam-A OIDC
+         verifier reads a claim (default ``tid``) off it as the tenant.
+      2. **Nous Portal** (default): ``resolve_nous_access_token()`` — existing
+         managed/hosted behaviour.
+
+    Raises on failure; callers decide whether that's fatal (enroll CLI) or a
+    graceful boot no-op (self-provision).
+    """
+    token_url = os.environ.get("GATEWAY_RELAY_IDP_TOKEN_URL", "").strip()
+    client_id = os.environ.get("GATEWAY_RELAY_IDP_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GATEWAY_RELAY_IDP_CLIENT_SECRET", "").strip()
+    scope = os.environ.get("GATEWAY_RELAY_IDP_SCOPE", "").strip()
+    if not token_url:
+        try:
+            from gateway.run import _load_gateway_config  # late import to avoid cycle
+
+            idp = ((_load_gateway_config().get("gateway") or {}).get("idp") or {})
+            token_url = str(idp.get("token_url", "") or "").strip()
+            client_id = client_id or str(idp.get("client_id", "") or "").strip()
+            client_secret = client_secret or str(idp.get("client_secret", "") or "").strip()
+            scope = scope or str(idp.get("scope", "") or "").strip()
+        except Exception:  # noqa: BLE001 - config absence must not crash
+            token_url = token_url or ""
+
+    if not token_url:
+        # Mode 2 — Nous Portal (default, unchanged behaviour).
+        from hermes_cli.auth import resolve_nous_access_token
+
+        return resolve_nous_access_token()
+
+    # Mode 1 — generic OAuth2 client_credentials grant.
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    if not client_id or not client_secret:
+        raise RuntimeError(
+            "gateway.idp.token_url configured but client_id/client_secret missing"
+        )
+    form = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if scope:
+        form["scope"] = scope
+    req = urllib.request.Request(
+        token_url,
+        data=urllib.parse.urlencode(form).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15.0) as resp:
+        payload = json.loads(resp.read().decode())
+    access_token = (payload or {}).get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise RuntimeError("IdP client_credentials response had no access_token")
+    return access_token.strip()
 
 
 def self_provision_relay() -> bool:
@@ -489,13 +564,11 @@ def self_provision_relay() -> bool:
         return False
 
     try:
-        from hermes_cli.auth import resolve_nous_access_token
-
-        access_token = resolve_nous_access_token()
+        access_token = _resolve_relay_identity_token()
     except Exception as exc:  # noqa: BLE001 - boot must survive a token failure
-        # No resolvable NAS identity (e.g. a self-hosted box that hasn't enrolled)
-        # -> nothing to provision with; skip quietly and let the gateway boot.
-        logger.warning("relay self-provision skipped: could not resolve Nous token (%s)", exc)
+        # No resolvable identity (e.g. a self-hosted box that hasn't enrolled and
+        # configured no IdP) -> nothing to provision with; skip quietly and boot.
+        logger.warning("relay self-provision skipped: could not resolve identity token (%s)", exc)
         return False
 
     identities = relay_platform_identities()
@@ -584,11 +657,11 @@ def _post_policy(*, policy_url: str, token: str, policy: dict, timeout: float = 
     body. Raises RuntimeError on transport failure (the caller treats any
     failure as non-fatal — relevance is an optimization, not a boot dependency).
     """
-    import json
+    import orjson
     import urllib.error
     import urllib.request
 
-    data = json.dumps(policy).encode("utf-8")
+    data = orjson.dumps(policy)
     req = urllib.request.Request(
         policy_url,
         data=data,

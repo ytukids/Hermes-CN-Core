@@ -6,9 +6,9 @@ and thread participation tracking.
 """
 
 import asyncio
-import json
+import orjson
 import logging
-import re
+from agent.re_compat import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict
@@ -69,6 +69,22 @@ class MessageDeduplicator:
                 )[-self._max_size:]
                 self._seen = dict(newest)
         return False
+
+    def contains(self, msg_id: str) -> bool:
+        """Return whether *msg_id* is live in the cache without inserting it."""
+        if not msg_id:
+            return False
+        seen_at = self._seen.get(msg_id)
+        if seen_at is None:
+            return False
+        if time.time() - seen_at < self._ttl:
+            return True
+        del self._seen[msg_id]
+        return False
+
+    def discard(self, msg_id: str) -> None:
+        """Release a claimed message ID after cancelled/failed handoff."""
+        self._seen.pop(msg_id, None)
 
     def clear(self):
         """Clear all tracked messages."""
@@ -234,7 +250,7 @@ class ThreadParticipationTracker:
         path = self._state_path()
         if path.exists():
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = orjson.loads(path.read_text(encoding="utf-8"))
                 if isinstance(data, list):
                     return [str(thread_id) for thread_id in data]
             except Exception:

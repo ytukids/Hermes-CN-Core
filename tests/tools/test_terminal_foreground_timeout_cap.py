@@ -3,7 +3,7 @@
 Ensures that foreground commands with timeout > FOREGROUND_MAX_TIMEOUT
 are rejected with an error suggesting background=true.
 """
-import json
+import orjson
 from unittest.mock import patch, MagicMock
 
 
@@ -37,7 +37,7 @@ class TestForegroundTimeoutCap:
         with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
              patch("tools.terminal_tool._start_cleanup_thread"):
 
-            result = json.loads(terminal_tool(
+            result = orjson.loads(terminal_tool(
                 command="echo hello",
                 timeout=9999,  # Way above max
             ))
@@ -54,7 +54,7 @@ class TestForegroundTimeoutCap:
         with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
              patch("tools.terminal_tool._start_cleanup_thread"):
 
-            result = json.loads(terminal_tool(
+            result = orjson.loads(terminal_tool(
                 command="nohup pnpm dev > /tmp/sg-server.log 2>&1 &",
             ))
 
@@ -69,7 +69,7 @@ class TestForegroundTimeoutCap:
         with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
              patch("tools.terminal_tool._start_cleanup_thread"):
 
-            result = json.loads(terminal_tool(command="pnpm dev"))
+            result = orjson.loads(terminal_tool(command="pnpm dev"))
 
         assert result["exit_code"] == -1
         assert "long-lived" in result["error"].lower()
@@ -85,10 +85,15 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "usage", "returncode": 0}
 
+            # token_kill rewrites known commands through rtk when the binary is
+            # installed on the host (e.g. "pnpm dev --help" -> "rtk pnpm dev
+            # --help"). This test asserts the guard's pass-through of the raw
+            # command, so disable rtk detection for hermetic behavior.
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
+                 patch("tools.rtk_provision._rtk_available", return_value=False), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="pnpm dev --help"))
+                result = orjson.loads(terminal_tool(command="pnpm dev --help"))
 
         assert result["error"] is None
         call_kwargs = mock_env.execute.call_args
@@ -107,7 +112,7 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(
+                result = orjson.loads(terminal_tool(
                     command="echo hello",
                     timeout=300,  # Within max
                 ))
@@ -135,7 +140,7 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="make build"))
+                result = orjson.loads(terminal_tool(command="make build"))
 
         # Should execute with the config default, NOT be rejected
         call_kwargs = mock_env.execute.call_args
@@ -163,7 +168,7 @@ class TestForegroundTimeoutCap:
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
                  patch("tools.process_registry.process_registry", mock_registry), \
                  patch("tools.approval.get_current_session_key", return_value=""):
-                result = json.loads(terminal_tool(
+                result = orjson.loads(terminal_tool(
                     command="python server.py",
                     background=True,
                     timeout=9999,
@@ -188,7 +193,7 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="echo hello"))
+                result = orjson.loads(terminal_tool(command="echo hello"))
 
         call_kwargs = mock_env.execute.call_args
         assert call_kwargs[1]["timeout"] == 180
@@ -207,7 +212,7 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(
+                result = orjson.loads(terminal_tool(
                     command="echo hello",
                     timeout=FOREGROUND_MAX_TIMEOUT,  # Exactly at limit
                 ))

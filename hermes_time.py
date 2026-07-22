@@ -19,6 +19,25 @@ from datetime import datetime
 from hermes_constants import get_config_path
 from typing import Optional
 
+# ciso8601 is a C-accelerated ISO8601 parser (10-50× faster than stdlib)
+_HAS_CISO8601: bool
+try:
+    from ciso8601 import parse_datetime as _parse_datetime
+    _HAS_CISO8601 = True
+except ImportError:
+    _HAS_CISO8601 = False
+
+
+def parse_iso_datetime(text: str) -> datetime:
+    """Parse an ISO 8601 datetime string, using ``ciso8601`` when available.
+
+    Falls back to ``datetime.fromisoformat`` if ``ciso8601`` is not installed.
+    Handles the ``Z`` suffix that ``fromisoformat`` does not accept.
+    """
+    if _HAS_CISO8601:
+        return _parse_datetime(text)
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -47,11 +66,22 @@ def _resolve_timezone_name() -> str:
 
     # 2. config.yaml ``timezone`` key
     try:
-        import yaml
-        config_path = get_config_path()
-        if config_path.exists():
-            with open(config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
+        # Prefer the shared cached raw-config reader (mtime/size-keyed cache +
+        # libyaml C loader) — a direct yaml.safe_load of a large config.yaml
+        # costs ~100ms+ and this used to run inside the FIRST system prompt
+        # build, on the time-to-first-token critical path.
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+        except Exception:
+            import yaml
+            config_path = get_config_path()
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            else:
+                cfg = {}
+        if cfg:
             # Managed scope: an administrator can pin ``timezone`` too. Overlay
             # via the shared helper (fail-open) since this reads config.yaml directly.
             try:

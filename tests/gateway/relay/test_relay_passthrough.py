@@ -12,8 +12,8 @@ connector->gateway handlers on the transport).
 
 from __future__ import annotations
 
-import base64
-import json
+import pybase64 as base64
+import orjson
 
 import pytest
 
@@ -45,7 +45,7 @@ def adapter():
 
 
 def _interaction_forward(payload: dict) -> PassthroughForward:
-    body = json.dumps(payload).encode("utf-8")
+    body = orjson.dumps(payload)
     return PassthroughForward(
         platform="discord",
         bot_id="appShared",
@@ -59,7 +59,7 @@ def _interaction_forward(payload: dict) -> PassthroughForward:
 def test_passthrough_from_wire_byte_preserves_body():
     """The wire frame's base64 body decodes back to the exact bytes (parity with
     the connector's toPassthroughForward)."""
-    original = json.dumps({"type": 2, "data": {"name": "ping"}, "guild_id": "g1"}).encode("utf-8")
+    original = orjson.dumps({"type": 2, "data": {"name": "ping"}, "guild_id": "g1"})
     wire = {
         "platform": "discord",
         "botId": "appShared",
@@ -120,10 +120,10 @@ async def test_discord_interaction_routes_through_handle_message(adapter, monkey
     ev = seen[0]
     assert ev.text == "summarize"
     assert ev.source.chat_id == "chan-9"
-    assert ev.source.guild_id == "guild-7"
+    assert ev.source.scope_id == "guild-7"
     assert ev.source.user_id == "user-3"
     assert ev.source.chat_type == "channel"
-    # Scope captured so the agent's reply re-asserts guild_id for egress.
+    # Scope captured so the agent's reply re-asserts scope_id for egress.
     assert adapter._scope_by_chat.get("chan-9") == "guild-7"
 
 

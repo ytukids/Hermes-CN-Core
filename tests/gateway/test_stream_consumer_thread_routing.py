@@ -103,7 +103,11 @@ class TestInitialReplyToId:
         await consumer._send_or_edit("Test")
 
         call_kwargs = adapter.send.call_args[1]
-        assert call_kwargs["metadata"] == {**metadata, "expect_edits": True}
+        assert call_kwargs["metadata"] == {
+            **metadata,
+            "reply_to_message_id": "om_msg_000",
+            "expect_edits": True,
+        }
         assert metadata == {"thread_id": "omt_topic789"}
 
     @pytest.mark.asyncio
@@ -140,7 +144,11 @@ class TestInitialReplyToId:
         await consumer._send_or_edit("Preview", finalize=False)
 
         metadata = adapter.send.call_args[1]["metadata"]
-        assert metadata == {"thread_id": "root_post_123", "expect_edits": True}
+        assert metadata == {
+            "thread_id": "root_post_123",
+            "reply_to_message_id": "reply_post_456",
+            "expect_edits": True,
+        }
 
 
 class TestOverflowFirstMessage:
@@ -205,12 +213,12 @@ class TestFeishuFallbackThreadRouting:
         adapter._run_blocking = _run_blocking_passthrough
 
         # Call _send_raw_message with reply_to=None and thread_id in metadata
-        import json
+        import orjson
         result = await FeishuAdapter._send_raw_message(
             adapter,
             chat_id="oc_main_chat",
             msg_type="text",
-            payload=json.dumps({"text": "hello"}),
+            payload=orjson.dumps({"text": "hello"}).decode('utf-8'),
             reply_to=None,
             metadata={"thread_id": "omt_topic_abc"},
         )
@@ -228,7 +236,7 @@ class TestFeishuFallbackThreadRouting:
         # receive_id should be the thread_id, not the chat_id
         receive_id = getattr(body, "receive_id", None)
         if receive_id is None and isinstance(body, str):
-            import json as _json
+            import orjson as _json
             receive_id = _json.loads(body).get("receive_id")
         assert receive_id == "omt_topic_abc", (
             f"Expected receive_id='omt_topic_abc', got '{receive_id}'"
@@ -260,12 +268,12 @@ class TestFeishuFallbackThreadRouting:
             return func(*args)
         adapter._run_blocking = _run_blocking_passthrough
 
-        import json
+        import orjson
         result = await FeishuAdapter._send_raw_message(
             adapter,
             chat_id="oc_main_chat",
             msg_type="text",
-            payload=json.dumps({"text": "hello"}),
+            payload=orjson.dumps({"text": "hello"}).decode('utf-8'),
             reply_to=None,
             metadata=None,
         )

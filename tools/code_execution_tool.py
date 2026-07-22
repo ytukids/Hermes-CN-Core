@@ -28,12 +28,14 @@ Platform: Linux / macOS only (Unix domain sockets for local). Disabled on Window
 Remote execution additionally requires Python 3 in the terminal backend.
 """
 
-import base64
+import pybase64 as base64
 import functools
+import orjson
 import json
 import logging
 import os
-import platform
+from platform_utils import is_windows
+import secrets
 import shlex
 import socket
 import subprocess
@@ -43,7 +45,7 @@ import threading
 import time
 import uuid
 
-_IS_WINDOWS = platform.system() == "Windows"
+_IS_WINDOWS = is_windows()
 from typing import Any, Dict, List, Optional
 
 from tools.thread_context import propagate_context_to_thread
@@ -88,7 +90,16 @@ _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                       "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
                       "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
 _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
-                      "PASSWD", "AUTH", "DSN", "WEBHOOK")
+                      "PASSWD", "AUTH", "DSN", "WEBHOOK",
+                      # Abbreviations that appear in real-world credential
+                      # variable names but were previously undetected:
+                      # CREDS (CREDENTIALS abbreviated), BEARER
+                      # (Authorization: Bearer tokens), APIKEY (written
+                      # without an underscore). "PASS" is intentionally NOT
+                      # added — it false-positives on legitimate non-secret
+                      # vars (BYPASS_CACHE, COMPASS_DIR, PASSENGER_HOST) while
+                      # PASSWORD/PASSWD already cover the credential cases.
+                      "CREDS", "BEARER", "APIKEY")
 
 # Operational HERMES_* vars the child legitimately needs by exact name — these
 # are non-secret runtime-location flags (the same set hermes_cli treats as the
@@ -219,9 +230,9 @@ _TOOL_STUBS = {
     ),
     "web_extract": (
         "web_extract",
-        "urls: list",
-        '"""Extract content from URLs. Returns dict with results list of {url, title, content, error}."""',
-        '{"urls": urls}',
+        "urls: list, char_limit: int = None",
+        '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
+        '{"urls": urls, "char_limit": char_limit}',
     ),
     "read_file": (
         "read_file",
@@ -249,9 +260,9 @@ _TOOL_STUBS = {
     ),
     "terminal": (
         "terminal",
-        "command: str, timeout: int = None, workdir: str = None",
+        "command: str, timeout: int = None, workdir: str = None, token_kill: bool = True, max_lines: int = None",
         '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
-        '{"command": command, "timeout": timeout, "workdir": workdir}',
+        '{"command": command, "timeout": timeout, "workdir": workdir, "token_kill": token_kill, "max_lines": max_lines}',
     ),
 }
 
@@ -372,7 +383,11 @@ def _connect():
 
 def _call(tool_name, args):
     """Send a tool call to the parent process and return the parsed result."""
-    request = json.dumps({"tool": tool_name, "args": args}) + "\\n"
+    request = json.dumps({
+        "tool": tool_name,
+        "args": args,
+        "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+    }) + "\\n"
     with _call_lock:
         conn = _connect()
         conn.sendall(request.encode())
@@ -425,7 +440,12 @@ def _call(tool_name, args):
     # non-ASCII chars in tool args when encoding them as JSON.
     tmp = req_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"tool": tool_name, "args": args, "seq": seq}, f)
+        f.write(json.dumps({
+            "tool": tool_name,
+            "args": args,
+            "seq": seq,
+            "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+        }))
     os.rename(tmp, req_file)
 
     # Wait for response with adaptive polling
@@ -473,6 +493,7 @@ def _rpc_server_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    rpc_token: str,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -512,9 +533,16 @@ def _rpc_server_loop(
 
                 call_start = time.monotonic()
                 try:
-                    request = json.loads(line.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    request = orjson.loads(line.decode())
+                except (orjson.JSONDecodeError, UnicodeDecodeError) as exc:
                     resp = tool_error(f"Invalid RPC request: {exc}")
+                    conn.sendall((resp + "\n").encode())
+                    continue
+
+                if not rpc_token or not secrets.compare_digest(
+                    str(request.get("token") or ""), rpc_token
+                ):
+                    resp = orjson.dumps({"error": "Unauthorized RPC request"}).decode('utf-8')
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -524,23 +552,23 @@ def _rpc_server_loop(
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    resp = json.dumps({
+                    resp = orjson.dumps({
                         "error": (
                             f"Tool '{tool_name}' is not available in execute_code. "
                             f"Available: {available}"
                         )
-                    })
+                    }).decode('utf-8')
                     conn.sendall((resp + "\n").encode())
                     continue
 
                 # Enforce tool call limit
                 if tool_call_counter[0] >= max_tool_calls:
-                    resp = json.dumps({
+                    resp = orjson.dumps({
                         "error": (
                             f"Tool call limit reached ({max_tool_calls}). "
                             "No more tool calls allowed in this execution."
                         )
-                    })
+                    }).decode('utf-8')
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -657,6 +685,7 @@ def _get_or_create_env(task_id: str):
                 "container_persistent": config.get("container_persistent", True),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+                "docker_network": config.get("docker_network", True),
             }
 
         ssh_config = None
@@ -741,6 +770,7 @@ def _rpc_poll_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    rpc_token: str,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -787,10 +817,17 @@ def _rpc_poll_loop(
                     timeout=10,
                 )
                 try:
-                    request = json.loads(read_result.get("output", ""))
-                except (json.JSONDecodeError, ValueError):
+                    request = orjson.loads(read_result.get("output", ""))
+                except (orjson.JSONDecodeError, ValueError):
                     logger.debug("Malformed RPC request in %s", req_file)
                     # Remove bad request to avoid infinite retry
+                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    continue
+
+                if not rpc_token or not secrets.compare_digest(
+                    str(request.get("token") or ""), rpc_token
+                ):
+                    logger.debug("Unauthorized RPC request in %s", req_file)
                     env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
                     continue
 
@@ -804,20 +841,20 @@ def _rpc_poll_loop(
                 # Enforce allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
+                    tool_result = orjson.dumps({
                         "error": (
                             f"Tool '{tool_name}' is not available in execute_code. "
                             f"Available: {available}"
                         )
-                    })
+                    }).decode('utf-8')
                 # Enforce tool call limit
                 elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
+                    tool_result = orjson.dumps({
                         "error": (
                             f"Tool call limit reached ({max_tool_calls}). "
                             "No more tool calls allowed in this execution."
                         )
-                    })
+                    }).decode('utf-8')
                 else:
                     # Strip forbidden terminal parameters
                     if tool_name == "terminal" and isinstance(tool_args, dict):
@@ -917,7 +954,7 @@ def _execute_remote(
             cwd="/", timeout=15,
         )
         if "OK" not in py_check.get("output", ""):
-            return json.dumps({
+            return orjson.dumps({
                 "status": "error",
                 "error": (
                     f"Python 3 is not available in the {env_type} terminal "
@@ -926,12 +963,14 @@ def _execute_remote(
                 ),
                 "tool_calls_made": 0,
                 "duration_seconds": 0,
-            })
+            }).decode('utf-8')
 
         # Create sandbox directory on remote
         env.execute(
             f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10,
         )
+
+        rpc_token = secrets.token_urlsafe(32)
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
@@ -948,7 +987,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event,
+                sandbox_tools, stop_event, rpc_token,
             ),
             daemon=True,
         )
@@ -957,6 +996,7 @@ def _execute_remote(
         # Build environment variable prefix for the script
         env_prefix = (
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
+            f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -988,12 +1028,12 @@ def _execute_remote(
             duration, tool_call_counter[0], type(exc).__name__, exc,
             exc_info=True,
         )
-        return json.dumps({
+        return orjson.dumps({
             "status": "error",
             "error": str(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
-        }, ensure_ascii=False)
+        }).decode('utf-8')
 
     finally:
         # Stop the polling thread
@@ -1066,7 +1106,7 @@ def _execute_remote(
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
 
-    return json.dumps(result, ensure_ascii=False)
+    return orjson.dumps(result).decode('utf-8')
 
 
 # ---------------------------------------------------------------------------
@@ -1095,10 +1135,10 @@ def execute_code(
         JSON string with execution results.
     """
     if not SANDBOX_AVAILABLE:
-        return json.dumps({
+        return orjson.dumps({
             "error": "execute_code sandbox is unavailable in this environment. "
                      "Use normal tool calls (terminal, read_file, write_file, ...) instead."
-        })
+        }).decode('utf-8')
 
     if not code or not code.strip():
         return tool_error("No code provided.")
@@ -1120,12 +1160,22 @@ def execute_code(
         has_host_access=_docker_has_host_access(_env_config),
     )
     if not _guard.get("approved", False):
-        return json.dumps({
+        return orjson.dumps({
             "status": "error",
             "error": _guard.get("message") or "execute_code blocked by approval guard.",
             "tool_calls_made": 0,
             "duration_seconds": 0,
-        }, ensure_ascii=False)
+        }).decode('utf-8')
+
+    # Clean interrupt slate for a user-approved script before EITHER dispatch
+    # path spawns it: drop a stale bit that landed on this thread during the
+    # blocking approval-wait so it can't kill the just-approved run on the first
+    # poll (local _wait_for_process loop, or remote/ssh env.execute which routes
+    # through the same poll loop).  A genuine post-clear interrupt re-sets the
+    # bit and is still caught downstream.
+    if _guard.get("user_approved"):
+        from tools.interrupt import clear_current_thread_interrupt
+        clear_current_thread_interrupt()
 
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
@@ -1195,6 +1245,7 @@ def execute_code(
             f.write(code)
 
         # --- Start RPC server ---
+        rpc_token = secrets.token_urlsafe(32)
         # Two transports:
         #   POSIX: AF_UNIX stream socket on sock_path, chmod 0600 for
         #   owner-only access.  Filesystem permissions gate the socket.
@@ -1221,7 +1272,7 @@ def execute_code(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
             ),
             daemon=True,
         )
@@ -1239,6 +1290,7 @@ def execute_code(
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
+        child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Force UTF-8 for the child's stdio and default file encoding.
         #
@@ -1299,7 +1351,7 @@ def execute_code(
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if _IS_WINDOWS else 0,
         )
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
@@ -1487,7 +1539,7 @@ def execute_code(
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
 
-        return json.dumps(result, ensure_ascii=False)
+        return orjson.dumps(result).decode('utf-8')
 
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
@@ -1499,12 +1551,12 @@ def execute_code(
             exc,
             exc_info=True,
         )
-        return json.dumps({
+        return orjson.dumps({
             "status": "error",
             "error": str(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
-        }, ensure_ascii=False)
+        }).decode('utf-8')
 
     finally:
         # Cleanup temp dir and socket
@@ -1643,7 +1695,7 @@ def _is_usable_python(python_path: str) -> bool:
              "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"],
             timeout=5,
             capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if _IS_WINDOWS else 0,
             stdin=subprocess.DEVNULL,
         )
         return result.returncode == 0
@@ -1727,8 +1779,9 @@ _TOOL_DOC_LINES = [
      "  web_search(query: str, limit: int = 5) -> dict\n"
      "    Returns {\"data\": {\"web\": [{\"url\", \"title\", \"description\"}, ...]}}"),
     ("web_extract",
-     "  web_extract(urls: list[str]) -> dict\n"
-     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown"),
+     "  web_extract(urls: list[str], char_limit: int = None) -> dict\n"
+     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
+     "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
     ("read_file",
      "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),

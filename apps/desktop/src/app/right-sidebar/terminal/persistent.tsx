@@ -4,7 +4,8 @@ import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from
 
 import { $terminalTakeover } from '../store'
 
-import { TerminalTab } from './index'
+import { ensureTerminal } from './terminals'
+import { TerminalWorkspace } from './workspace'
 
 /**
  * One xterm Terminal mounted at the layout root and CSS-overlayed onto
@@ -40,7 +41,6 @@ export function TerminalSlot({ className = SLOT_CLASS }: { className?: string })
 }
 
 interface PersistentTerminalProps {
-  cwd: string
   onAddSelectionToChat: (text: string, label?: string) => void
 }
 
@@ -54,11 +54,25 @@ interface Rect {
 const sameRect = (a: Rect | null, b: Rect) =>
   !!a && a.top === b.top && a.left === b.left && a.width === b.width && a.height === b.height
 
-export function PersistentTerminal({ cwd, onAddSelectionToChat }: PersistentTerminalProps) {
+export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalProps) {
   const slot = useStore($slot)
   const terminalTakeover = useStore($terminalTakeover)
   const [rect, setRect] = useState<Rect | null>(null)
   const [ready, setReady] = useState(false)
+
+  // VS Code parity: once the pane has ever been opened, keep the terminals
+  // mounted — and their shells alive — even while hidden. Hiding the pane just
+  // collapses the slot, so the overlay below goes invisible; nothing is torn
+  // down. Only an explicit per-tab close kills a PTY. Re-opening re-ensures one
+  // terminal exists (covers having closed the last tab).
+  const [mounted, setMounted] = useState(false)
+
+  useEffect(() => {
+    if (terminalTakeover && ready) {
+      setMounted(true)
+      ensureTerminal()
+    }
+  }, [terminalTakeover, ready])
 
   useLayoutEffect(() => {
     if (!slot) {
@@ -69,9 +83,8 @@ export function PersistentTerminal({ cwd, onAddSelectionToChat }: PersistentTerm
 
     let prev: Rect | null = null
     let frame = 0
-    let stableFrames = 0
 
-    const measure = (): boolean => {
+    const tick = () => {
       const r = slot.getBoundingClientRect()
       // floor top/left + ceil right/bottom: overlay always covers the slot's
       // full pixel footprint, so half-pixel rects can't leak page bg through.
@@ -79,71 +92,21 @@ export function PersistentTerminal({ cwd, onAddSelectionToChat }: PersistentTerm
       const left = Math.floor(r.left)
       const next: Rect = { top, left, width: Math.ceil(r.right) - left, height: Math.ceil(r.bottom) - top }
 
-      if (sameRect(prev, next)) {
-        return false
-      }
+      if (!sameRect(prev, next)) {
+        prev = next
+        setRect(next)
 
-      prev = next
-      setRect(next)
-
-      if (next.width > 0 && next.height > 0) {
-        setReady(true)
-      }
-
-      return true
-    }
-
-    // Track the slot through a transition, then STOP. The old implementation
-    // re-ran getBoundingClientRect() every frame forever, which forces a layout
-    // flush ~60×/sec for the whole app lifetime — a constant main-thread tax
-    // that amplifies any other jank into a perceptible freeze on slower/Windows
-    // machines. Instead, re-measure each frame only until the rect has held
-    // steady for a few frames, then idle until the next resize/scroll/layout
-    // change re-arms the burst.
-    const settle = () => {
-      stableFrames = 0
-
-      if (frame) {
-        return
-      }
-
-      const step = () => {
-        stableFrames = measure() ? 0 : stableFrames + 1
-
-        if (stableFrames >= 3) {
-          frame = 0
-
-          return
+        if (next.width > 0 && next.height > 0) {
+          setReady(true)
         }
-
-        frame = requestAnimationFrame(step)
       }
 
-      frame = requestAnimationFrame(step)
+      frame = requestAnimationFrame(tick)
     }
 
-    measure()
-    settle()
+    tick()
 
-    // Re-arm the burst on the events that can move/resize the slot. A plain
-    // ResizeObserver alone misses position-only shifts (a sibling pane resizing
-    // moves the slot without changing its size), so pair it with window resize
-    // and capture-phase scroll.
-    const reArm = () => settle()
-    const resizeObserver = new ResizeObserver(reArm)
-    resizeObserver.observe(slot)
-    window.addEventListener('resize', reArm)
-    window.addEventListener('scroll', reArm, { capture: true, passive: true })
-
-    return () => {
-      if (frame) {
-        cancelAnimationFrame(frame)
-      }
-
-      resizeObserver.disconnect()
-      window.removeEventListener('resize', reArm)
-      window.removeEventListener('scroll', reArm, { capture: true })
-    }
+    return () => cancelAnimationFrame(frame)
   }, [slot])
 
   const visible = Boolean(rect && rect.width > 0 && rect.height > 0)
@@ -165,12 +128,12 @@ export function PersistentTerminal({ cwd, onAddSelectionToChat }: PersistentTerm
     contain: 'layout size paint'
   }
 
-  // Defer mount until the terminal sidebar is open and the slot has real dims.
-  // Booting xterm/node-pty at 0×0 starts the shell at 80×24 and spawns a
-  // visible conhost on Windows even when the pane is collapsed.
+  // Defer the FIRST mount until the pane is open and the slot has real dims —
+  // booting xterm/node-pty at 0×0 starts the shell at 80×24 and spawns a visible
+  // conhost on Windows. After that `mounted` latches: shells persist while hidden.
   return (
     <div aria-hidden={!visible} style={style}>
-      {terminalTakeover && ready && <TerminalTab cwd={cwd} onAddSelectionToChat={onAddSelectionToChat} />}
+      {mounted && <TerminalWorkspace onAddSelectionToChat={onAddSelectionToChat} />}
     </div>
   )
 }

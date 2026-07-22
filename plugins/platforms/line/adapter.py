@@ -61,15 +61,15 @@ a single plugin-form module that requires zero core edits:
 from __future__ import annotations
 
 import asyncio
-import base64
+import pybase64 as base64
 import enum
 import hashlib
 import hmac
-import json
+import orjson
 import logging
 import mimetypes
 import os
-import re
+from agent.re_compat import re
 import secrets
 import tempfile
 import time
@@ -273,7 +273,9 @@ def verify_line_signature(body: bytes, signature: str, channel_secret: str) -> b
         expected = base64.b64encode(digest).decode("utf-8")
     except Exception:
         return False
-    return hmac.compare_digest(expected, signature)
+    # Compare as bytes: compare_digest raises TypeError on a str with
+    # non-ASCII characters, and the signature is a raw request header.
+    return hmac.compare_digest(expected.encode(), signature.encode())
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +588,7 @@ def build_postback_button_message(
                 {
                     "type": "postback",
                     "label": button_label[:20] or "Get answer",
-                    "data": json.dumps(
-                        {"action": "show_response", "request_id": request_id}
-                    ),
+                    "data": orjson.dumps({"action": "show_response", "request_id": request_id}).decode('utf-8'),
                     "displayText": button_label[:300] or "Get answer",
                 }
             ],
@@ -881,8 +881,8 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=401, text="invalid signature")
 
         try:
-            payload = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = orjson.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, orjson.JSONDecodeError):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
@@ -1002,8 +1002,8 @@ class LineAdapter(BasePlatformAdapter):
         chat_id, _ = _resolve_chat(source)
 
         try:
-            parsed = json.loads(data)
-        except (TypeError, json.JSONDecodeError):
+            parsed = orjson.loads(data)
+        except (TypeError, orjson.JSONDecodeError):
             return
 
         if parsed.get("action") != "show_response":

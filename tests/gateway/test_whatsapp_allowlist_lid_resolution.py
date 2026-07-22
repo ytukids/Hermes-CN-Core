@@ -13,7 +13,7 @@ bridge's ``lid-mapping-*.json`` session files (the same source the gateway
 authz and session-key paths already use).
 """
 
-import json
+import orjson
 from unittest.mock import AsyncMock
 
 from gateway.config import Platform, PlatformConfig
@@ -54,9 +54,9 @@ def _write_lid_mapping(phone=PHONE, lid=LID):
     """Mirror what the JS bridge writes: phone→lid and lid→phone (reverse)."""
     session_dir = get_hermes_home() / "whatsapp" / "session"
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / f"lid-mapping-{phone}.json").write_text(json.dumps(lid), encoding="utf-8")
+    (session_dir / f"lid-mapping-{phone}.json").write_text(orjson.dumps(lid).decode('utf-8'), encoding="utf-8")
     (session_dir / f"lid-mapping-{lid}_reverse.json").write_text(
-        json.dumps(phone), encoding="utf-8"
+        orjson.dumps(phone).decode('utf-8'), encoding="utf-8"
     )
 
 
@@ -119,10 +119,17 @@ def test_dm_disabled_policy_blocks_even_allowlisted():
     assert adapter._is_dm_allowed(f"{LID}@lid") is False
 
 
-def test_dm_open_policy_allows_anyone():
+def test_dm_open_policy_allows_anyone_with_opt_in(monkeypatch):
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
     adapter = _make_adapter(dm_policy="open")
 
     assert adapter._is_dm_allowed("anyone@lid") is True
+
+
+def test_dm_open_policy_blocked_without_opt_in():
+    adapter = _make_adapter(dm_policy="open")
+
+    assert adapter._is_dm_allowed("anyone@lid") is False
 
 
 # ------------------------------------------------------------------ group gate

@@ -1,6 +1,6 @@
 """Pure tool-call guardrail primitive tests."""
 
-import json
+import orjson
 
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -29,8 +29,8 @@ def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposi
     assert len(sig_a.args_hash) == 64
     metadata = sig_a.to_metadata()
     assert metadata == {"tool_name": "web_search", "args_hash": sig_a.args_hash}
-    assert "secret-token-value" not in json.dumps(metadata)
-    assert "☤" not in json.dumps(metadata)
+    assert "secret-token-value" not in orjson.dumps(metadata).decode('utf-8')
+    assert "☤" not in orjson.dumps(metadata).decode('utf-8')
 
 
 def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
@@ -133,15 +133,15 @@ def test_success_resets_exact_signature_failure_streak():
 
 
 def test_file_mutation_lint_error_result_is_not_a_tool_failure():
-    write_result = json.dumps({
+    write_result = orjson.dumps({
         "bytes_written": 12,
         "lint": {"status": "error", "output": "SyntaxError: invalid syntax"},
-    })
-    patch_result = json.dumps({
+    }).decode('utf-8')
+    patch_result = orjson.dumps({
         "success": True,
         "diff": "--- a/tmp.py\n+++ b/tmp.py\n",
         "lsp_diagnostics": "<diagnostics>ERROR [1:1] type mismatch</diagnostics>",
-    })
+    }).decode('utf-8')
 
     assert classify_tool_failure("write_file", write_result) == (False, "")
     assert classify_tool_failure("patch", patch_result) == (False, "")
@@ -256,3 +256,24 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+def test_after_call_survives_lone_surrogates_in_result_and_args():
+    # Scraped web/social text can contain unpaired UTF-16 surrogates (e.g. the
+    # first half of a mathematical-bold pair, '\ud835'). str.encode('utf-8')
+    # rejects them, and the result hasher crashed the whole conversation loop
+    # (live outage: "Outer loop error in API call #34 ... surrogates not
+    # allowed"). Weird text must never take down the loop.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2, no_progress_block_after=2)
+    )
+    dirty = "price \ud835 update"
+
+    decision = controller.after_call("web_search", {"query": dirty}, dirty, failed=False)
+    assert decision.action in {"allow", "warn"}
+
+    # hashing stays deterministic: the same dirty failure twice still trips
+    # the exact-failure guard, proving the hash is stable across calls
+    controller.after_call("web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True)
+    controller.after_call("web_search", {"query": dirty}, '{"error":"\ud835 boom"}', failed=True)
+    assert controller.before_call("web_search", {"query": dirty}).action == "block"

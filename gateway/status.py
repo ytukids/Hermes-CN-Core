@@ -11,15 +11,17 @@ different, user-installed Hermes executable.
 """
 
 import hashlib
-import json
+import orjson
 import os
 import shlex
 import signal
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
 from typing import Any, Optional
 from utils import atomic_json_write
 
@@ -47,6 +49,25 @@ _gateway_lock_handle = None
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
+_GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
+_gateway_running_pid_cache_lock = threading.Lock()
+_gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
+
+
+def _get_process_hermes_home() -> Path:
+    """Return the process-level HERMES_HOME, skipping context-local overrides.
+
+    Gateway identity files (PID, lock, runtime status, takeover/stop markers)
+    must always live in the directory the gateway process was launched with.
+    ``get_hermes_home()`` honors ``_HERMES_HOME_OVERRIDE`` contextvar used for
+    per-session profile dispatch, which would route these files into the wrong
+    profile directory when a profile-context task happens to be active at write
+    time.  See issue #56986.
+    """
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return Path(val)
+    return _get_platform_default_hermes_home()
 
 
 def _get_gateway_runtime_dir() -> Path:
@@ -60,7 +81,10 @@ def _get_gateway_runtime_dir() -> Path:
     override = os.getenv("HERMES_GATEWAY_RUNTIME_DIR")
     if override:
         return Path(override)
-    return get_hermes_home()
+    # No desktop override: fall through to the process-level HERMES_HOME
+    # (#56986) so identity files never follow per-session profile
+    # contextvar overrides.
+    return _get_process_hermes_home()
 
 
 def _get_pid_path() -> Path:
@@ -110,6 +134,10 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 text=True,
+                # taskkill prints in the OEM/ANSI codepage (e.g. GBK on
+                # zh-CN Windows) — strict decoding kills the stdout reader
+                # thread and silently drops the result text.
+                errors="replace",
                 timeout=10,
                 creationflags=windows_hide_flags(),
             )
@@ -366,9 +394,13 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
     bare with no profile flag.
     """
-    command_lc = command.lower()
+    command_lc = command.lower().replace("\\", "/")
     profile_name = _profile_name_for_home(profile_home)
-    home_lc = str(profile_home).lower()
+    # Normalize separators on both sides: ``str(Path)`` uses backslashes on
+    # Windows, but a live cmdline may carry the home path either way
+    # (POSIX-style from a container/MSYS launcher or native). The substring
+    # containment check below must not depend on which form the launcher used.
+    home_lc = str(profile_home).lower().replace("\\", "/")
 
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()
@@ -457,8 +489,8 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
     if not raw:
         return None
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
+        payload = orjson.loads(raw)
+    except orjson.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -482,8 +514,8 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
         return None
 
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
+        payload = orjson.loads(raw)
+    except orjson.JSONDecodeError:
         try:
             return {"pid": int(raw)}
         except ValueError:
@@ -509,6 +541,33 @@ def _pid_from_record(record: Optional[dict[str, Any]]) -> Optional[int]:
         return None
 
 
+def _clear_running_pid_cache() -> None:
+    with _gateway_running_pid_cache_lock:
+        _gateway_running_pid_cache.clear()
+
+
+def _file_cache_signature(path: Path) -> tuple[bool, Optional[int], Optional[int]]:
+    try:
+        st = path.stat()
+    except OSError:
+        return (False, None, None)
+    return (True, st.st_mtime_ns, st.st_size)
+
+
+def _running_pid_cache_signature(
+    pid_path: Path,
+    *,
+    include_runtime_status: bool,
+) -> tuple[Any, ...]:
+    parts: list[Any] = [
+        _file_cache_signature(pid_path),
+        _file_cache_signature(_get_gateway_lock_path(pid_path)),
+    ]
+    if include_runtime_status:
+        parts.append(_file_cache_signature(_get_runtime_status_path()))
+    return tuple(parts)
+
+
 def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
     """Delete a stale gateway PID file (and its sibling lock metadata).
 
@@ -521,6 +580,7 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
     """
     if not cleanup_stale:
         return
+    _clear_running_pid_cache()
     try:
         pid_path.unlink(missing_ok=True)
     except Exception:
@@ -534,7 +594,7 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
 def _write_gateway_lock_record(handle) -> None:
     handle.seek(0)
     handle.truncate()
-    json.dump(_build_pid_record(), handle)
+    handle.write(orjson.dumps(_build_pid_record()).decode('utf-8'))
     handle.flush()
     try:
         os.fsync(handle.fileno())
@@ -706,6 +766,7 @@ def acquire_gateway_runtime_lock() -> bool:
         return False
     _write_gateway_lock_record(handle)
     _gateway_lock_handle = handle
+    _clear_running_pid_cache()
     return True
 
 
@@ -721,6 +782,7 @@ def release_gateway_runtime_lock() -> None:
         handle.close()
     except OSError:
         pass
+    _clear_running_pid_cache()
 
 
 def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
@@ -755,7 +817,7 @@ def write_pid_file() -> None:
     """
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    record = json.dumps(_build_pid_record())
+    record = orjson.dumps(_build_pid_record()).decode('utf-8')
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
@@ -763,6 +825,7 @@ def write_pid_file() -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(record)
+        _clear_running_pid_cache()
     except Exception:
         try:
             path.unlink(missing_ok=True)
@@ -1044,6 +1107,7 @@ def remove_pid_file() -> None:
                 # PID file belongs to a different process — leave it alone.
                 return
         path.unlink(missing_ok=True)
+        _clear_running_pid_cache()
     except Exception:
         pass
 
@@ -1068,7 +1132,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
     if existing is None and lock_path.exists():
         # Lock file exists but is empty or contains invalid JSON — treat as
         # stale.  This happens when a previous process was killed between
-        # O_CREAT|O_EXCL and the subsequent json.dump() (e.g. DNS failure
+        # O_CREAT|O_EXCL and the subsequent () (e.g. DNS failure
         # during rapid Slack reconnect retries).
         try:
             lock_path.unlink(missing_ok=True)
@@ -1156,7 +1220,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         return False, _read_json_file(lock_path)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(record, handle)
+            handle.write(orjson.dumps(record).decode('utf-8'))
     except Exception:
         try:
             lock_path.unlink(missing_ok=True)
@@ -1254,13 +1318,13 @@ _PLANNED_STOP_MARKER_TTL_S = 60
 
 def _get_takeover_marker_path() -> Path:
     """Return the path to the --replace takeover marker file."""
-    home = get_hermes_home()
+    home = _get_process_hermes_home()
     return home / _TAKEOVER_MARKER_FILENAME
 
 
 def _get_planned_stop_marker_path() -> Path:
     """Return the path to the intentional gateway stop marker file."""
-    home = get_hermes_home()
+    home = _get_process_hermes_home()
     return home / _PLANNED_STOP_MARKER_FILENAME
 
 
@@ -1315,7 +1379,7 @@ def _consume_pid_marker_for_self(
     # unaffected. Leave a mismatched marker in place so the correct
     # profile can still consume it.
     replacer_home = record.get("replacer_hermes_home")
-    if replacer_home is not None and replacer_home != str(get_hermes_home()):
+    if replacer_home is not None and replacer_home != str(_get_process_hermes_home()):
         return False
 
     our_pid = os.getpid()
@@ -1364,7 +1428,7 @@ def write_takeover_marker(target_pid: int) -> bool:
             "target_pid": target_pid,
             "target_start_time": target_start_time,
             "replacer_pid": os.getpid(),
-            "replacer_hermes_home": str(get_hermes_home()),
+            "replacer_hermes_home": str(_get_process_hermes_home()),
             "written_at": _utc_now_iso(),
         }
         _write_json_file(_get_takeover_marker_path(), record)
@@ -1547,6 +1611,54 @@ def get_running_pid(
         if runtime_pid is not None:
             return runtime_pid
     return None
+
+
+def get_running_pid_cached(
+    pid_path: Optional[Path] = None,
+    *,
+    cleanup_stale: bool = True,
+    ttl_seconds: float = _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS,
+) -> Optional[int]:
+    """Cached read-side wrapper for dashboard/status polling.
+
+    ``get_running_pid()`` probes the runtime lock by briefly opening and locking
+    ``gateway.lock``. That is the right authoritative check for control paths,
+    but high-frequency read-only HTTP polling can call it hundreds of times per
+    minute. Cache for a short window and invalidate on PID/lock/runtime-status
+    file changes so status endpoints do not churn file descriptors while still
+    noticing gateway start/stop transitions quickly.
+    """
+    if ttl_seconds <= 0:
+        return get_running_pid(pid_path, cleanup_stale=cleanup_stale)
+
+    resolved_pid_path = pid_path or _get_pid_path()
+    include_runtime_status = pid_path is None
+    signature = _running_pid_cache_signature(
+        resolved_pid_path,
+        include_runtime_status=include_runtime_status,
+    )
+    key = (str(resolved_pid_path), bool(cleanup_stale), include_runtime_status)
+    now = time.monotonic()
+
+    with _gateway_running_pid_cache_lock:
+        cached = _gateway_running_pid_cache.get(key)
+        if cached is not None:
+            cached_at, cached_signature, cached_pid = cached
+            if now - cached_at <= ttl_seconds and cached_signature == signature:
+                return cached_pid
+
+    pid = get_running_pid(pid_path, cleanup_stale=cleanup_stale)
+    refreshed_signature = _running_pid_cache_signature(
+        resolved_pid_path,
+        include_runtime_status=include_runtime_status,
+    )
+    with _gateway_running_pid_cache_lock:
+        _gateway_running_pid_cache[key] = (
+            time.monotonic(),
+            refreshed_signature,
+            pid,
+        )
+    return pid
 
 
 def is_gateway_running(

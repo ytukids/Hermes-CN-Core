@@ -1,5 +1,6 @@
 """Tests for tools/skills_hub.py — source adapters, lock file, taps, dedup logic."""
 
+import orjson
 import json
 import time
 from typing import List, Optional
@@ -89,13 +90,13 @@ class TestSkillsShGroupings:
     """
 
     def test_parse_basic_groupings(self):
-        content = json.dumps({
+        content = orjson.dumps({
             "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
             "groupings": [
                 {"title": "Inference AI", "skills": ["dynamo-router", "dynamo-recipe"]},
                 {"title": "Decision Optimization", "skills": ["cuopt-developer"]},
             ],
-        })
+        }).decode('utf-8')
         mapping = GitHubSource._parse_skillsh_groupings(content)
         assert mapping == {
             "dynamo-router": "Inference AI",
@@ -117,24 +118,24 @@ class TestSkillsShGroupings:
 
     def test_parse_tolerates_malformed_group(self):
         # A group missing its skills list is skipped; the valid one survives.
-        content = json.dumps({"groupings": [
+        content = orjson.dumps({"groupings": [
             {"title": "X"},                              # no skills -> skipped
             {"skills": ["a"]},                           # no title -> skipped
             {"title": "Y", "skills": ["b", 5, None]},    # only valid string members kept
-        ]})
+        ]}).decode('utf-8')
         assert GitHubSource._parse_skillsh_groupings(content) == {"b": "Y"}
 
     def test_parse_first_grouping_wins_on_duplicate(self):
-        content = json.dumps({"groupings": [
+        content = orjson.dumps({"groupings": [
             {"title": "First", "skills": ["dup"]},
             {"title": "Second", "skills": ["dup"]},
-        ]})
+        ]}).decode('utf-8')
         assert GitHubSource._parse_skillsh_groupings(content) == {"dup": "First"}
 
     def test_get_groupings_caches_per_repo(self):
         auth = MagicMock()
         src = GitHubSource(auth=auth)
-        content = json.dumps({"groupings": [{"title": "T", "skills": ["s"]}]})
+        content = orjson.dumps({"groupings": [{"title": "T", "skills": ["s"]}]}).decode('utf-8')
         with patch.object(src, "_fetch_file_content", return_value=content) as mock_fetch:
             first = src._get_skillsh_groupings("acme/skills")
             second = src._get_skillsh_groupings("acme/skills")
@@ -1164,7 +1165,9 @@ class TestCheckForSkillUpdates:
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("same content")
         (skill_dir / "references").mkdir()
-        (skill_dir / "references" / "checklist.md").write_text("- [ ] security\n")
+        # write_bytes: on Windows write_text translates \n -> \r\n, which
+        # would make the on-disk bytes differ from the in-memory bundle.
+        (skill_dir / "references" / "checklist.md").write_bytes(b"- [ ] security\n")
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
@@ -1227,7 +1230,9 @@ class TestCheckForSkillUpdates:
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_bytes(b"# Demo Skill\n")
         (skill_dir / "references").mkdir()
-        (skill_dir / "references" / "checklist.md").write_text("- [ ] security\n")
+        # write_bytes: on Windows write_text translates \n -> \r\n, which
+        # would make the on-disk bytes differ from the in-memory bundle.
+        (skill_dir / "references" / "checklist.md").write_bytes(b"- [ ] security\n")
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
@@ -1316,10 +1321,10 @@ class TestHubLockFile:
 
     def test_load_valid_file(self, tmp_path):
         lock_file = tmp_path / "lock.json"
-        lock_file.write_text(json.dumps({
+        lock_file.write_text(orjson.dumps({
             "version": 1,
             "installed": {"my-skill": {"source": "github"}}
-        }))
+        }).decode('utf-8'))
         lock = HubLockFile(path=lock_file)
         data = lock.load()
         assert "my-skill" in data["installed"]
@@ -1414,7 +1419,7 @@ class TestTapsManager:
 
     def test_load_valid_file(self, tmp_path):
         taps_file = tmp_path / "taps.json"
-        taps_file.write_text(json.dumps({"taps": [{"repo": "owner/repo", "path": "skills/"}]}))
+        taps_file.write_text(orjson.dumps({"taps": [{"repo": "owner/repo", "path": "skills/"}]}).decode('utf-8'))
         mgr = TapsManager(path=taps_file)
         taps = mgr.load()
         assert len(taps) == 1
@@ -1816,6 +1821,26 @@ class TestSkillMetaToDict:
 # ---------------------------------------------------------------------------
 
 
+class TestOptionalSkillSourceMetadata:
+    def test_scan_all_emits_repo_root_relative_metadata(self, tmp_path):
+        optional_root = tmp_path / "optional-skills"
+        skill_dir = optional_root / "finance" / "3-statement-model"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: 3-statement-model\ndescription: test\n---\n\nBody\n",
+            encoding="utf-8",
+        )
+
+        src = OptionalSkillSource()
+        src._optional_dir = optional_root
+
+        meta = src.inspect("official/finance/3-statement-model")
+
+        assert meta is not None
+        assert meta.repo == "NousResearch/hermes-agent"
+        assert meta.path == "optional-skills/finance/3-statement-model"
+
+
 class TestOptionalSkillSourceBinaryAssets:
     def test_fetch_preserves_binary_assets(self, tmp_path):
         optional_root = tmp_path / "optional-skills"
@@ -1829,8 +1854,10 @@ class TestOptionalSkillSourceBinaryAssets:
         (skill_dir / "assets" / "neutts-cli" / "samples" / "jo.wav").write_bytes(
             wav_bytes
         )
-        (skill_dir / "assets" / "neutts-cli" / "samples" / "jo.txt").write_text(
-            "hello\n", encoding="utf-8"
+        # write_bytes: write_text would translate \n -> \r\n on Windows and
+        # the byte-exact assertions below would fail.
+        (skill_dir / "assets" / "neutts-cli" / "samples" / "jo.txt").write_bytes(
+            b"hello\n"
         )
         pycache_dir = skill_dir / "assets" / "neutts-cli" / "src" / "neutts_cli" / "__pycache__"
         pycache_dir.mkdir(parents=True)
@@ -1845,6 +1872,23 @@ class TestOptionalSkillSourceBinaryAssets:
         assert bundle.files["assets/neutts-cli/samples/jo.wav"] == wav_bytes
         assert bundle.files["assets/neutts-cli/samples/jo.txt"] == b"hello\n"
         assert "assets/neutts-cli/src/neutts_cli/__pycache__/cli.cpython-312.pyc" not in bundle.files
+
+    def test_fetch_rejects_sibling_directory_traversal(self, tmp_path):
+        optional_root = tmp_path / "optional-skills"
+        sibling_skill_dir = tmp_path / "optional-skills-escape" / "pwned"
+        optional_root.mkdir()
+        sibling_skill_dir.mkdir(parents=True)
+        (sibling_skill_dir / "SKILL.md").write_text(
+            "---\nname: pwned\ndescription: traversal\n---\n\nBody\n",
+            encoding="utf-8",
+        )
+
+        src = OptionalSkillSource()
+        src._optional_dir = optional_root
+
+        bundle = src.fetch("official/../optional-skills-escape/pwned")
+
+        assert bundle is None
 
 
 class TestQuarantineBundleBinaryAssets:
@@ -2195,7 +2239,7 @@ class TestInstallPathSafety:
         (target / "file.txt").write_text("important")
 
         # Bypass record_install's validator to simulate a poisoned lock file.
-        lock_path.write_text(json.dumps({
+        lock_path.write_text(orjson.dumps({
             "installed": {
                 "evil": {
                     "source": "github",
@@ -2210,7 +2254,7 @@ class TestInstallPathSafety:
                     "updated_at": "now",
                 }
             }
-        }))
+        }).decode('utf-8'))
 
         patch_lock_file(lock_path)
         ok, msg = uninstall_skill("evil")
@@ -2227,7 +2271,7 @@ class TestInstallPathSafety:
         sibling.mkdir()
         (sibling / "data").write_text("nope")
 
-        lock_path.write_text(json.dumps({
+        lock_path.write_text(orjson.dumps({
             "installed": {
                 "evil": {
                     "source": "github", "identifier": "x",
@@ -2238,7 +2282,7 @@ class TestInstallPathSafety:
                     "installed_at": "now", "updated_at": "now",
                 }
             }
-        }))
+        }).decode('utf-8'))
 
         patch_lock_file(lock_path)
         ok, msg = uninstall_skill("evil")
@@ -2255,7 +2299,7 @@ class TestInstallPathSafety:
         (isolated_skills_dir / "bystander" / "SKILL.md").write_text("safe")
 
         lock_path = tmp_path / "lock.json"
-        lock_path.write_text(json.dumps({
+        lock_path.write_text(orjson.dumps({
             "installed": {
                 "evil": {
                     "source": "github", "identifier": "x",
@@ -2266,7 +2310,7 @@ class TestInstallPathSafety:
                     "installed_at": "now", "updated_at": "now",
                 }
             }
-        }))
+        }).decode('utf-8'))
 
         patch_lock_file(lock_path)
         ok, msg = uninstall_skill("evil")
@@ -2292,7 +2336,7 @@ class TestInstallPathSafety:
             pytest.skip("symlink creation unsupported on this platform")
 
         lock_path = tmp_path / "lock.json"
-        lock_path.write_text(json.dumps({
+        lock_path.write_text(orjson.dumps({
             "installed": {
                 "evil": {
                     "source": "github", "identifier": "x",
@@ -2303,7 +2347,7 @@ class TestInstallPathSafety:
                     "installed_at": "now", "updated_at": "now",
                 }
             }
-        }))
+        }).decode('utf-8'))
 
         patch_lock_file(lock_path)
         ok, msg = uninstall_skill("evil")
@@ -2434,3 +2478,103 @@ class TestParallelSearchSourcesTimeout:
         assert source_counts.get("a") == 1
         assert source_counts.get("b") == 1
         assert len(all_results) == 2
+
+
+# ---------------------------------------------------------------------------
+# _load_hermes_index — centralized index fetch (Browse-hub landing / search)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadHermesIndex:
+    """Regression coverage for the Skills-Hub index fetch.
+
+    The centralized index is a large body served with Content-Encoding: br.
+    httpx's streaming Brotli decoder (brotlicffi 1.2.0.1, pinned for Discord
+    attachment decoding) raises DecodingError on payloads this size, which
+    used to cascade into a silently-empty Skills Hub. The fetch must therefore
+    (a) not ask for Brotli, and (b) survive a DecodingError by retrying
+    uncompressed instead of blanking the hub.
+    """
+
+    @staticmethod
+    def _isolate_cache(monkeypatch, tmp_path):
+        """Point the on-disk cache at an empty tmp dir so no real cache leaks in."""
+        import tools.skills_hub as hub
+
+        cache_file = tmp_path / "hermes-index.json"
+        monkeypatch.setattr(hub, "_hermes_index_cache_file", lambda: cache_file)
+        return cache_file
+
+    def test_fetch_does_not_request_brotli(self, monkeypatch, tmp_path):
+        """The index fetch must not negotiate Brotli (the broken decoder path)."""
+        import tools.skills_hub as hub
+
+        self._isolate_cache(monkeypatch, tmp_path)
+
+        captured = {}
+
+        def fake_get(url, *args, **kwargs):
+            captured["headers"] = kwargs.get("headers", {})
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"skills": [{"name": "x"}]}
+            return resp
+
+        monkeypatch.setattr(hub.httpx, "get", fake_get)
+
+        data = hub._load_hermes_index()
+        assert data == {"skills": [{"name": "x"}]}
+
+        accept = captured["headers"].get("Accept-Encoding", "")
+        assert "br" not in [tok.strip() for tok in accept.split(",")], (
+            f"index fetch must not request Brotli, got Accept-Encoding={accept!r}"
+        )
+
+    def test_decoding_error_retries_uncompressed(self, monkeypatch, tmp_path):
+        """A DecodingError on the first attempt retries with identity, not a blank hub."""
+        import tools.skills_hub as hub
+
+        self._isolate_cache(monkeypatch, tmp_path)
+
+        attempts = []
+
+        def fake_get(url, *args, **kwargs):
+            enc = kwargs.get("headers", {}).get("Accept-Encoding", "")
+            attempts.append(enc)
+            if len(attempts) == 1:
+                raise httpx.DecodingError("brotli: decoder process called with data")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"skills": [{"name": "recovered"}]}
+            return resp
+
+        monkeypatch.setattr(hub.httpx, "get", fake_get)
+
+        data = hub._load_hermes_index()
+        assert data == {"skills": [{"name": "recovered"}]}
+        assert len(attempts) == 2, "should retry once after a DecodingError"
+        # The retry must be uncompressed (identity) so a Brotli-ignoring proxy
+        # can't fail the same way twice.
+        assert attempts[1].strip() == "identity"
+
+    def test_persistent_decoding_error_falls_back_to_stale_cache(
+        self, monkeypatch, tmp_path
+    ):
+        """If every attempt fails to decode, serve the stale cache rather than None."""
+        import tools.skills_hub as hub
+
+        cache_file = self._isolate_cache(monkeypatch, tmp_path)
+        cache_file.write_text(json.dumps({"skills": [{"name": "stale"}]}))
+        # Force the cache to look expired so the network path runs.
+        old = time.time() - (hub.HERMES_INDEX_TTL + 100)
+        import os
+
+        os.utime(cache_file, (old, old))
+
+        def fake_get(url, *args, **kwargs):
+            raise httpx.DecodingError("brotli boom")
+
+        monkeypatch.setattr(hub.httpx, "get", fake_get)
+
+        data = hub._load_hermes_index()
+        assert data == {"skills": [{"name": "stale"}]}

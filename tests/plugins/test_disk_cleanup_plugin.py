@@ -13,7 +13,7 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
 """
 
 import importlib
-import json
+import orjson
 import sys
 from pathlib import Path
 
@@ -136,6 +136,13 @@ class TestGuessCategory:
         p.write_text("x")
         assert dg.guess_category(p) == "cron-output"
 
+    def test_cron_output_root_not_tracked(self, _isolate_env):
+        """The cron/output root is durable container state, not an artifact."""
+        dg = _load_lib()
+        output_root = _isolate_env / "cron" / "output"
+        output_root.mkdir(parents=True)
+        assert dg.guess_category(output_root) is None
+
     def test_cron_jobs_json_not_tracked(self, _isolate_env):
         """Regression for #32164: the cron registry must never be tracked."""
         dg = _load_lib()
@@ -192,18 +199,18 @@ class TestStaleCronEntryMigration:
         # directly writing the tracked file (track() would reject it).
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
+        tracked_file.write_text(orjson.dumps([{
             "path": str(jobs_json),
             "category": "cron-output",
             "timestamp": "2025-01-01T00:00:00+00:00",  # very old
             "size": 123,
-        }]))
+        }]).decode('utf-8'))
 
         summary = dg.quick()
         assert summary["deleted"] == 0, "cron/jobs.json must not be deleted"
         assert jobs_json.exists(), "jobs.json must still exist"
         # The stale entry should have been dropped from tracking.
-        remaining = json.loads(tracked_file.read_text())
+        remaining = orjson.loads(tracked_file.read_text())
         assert len(remaining) == 0
 
     def test_quick_skips_stale_cron_output_for_cron_dir(self, _isolate_env):
@@ -217,16 +224,39 @@ class TestStaleCronEntryMigration:
 
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
+        tracked_file.write_text(orjson.dumps([{
             "path": str(cron_dir),
             "category": "cron-output",
             "timestamp": "2025-01-01T00:00:00+00:00",
             "size": 0,
-        }]))
+        }]).decode('utf-8'))
 
         summary = dg.quick()
         assert summary["deleted"] == 0, "cron/ dir must not be deleted"
         assert cron_dir.exists()
+
+    def test_quick_skips_stale_cron_output_for_output_root(self, _isolate_env):
+        """Stale entry for cron/output itself must not delete all job output."""
+        dg = _load_lib()
+        output_root = _isolate_env / "cron" / "output"
+        job_dir = output_root / "job_1"
+        job_dir.mkdir(parents=True)
+        run_md = job_dir / "run.md"
+        run_md.write_text("x")
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(orjson.dumps([{
+            "path": str(output_root),
+            "category": "cron-output",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "size": 0,
+        }]).decode('utf-8'))
+
+        summary = dg.quick()
+        assert summary["deleted"] == 0, "cron/output root must not be deleted"
+        assert output_root.exists()
+        assert run_md.exists()
 
     def test_quick_skips_protected_cron_paths_defense_in_depth(self, _isolate_env):
         """Defense-in-depth: even if guess_category returned cron-output
@@ -241,12 +271,12 @@ class TestStaleCronEntryMigration:
         # be auto-deleted) — the protected path guard must still block it.
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
+        tracked_file.write_text(orjson.dumps([{
             "path": str(tick_lock),
             "category": "test",
             "timestamp": "2025-01-01T00:00:00+00:00",
             "size": 0,
-        }]))
+        }]).decode('utf-8'))
 
         summary = dg.quick()
         assert summary["deleted"] == 0, ".tick.lock must not be deleted"
@@ -262,12 +292,12 @@ class TestStaleCronEntryMigration:
 
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
+        tracked_file.write_text(orjson.dumps([{
             "path": str(jobs_json),
             "category": "cron-output",
             "timestamp": "2025-01-01T00:00:00+00:00",
             "size": 123,
-        }]))
+        }]).decode('utf-8'))
 
         auto, prompt = dg.dry_run()
         assert len(auto) == 0, "stale cron-output for jobs.json must not appear"
@@ -287,12 +317,12 @@ class TestStaleCronEntryMigration:
 
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
+        tracked_file.write_text(orjson.dumps([{
             "path": str(run_md),
             "category": "cron-output",
             "timestamp": old_ts,
             "size": 10,
-        }]))
+        }]).decode('utf-8'))
 
         summary = dg.quick()
         assert summary["deleted"] == 1, "valid old cron-output should be deleted"
@@ -434,7 +464,7 @@ class TestPostToolCallHook:
             task_id="t1", session_id="s1",
         )
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        data = json.loads(tracked_file.read_text())
+        data = orjson.loads(tracked_file.read_text())
         assert len(data) == 1
         assert data[0]["category"] == "test"
 
@@ -462,7 +492,7 @@ class TestPostToolCallHook:
             task_id="t3", session_id="s3",
         )
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        data = json.loads(tracked_file.read_text())
+        data = orjson.loads(tracked_file.read_text())
         assert any(Path(i["path"]) == p.resolve() for i in data)
 
     def test_ignores_unrelated_tool(self, _isolate_env):
