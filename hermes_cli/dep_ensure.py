@@ -22,25 +22,26 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tools.environments.windows_env import refresh_env_from_registry
+from hermes_constants import agent_browser_runnable
+from tools.environments.local import hermes_subprocess_env
 
 _IS_WINDOWS = platform.system() == "Windows"
 
 _DEP_CHECKS = {
     "node": lambda: shutil.which("node") is not None,
     "browser": lambda: (
-        shutil.which("agent-browser") is not None
+        agent_browser_runnable(shutil.which("agent-browser"))
         or _has_system_browser()
         or _has_hermes_agent_browser()
     ),
-    "ripgrep": lambda: shutil.which("rg") is not None and _has_ripgrepy(),
+    "ripgrep": lambda: shutil.which("rg") is not None,
     "ffmpeg": lambda: shutil.which("ffmpeg") is not None,
 }
 
 _DEP_DESCRIPTIONS = {
     "node": "Node.js (required for browser tools and TUI)",
     "browser": "Browser engine (Chromium, for web browsing tools)",
-    "ripgrep": "ripgrep + ripgrepy (fast file search)",
+    "ripgrep": "ripgrep (fast file search)",
     "ffmpeg": "ffmpeg (TTS voice messages)",
 }
 
@@ -54,14 +55,6 @@ def _has_system_browser() -> bool:
         if shutil.which(name):
             return True
     return False
-
-
-def _has_ripgrepy() -> bool:
-    try:
-        import ripgrepy
-        return True
-    except Exception:
-        return False
 
 
 def _has_hermes_agent_browser() -> bool:
@@ -141,7 +134,6 @@ def ensure_dependency(
 
     if shell == "powershell":
         from hermes_constants import get_hermes_home
-        refresh_env_from_registry()
         ps_bin = shutil.which("powershell") or shutil.which("pwsh")
         if not ps_bin:
             if interactive:
@@ -157,7 +149,8 @@ def ensure_dependency(
     else:
         cmd = ["bash", str(script), "--ensure", dep]
 
-    run_env = {**os.environ, "IS_INTERACTIVE": "false"}
+    run_env = hermes_subprocess_env(inherit_credentials=False)
+    run_env["IS_INTERACTIVE"] = "false"
     result = subprocess.run(
         cmd,
         env=run_env,

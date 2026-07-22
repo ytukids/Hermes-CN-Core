@@ -355,101 +355,93 @@ async def test_blocks_sensitive_home_and_hermes_paths(tmp_path: Path, monkeypatc
     assert any("sensitive credential" in warning for warning in result.warnings)
 
 
-# ── _rg_files ripgrepy integration ────────────────────────────────────
+@pytest.mark.asyncio
+async def test_blocks_canonical_read_denylist_credential_stores(tmp_path: Path, monkeypatch):
+    """@file expansion must honour the canonical read deny-list.
+
+    The narrow in-module list historically missed the real credential stores
+    (provider keys, OAuth tokens, MCP tokens, project-local .env). Because the
+    gateway routes untrusted remote message text through reference expansion,
+    a chat peer could otherwise attach `@file:~/.hermes/auth.json` and read the
+    operator's keys into context. These must all be refused, with their secret
+    bodies kept out of the expanded message.
+    """
+    from agent.context_references import preprocess_context_references_async
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home).mkdir(parents=True)
+
+    auth_json = hermes_home / "auth.json"
+    auth_json.write_text('{"openai": "sk-AUTHJSON-SECRET"}\n', encoding="utf-8")
+
+    oauth = hermes_home / ".anthropic_oauth.json"
+    oauth.write_text('{"access_token": "OAUTH-SECRET"}\n', encoding="utf-8")
+
+    mcp_token = hermes_home / "mcp-tokens" / "github.json"
+    mcp_token.parent.mkdir(parents=True)
+    mcp_token.write_text('{"token": "MCP-TOKEN-SECRET"}\n', encoding="utf-8")
+
+    project_env = tmp_path / "project" / ".env"
+    project_env.parent.mkdir(parents=True)
+    project_env.write_text("DB_PASSWORD=ENV-SECRET\n", encoding="utf-8")
+
+    result = await preprocess_context_references_async(
+        "inspect @file:.hermes/auth.json and @file:.hermes/.anthropic_oauth.json "
+        "and @file:.hermes/mcp-tokens/github.json and @file:project/.env",
+        cwd=tmp_path,
+        allowed_root=tmp_path,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    for secret in (
+        "sk-AUTHJSON-SECRET",
+        "OAUTH-SECRET",
+        "MCP-TOKEN-SECRET",
+        "ENV-SECRET",
+    ):
+        assert secret not in result.message
+    assert sum("sensitive credential" in warning for warning in result.warnings) == 4
 
 
-class TestRgFilesRipgrepy:
-    """Tests for _rg_files() using the ripgrepy path."""
+@pytest.mark.asyncio
+async def test_canonical_guard_fails_closed_when_lookup_raises(tmp_path: Path, monkeypatch):
+    """If the canonical read guard raises, the reference must fail CLOSED.
 
-    def test_ripgrepy_not_importable_returns_none(self, tmp_path, monkeypatch):
-        """When ripgrepy cannot be imported, _rg_files returns None."""
-        from agent.context_references import _rg_files
-        import builtins
-        orig_import = builtins.__import__
+    The guard exists specifically to cover credential stores the narrow local
+    list misses (auth.json, ...). If get_read_block_error ever raised, silently
+    falling through to the local list would re-open that exact hole — and the
+    gateway feeds untrusted remote text here, so a chat peer could then attach
+    auth.json. The reference must be refused and the secret kept out of the
+    expanded message.
+    """
+    from agent.context_references import preprocess_context_references_async
 
-        def blocking_import(name, *args, **kwargs):
-            if name == "ripgrepy" or name.startswith("ripgrepy."):
-                raise ImportError("No module named ripgrepy")
-            return orig_import(name, *args, **kwargs)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
 
-        monkeypatch.setattr(builtins, "__import__", blocking_import)
-        result = _rg_files(tmp_path, tmp_path, 50)
-        assert result is None
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(parents=True)
+    auth_json = hermes_home / "auth.json"
+    auth_json.write_text('{"openai": "sk-AUTHJSON-SECRET"}\n', encoding="utf-8")
 
-    def test_rg_returns_file_list(self, tmp_path, monkeypatch):
-        """_rg_files returns list of Paths from rg output."""
-        from agent.context_references import _rg_files
-        monkeypatch.setattr(
-            subprocess, "run",
-            lambda *a, **kw: subprocess.CompletedProcess(
-                [], 0, stdout="src/a.py\nsrc/b.py\nREADME.md\n"
-            )
-        )
-        result = _rg_files(tmp_path, tmp_path, 50)
-        assert result is not None
-        assert len(result) == 3
-        assert Path("src/a.py") in result
-        assert Path("src/b.py") in result
-        assert Path("README.md") in result
+    def _boom(_path):
+        raise RuntimeError("guard resolution failed")
 
-    def test_rg_exit_nonzero_returns_none(self, tmp_path, monkeypatch):
-        """_rg_files returns None when rg exits non-zero."""
-        from agent.context_references import _rg_files
-        monkeypatch.setattr(
-            subprocess, "run",
-            lambda *a, **kw: subprocess.CompletedProcess([], 1, stdout="")
-        )
-        result = _rg_files(tmp_path, tmp_path, 50)
-        assert result is None
+    monkeypatch.setattr("agent.file_safety.get_read_block_error", _boom)
 
-    def test_rg_subprocess_error_returns_none(self, tmp_path, monkeypatch):
-        """_rg_files returns None on subprocess error."""
-        from agent.context_references import _rg_files
-        monkeypatch.setattr(
-            subprocess, "run",
-            lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("rg not found"))
-        )
-        result = _rg_files(tmp_path, tmp_path, 50)
-        assert result is None
+    result = await preprocess_context_references_async(
+        "inspect @file:.hermes/auth.json",
+        cwd=tmp_path,
+        allowed_root=tmp_path,
+        context_length=100_000,
+    )
 
-    def test_respects_limit(self, tmp_path, monkeypatch):
-        """_rg_files respects the limit parameter."""
-        from agent.context_references import _rg_files
-        stdout = "\n".join([f"file_{i}.py" for i in range(20)])
-        monkeypatch.setattr(
-            subprocess, "run",
-            lambda *a, **kw: subprocess.CompletedProcess([], 0, stdout=stdout)
-        )
-        result = _rg_files(tmp_path, tmp_path, 5)
-        assert result is not None
-        assert len(result) == 5
-
-    def test_blank_lines_ignored(self, tmp_path, monkeypatch):
-        """_rg_files ignores blank lines in stdout."""
-        from agent.context_references import _rg_files
-        monkeypatch.setattr(
-            subprocess, "run",
-            lambda *a, **kw: subprocess.CompletedProcess(
-                [], 0, stdout="a.py\n\n\nb.py\n"
-            )
-        )
-        result = _rg_files(tmp_path, tmp_path, 50)
-        assert result is not None
-        assert len(result) == 2
-
-    def test_uses_relative_path_from_cwd(self, tmp_path, monkeypatch):
-        """_rg_files runs rg with path relative to cwd."""
-        from agent.context_references import _rg_files
-        captured_cmd = []
-        def capture_run(cmd, **kwargs):
-            captured_cmd.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="")
-        monkeypatch.setattr(subprocess, "run", capture_run)
-        cwd = tmp_path / "project"
-        cwd.mkdir()
-        search_path = cwd / "src"
-        search_path.mkdir()
-        _rg_files(search_path, cwd, 50)
-        assert len(captured_cmd) == 1
-        # The relative path should be in the command
-        assert any("src" in str(a) for a in captured_cmd[0])
+    assert "sk-AUTHJSON-SECRET" not in result.message
+    assert any(
+        "credential deny-list" in warning or "sensitive credential" in warning
+        for warning in result.warnings
+    )
