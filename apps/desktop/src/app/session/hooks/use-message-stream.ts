@@ -271,6 +271,7 @@ export function useMessageStream({
   // them to at most one refresh per window. Explicit refreshes elsewhere (boot,
   // session create/branch) stay immediate.
   const refreshSessionsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   const coalesceRefreshSessions = useCallback(() => {
     if (refreshSessionsTimerRef.current !== null) {
       return
@@ -670,17 +671,14 @@ export function useMessageStream({
         }
       })
 
-      coalesceRefreshSessions()      // Sync the freshly-titled row to other windows (e.g. main, when the turn
+      coalesceRefreshSessions() // Sync the freshly-titled row to other windows (e.g. main, when the turn
       // ran in the pop-out).
       broadcastSessionsChanged()
 
-
-
       if (compactedTurnRef.current.delete(sessionId)) {
-
         shouldHydrate = false
-
       }
+
       if (shouldHydrate) {
         void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
       }
