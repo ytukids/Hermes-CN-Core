@@ -347,6 +347,44 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     return env
 
 
+
+def _find_bash_posix() -> str | None:
+    """Find bash for command execution on POSIX, or PowerShell on Windows.
+
+    On non-Windows platforms, returns the path to bash.
+    On Windows, returns the path to PowerShell.
+    """
+    if not _IS_WINDOWS:
+        return (
+            shutil.which("bash")
+            or ("/usr/bin/bash" if os.path.isfile("/usr/bin/bash") else None)
+            or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+            or os.environ.get("SHELL")
+            or "/bin/sh"
+        )
+    # Windows: return powershell.exe path
+    return shutil.which("powershell.exe") or "powershell.exe"
+
+
+def _resolve_shell() -> tuple[str, str]:
+    """Resolve the shell type and path for LocalEnvironment.
+
+    Returns a tuple of (shell_type, shell_path).
+    On Windows: ("powershell", "powershell.exe")
+    On non-Windows: ("bash", bash_path)
+    """
+    if _IS_WINDOWS:
+        shell_path = shutil.which("powershell.exe") or "powershell.exe"
+        logger.info("Selected shell: powershell at %s", shell_path)
+        return ("powershell", shell_path)
+    else:
+        bash_path = _find_bash_posix()
+        if bash_path:
+            logger.info("Selected shell: bash at %s", bash_path)
+            return ("bash", bash_path)
+        raise RuntimeError("No usable shell found.")
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
