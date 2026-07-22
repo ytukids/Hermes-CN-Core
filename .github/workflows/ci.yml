@@ -15,6 +15,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip Python Tests (all slices)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -75,7 +80,8 @@ jobs:
       needs.detect.outputs.python == 'true' &&
       !contains(github.event.head_commit.message, '[skip tests]') &&
       !contains(github.event.head_commit.message, '[skip-ci]') &&
-      !contains(github.ref, '/skip-tests/')
+      !contains(github.ref, '/skip-tests/') &&
+      (!inputs || !inputs.skip_tests)
     uses: ./.github/workflows/tests.yml
     with:
       slice_count: 8
